@@ -9,6 +9,10 @@ import sys
 import tempfile
 
 
+_MISSING = object()
+"""Module-private unique sentinel marking an omitted backward() grad."""
+
+
 def _as_finite_float(value):
     """Validate a scalar float; TypeError on bad type, ValueError if non-finite."""
     if isinstance(value, bool) or not isinstance(value, float):
@@ -521,19 +525,93 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def layer_norm(self, eps=1e-5):
+        data = _require_nonempty_float_vector(self, "layer_norm")
+        if isinstance(eps, bool) or not isinstance(eps, float):
+            raise TypeError("eps must be a positive finite float")
+        if not math.isfinite(eps) or eps <= 0.0:
+            raise ValueError("eps must be a positive finite float")
+        n = len(data)
+        mu = sum(data) / n
+        if not math.isfinite(mu):
+            raise ValueError("layer_norm intermediate must be finite")
+        centered = []
+        for value in data:
+            c_i = value - mu
+            if not math.isfinite(c_i):
+                raise ValueError("layer_norm intermediate must be finite")
+            centered.append(c_i)
+        var_sum = 0.0
+        for c_i in centered:
+            var_sum += c_i * c_i
+            if not math.isfinite(var_sum):
+                raise ValueError("layer_norm intermediate must be finite")
+        var = var_sum / n
+        if not math.isfinite(var):
+            raise ValueError("layer_norm intermediate must be finite")
+        denom = var + eps
+        if not math.isfinite(denom):
+            raise ValueError("layer_norm intermediate must be finite")
+        r = 1.0 / math.sqrt(denom)
+        if not math.isfinite(r):
+            raise ValueError("layer_norm intermediate must be finite")
+        out_data = []
+        for c_i in centered:
+            y_i = c_i * r
+            if not math.isfinite(y_i):
+                raise ValueError("layer_norm intermediate must be finite")
+            out_data.append(y_i)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+
+        def backward_fn(grad):
+            G = 0.0
+            for g in grad:
+                G += g
+                if not math.isfinite(G):
+                    raise ValueError(
+                        "layer_norm backward intermediate must be finite"
+                    )
+            H = 0.0
+            for g, c_i in zip(grad, centered):
+                product = g * c_i
+                if not math.isfinite(product):
+                    raise ValueError(
+                        "layer_norm backward intermediate must be finite"
+                    )
+                H += product
+                if not math.isfinite(H):
+                    raise ValueError(
+                        "layer_norm backward intermediate must be finite"
+                    )
+            contribution = []
+            for g, c_i in zip(grad, centered):
+                dx_i = (r / n) * (n * g - G - c_i * r * r * H)
+                if not math.isfinite(dx_i):
+                    raise ValueError(
+                        "layer_norm backward intermediate must be finite"
+                    )
+                contribution.append(dx_i)
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def zero_grad(self):
         self.grad = None
         return None
 
-    def backward(self, grad=None):
+    def backward(self, grad=_MISSING):
         if not self._parents:
             raise ValueError("cannot call backward on a tensor without a graph")
-        if grad is None:
+        if grad is _MISSING:
             if isinstance(self.data, list):
                 raise ValueError(
                     "grad must be provided for a non-scalar tensor"
                 )
             grad = 1.0
+        elif grad is None:
+            raise TypeError("grad must not be None")
         else:
             grad = _validate_grad(grad, self.data)
 
