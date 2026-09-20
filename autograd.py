@@ -791,12 +791,49 @@ def _cli_evaluate(path):
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
-    if len(entries) != 2 or entries[0][0] != "w" or entries[1][0] != "b":
-        print("state must contain exactly the parameters w and b in order",
-              file=sys.stderr)
-        return 2
-    if isinstance(entries[0][1], list) or isinstance(entries[1][1], list):
-        print("parameters w and b must be scalar Tensors", file=sys.stderr)
+    if len(entries) == 2:
+        if entries[0][0] != "w" or entries[1][0] != "b":
+            print("state must contain exactly the parameters w and b in order",
+                  file=sys.stderr)
+            return 2
+        if isinstance(entries[0][1], list) or isinstance(entries[1][1], list):
+            print("parameters w and b must be scalar Tensors", file=sys.stderr)
+            return 2
+    elif len(entries) == 7:
+        names = ["w", "b", "mw", "mb", "vw", "vb", "t"]
+        requires_flags = (True, True, False, False, False, False, False)
+        if (
+            [entry[0] for entry in entries] != names
+            or any(isinstance(entry[1], list) for entry in entries)
+            or any(
+                entry[2] is not flag
+                for entry, flag in zip(entries, requires_flags)
+            )
+        ):
+            print(
+                "state must contain exactly the scalar parameters w, b, mw,"
+                " mb, vw, vb and t in order with requires_grad true, true,"
+                " false, false, false, false, false",
+                file=sys.stderr,
+            )
+            return 2
+        t_value = entries[6][1]
+        if (
+            not math.isfinite(t_value)
+            or t_value < 0.0
+            or not t_value.is_integer()
+        ):
+            print(
+                "t must be a non-negative integer-valued float",
+                file=sys.stderr,
+            )
+            return 2
+    else:
+        print(
+            "state must contain exactly the parameters w and b or the"
+            " parameters w, b, mw, mb, vw, vb and t",
+            file=sys.stderr,
+        )
         return 2
     try:
         w_tensor = Tensor(entries[0][1], entries[0][2])
