@@ -573,6 +573,59 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def logsumexp(self):
+        data = _require_nonempty_float_vector(self, "logsumexp")
+        # Snapshot the input first, then shift by its maximum so exp is only
+        # ever evaluated on values in (-inf, 0]; exp(x_i) directly is never
+        # computed.
+        x = list(data)
+        m = max(x)
+        z = []
+        s = 0.0
+        for value in x:
+            diff = value - m
+            if not math.isfinite(diff):
+                raise ValueError("logsumexp intermediate must be finite")
+            z_i = math.exp(diff)
+            if not math.isfinite(z_i):
+                raise ValueError("logsumexp intermediate must be finite")
+            z.append(z_i)
+            s += z_i
+            if not math.isfinite(s):
+                raise ValueError("logsumexp intermediate must be finite")
+        log_s = math.log(s)
+        if not math.isfinite(log_s):
+            raise ValueError("logsumexp intermediate must be finite")
+        out_data = m + log_s
+        if not math.isfinite(out_data):
+            raise ValueError("logsumexp intermediate must be finite")
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # Snapshot x, z and s so later caller-side mutation of the input
+        # cannot change what a pending backward pass uses.
+        snapshot_x = x
+        snapshot_z = z
+        total = s
+
+        def backward_fn(grad):
+            dx = []
+            for z_i in snapshot_z:
+                scaled = grad * z_i
+                if not math.isfinite(scaled):
+                    raise ValueError(
+                        "logsumexp backward intermediate must be finite"
+                    )
+                dx_i = scaled / total
+                if not math.isfinite(dx_i):
+                    raise ValueError(
+                        "logsumexp backward intermediate must be finite"
+                    )
+                dx.append(dx_i)
+            return [(parent, dx)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def conv1d(self, kernel, stride=1, padding=0):
         if not isinstance(kernel, Tensor):
             raise TypeError("kernel must be a Tensor")
