@@ -345,6 +345,86 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def conv1d(self, kernel, stride=1, padding=0):
+        if not isinstance(kernel, Tensor):
+            raise TypeError("kernel must be a Tensor")
+        data = _require_nonempty_float_vector(self, "conv1d")
+        weights = _require_nonempty_float_vector(kernel, "conv1d")
+        if isinstance(stride, bool) or not isinstance(stride, int):
+            raise TypeError("stride must be a positive int")
+        if stride <= 0:
+            raise ValueError("stride must be a positive int")
+        if isinstance(padding, bool) or not isinstance(padding, int):
+            raise TypeError("padding must be a non-negative int")
+        if padding < 0:
+            raise ValueError("padding must be a non-negative int")
+        n = len(data)
+        k = len(weights)
+        out_len = (n + 2 * padding - k) // stride + 1
+        if out_len <= 0:
+            raise ValueError("conv1d output length must be positive")
+        # Cross-correlation: the kernel is never flipped; out-of-range
+        # input positions (from padding) are skipped.
+        out_data = []
+        for o in range(out_len):
+            acc = 0.0
+            for i in range(k):
+                j = o * stride + i - padding
+                if 0 <= j < n:
+                    product = data[j] * weights[i]
+                    if not math.isfinite(product):
+                        raise ValueError(
+                            "conv1d intermediate must be finite"
+                        )
+                    acc += product
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "conv1d intermediate must be finite"
+                        )
+            out_data.append(acc)
+        if not (self.requires_grad or kernel.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_kernel = self, kernel
+
+        def backward_fn(grad):
+            dx = [0.0] * n
+            dk = [0.0] * k
+            for o in range(out_len):
+                g = grad[o]
+                for i in range(k):
+                    j = o * stride + i - padding
+                    if 0 <= j < n:
+                        contrib_x = g * weights[i]
+                        if not math.isfinite(contrib_x):
+                            raise ValueError(
+                                "conv1d backward intermediate must be finite"
+                            )
+                        dx[j] += contrib_x
+                        if not math.isfinite(dx[j]):
+                            raise ValueError(
+                                "conv1d backward intermediate must be finite"
+                            )
+                        contrib_k = g * data[j]
+                        if not math.isfinite(contrib_k):
+                            raise ValueError(
+                                "conv1d backward intermediate must be finite"
+                            )
+                        dk[i] += contrib_k
+                        if not math.isfinite(dk[i]):
+                            raise ValueError(
+                                "conv1d backward intermediate must be finite"
+                            )
+            contributions = []
+            if parent_self.requires_grad:
+                contributions.append((parent_self, dx))
+            if parent_kernel.requires_grad:
+                contributions.append((parent_kernel, dk))
+            return contributions
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_kernel), backward_fn
+        )
+
     def zero_grad(self):
         self.grad = None
         return None
