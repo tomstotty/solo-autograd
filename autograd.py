@@ -291,6 +291,72 @@ class Tensor:
         )
 
 
+class SGD:
+    """Stochastic gradient descent over a fixed list of Tensors."""
+
+    def __init__(self, parameters, lr):
+        if not isinstance(parameters, list):
+            raise TypeError("parameters must be a non-empty list of Tensors")
+        if len(parameters) == 0:
+            raise ValueError("parameters must be non-empty")
+        for parameter in parameters:
+            if not isinstance(parameter, Tensor):
+                raise TypeError("parameters must contain only Tensors")
+        if len({id(parameter) for parameter in parameters}) != len(parameters):
+            raise ValueError("parameters must not contain duplicate Tensors")
+        if isinstance(lr, bool) or not isinstance(lr, float):
+            raise TypeError("lr must be a positive finite float")
+        if not math.isfinite(lr) or lr <= 0.0:
+            raise ValueError("lr must be a positive finite float")
+        self.parameters = list(parameters)
+        self.lr = lr
+
+    def step(self):
+        # Compute and validate every new value before mutating anything, so
+        # a failure leaves all data, grad, and requires_grad untouched.
+        updates = []
+        for parameter in self.parameters:
+            if not parameter.requires_grad or parameter.grad is None:
+                continue
+            updates.append(
+                (parameter, self._updated_data(parameter.data, parameter.grad))
+            )
+        for parameter, new_data in updates:
+            parameter.data = new_data
+        return None
+
+    def _updated_data(self, data, grad):
+        if isinstance(data, list):
+            if isinstance(grad, list):
+                if len(grad) != len(data):
+                    raise ValueError("grad shape must match tensor shape")
+                return [
+                    self._updated_value(value, g)
+                    for value, g in zip(data, grad)
+                ]
+            if isinstance(grad, float) and not isinstance(grad, bool):
+                raise ValueError("grad shape must match tensor shape")
+            raise TypeError("grad must be a list of floats")
+        if isinstance(grad, list):
+            raise ValueError("grad shape must match tensor shape")
+        return self._updated_value(data, grad)
+
+    def _updated_value(self, value, grad):
+        if isinstance(grad, bool) or not isinstance(grad, float):
+            raise TypeError("grad elements must be floats")
+        if not math.isfinite(grad):
+            raise ValueError("grad must be finite")
+        new_value = value - self.lr * grad
+        if not math.isfinite(new_value):
+            raise ValueError("updated data must be finite")
+        return new_value
+
+    def zero_grad(self):
+        for parameter in self.parameters:
+            parameter.grad = None
+        return None
+
+
 def gradcheck(fn, data, eps=1e-6, atol=1e-5):
     """Compare analytic gradients from backward() with central differences.
 
