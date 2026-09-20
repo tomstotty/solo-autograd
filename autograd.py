@@ -608,11 +608,26 @@ def _cli_tensor():
     return 0
 
 
-def _cli_checkpoint_parameters():
-    """Parse the checkpoint stdin payload into an ordered name -> Tensor dict.
+class _ObjectPairs(list):
+    """Marker for a JSON object parsed as ordered (key, value) pairs."""
 
-    Returns (parameters, error); exactly one of the two is None.
-    """
+
+def _parse_json_pairs(text):
+    """Parse JSON preserving object member pairs so duplicates are visible."""
+    return json.loads(text, object_pairs_hook=_ObjectPairs)
+
+
+def _has_duplicate_key(pairs):
+    seen = set()
+    for key, _ in pairs:
+        if key in seen:
+            return True
+        seen.add(key)
+    return False
+
+
+def _read_stdin_line():
+    """Read stdin, requiring exactly one line; returns (text, error)."""
     try:
         text = sys.stdin.read()
     except OSError:
@@ -621,27 +636,52 @@ def _cli_checkpoint_parameters():
         text = text[:-1]
     if "\n" in text:
         return None, "stdin must contain exactly one line of JSON"
+    return text, None
+
+
+def _cli_checkpoint_parameters():
+    """Parse the checkpoint stdin payload into an ordered name -> Tensor dict.
+
+    Returns (parameters, error); exactly one of the two is None.
+    """
+    text, error = _read_stdin_line()
+    if error is not None:
+        return None, error
     try:
-        payload = json.loads(text)
+        payload = _parse_json_pairs(text)
     except ValueError:
         return None, "invalid JSON input"
-    if not isinstance(payload, dict) or set(payload) != {"parameters"}:
+    if not isinstance(payload, _ObjectPairs):
         return None, "input must be an object with only the parameters key"
-    members = payload["parameters"]
-    if not isinstance(members, dict):
+    if _has_duplicate_key(payload):
+        return None, "duplicate key in JSON input"
+    if [key for key, _ in payload] != ["parameters"]:
+        return None, "input must be an object with only the parameters key"
+    members = payload[0][1]
+    if not isinstance(members, _ObjectPairs):
         return None, "parameters must be an object"
+    if _has_duplicate_key(members):
+        return None, "duplicate key in JSON input"
     if len(members) == 0:
         return None, "parameters must be non-empty"
     parameters = {}
-    for name, spec in members.items():
-        if not isinstance(spec, dict) or list(spec) != ["data", "requires_grad"]:
+    for name, spec in members:
+        if not isinstance(spec, _ObjectPairs):
+            return (
+                None,
+                "each parameter must contain only data and requires_grad"
+                " in that order",
+            )
+        if _has_duplicate_key(spec):
+            return None, "duplicate key in JSON input"
+        if [key for key, _ in spec] != ["data", "requires_grad"]:
             return (
                 None,
                 "each parameter must contain only data and requires_grad"
                 " in that order",
             )
         try:
-            parameters[name] = Tensor(spec["data"], spec["requires_grad"])
+            parameters[name] = Tensor(spec[0][1], spec[1][1])
         except (TypeError, ValueError) as exc:
             return None, str(exc)
     return parameters, None
@@ -708,6 +748,113 @@ def _cli_checkpoint_load(path):
     return 0
 
 
+def _cli_evaluate_samples():
+    """Parse the evaluate stdin payload into a list of (x, y) float pairs.
+
+    Returns (samples, error); exactly one of the two is None.
+    """
+    text, error = _read_stdin_line()
+    if error is not None:
+        return None, error
+    try:
+        payload = _parse_json_pairs(text)
+    except ValueError:
+        return None, "invalid JSON input"
+    if not isinstance(payload, _ObjectPairs):
+        return None, "input must be an object with only the samples key"
+    if _has_duplicate_key(payload):
+        return None, "duplicate key in JSON input"
+    if [key for key, _ in payload] != ["samples"]:
+        return None, "input must be an object with only the samples key"
+    members = payload[0][1]
+    if not isinstance(members, list) or isinstance(members, _ObjectPairs):
+        return None, "samples must be a non-empty array of [x, y] pairs"
+    if len(members) == 0:
+        return None, "samples must be a non-empty array of [x, y] pairs"
+    samples = []
+    for item in members:
+        if (
+            not isinstance(item, list)
+            or isinstance(item, _ObjectPairs)
+            or len(item) != 2
+        ):
+            return None, "each sample must be a [x, y] pair"
+        x, y = item
+        for value in (x, y):
+            if isinstance(value, bool) or not isinstance(value, float):
+                return None, "sample values must be finite floats"
+            if not math.isfinite(value):
+                return None, "sample values must be finite floats"
+        samples.append((x, y))
+    return samples, None
+
+
+def _cli_evaluate(path):
+    try:
+        with open(path, "rb") as state_file:
+            raw = state_file.read()
+    except OSError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    samples, error = _cli_evaluate_samples()
+    if error is not None:
+        print(error, file=sys.stderr)
+        return 2
+    try:
+        entries = _StateParser(text).parse()
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if len(entries) != 2 or entries[0][0] != "w" or entries[1][0] != "b":
+        print("state must contain exactly the parameters w and b in order",
+              file=sys.stderr)
+        return 2
+    if isinstance(entries[0][1], list) or isinstance(entries[1][1], list):
+        print("parameters w and b must be scalar Tensors", file=sys.stderr)
+        return 2
+    try:
+        w_tensor = Tensor(entries[0][1], entries[0][2])
+        b_tensor = Tensor(entries[1][1], entries[1][2])
+    except (TypeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    w = w_tensor.data
+    b = b_tensor.data
+    total = 0.0
+    for x, y in samples:
+        prediction = w * x
+        if not math.isfinite(prediction):
+            print("evaluation produced a non-finite value", file=sys.stderr)
+            return 2
+        prediction = prediction + b
+        if not math.isfinite(prediction):
+            print("evaluation produced a non-finite value", file=sys.stderr)
+            return 2
+        residual = prediction - y
+        if not math.isfinite(residual):
+            print("evaluation produced a non-finite value", file=sys.stderr)
+            return 2
+        squared = residual * residual
+        if not math.isfinite(squared):
+            print("evaluation produced a non-finite value", file=sys.stderr)
+            return 2
+        total = total + squared
+        if not math.isfinite(total):
+            print("evaluation produced a non-finite value", file=sys.stderr)
+            return 2
+    loss = total / len(samples)
+    if not math.isfinite(loss):
+        print("evaluation produced a non-finite value", file=sys.stderr)
+        return 2
+    sys.stdout.write('{"loss":' + _format_float(loss) + "}\n")
+    return 0
+
+
 def main(argv):
     if len(argv) == 1 and argv[0] == "tensor":
         try:
@@ -727,8 +874,15 @@ def main(argv):
         except Exception as exc:  # noqa: BLE001 - unexpected CLI failure
             print(str(exc), file=sys.stderr)
             return 1
+    if len(argv) == 2 and argv[0] == "evaluate":
+        try:
+            return _cli_evaluate(argv[1])
+        except Exception as exc:  # noqa: BLE001 - unexpected CLI failure
+            print(str(exc), file=sys.stderr)
+            return 1
     print(
-        "usage: python autograd.py tensor | checkpoint {save|load} PATH",
+        "usage: python autograd.py tensor | checkpoint {save|load} PATH"
+        " | evaluate PATH",
         file=sys.stderr,
     )
     return 1
