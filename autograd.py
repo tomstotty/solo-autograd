@@ -234,6 +234,61 @@ class Tensor:
             out_data, True, (parent_self, parent_other), backward_fn
         )
 
+    def dot(self, other):
+        if not isinstance(other, Tensor):
+            raise TypeError("other must be a Tensor")
+        a = _require_nonempty_float_vector(self, "dot")
+        b = _require_nonempty_float_vector(other, "dot")
+        if len(a) != len(b):
+            raise ValueError("dot vector lengths must match")
+        # Accumulate index by index starting from 0.0, multiplying before
+        # adding at each index; a non-finite product or partial sum aborts
+        # before a result tensor exists, so no state can change on failure.
+        acc = 0.0
+        for i in range(len(a)):
+            product = a[i] * b[i]
+            if not math.isfinite(product):
+                raise ValueError("dot intermediate must be finite")
+            acc += product
+            if not math.isfinite(acc):
+                raise ValueError("dot intermediate must be finite")
+        out_data = acc
+        if not (self.requires_grad or other.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_other = self, other
+        # Snapshot both operands so later caller-side mutation of either
+        # input list cannot change what a pending backward pass uses.
+        snapshot_a = list(parent_self.data)
+        snapshot_b = list(parent_other.data)
+
+        def backward_fn(grad):
+            contributions = []
+            if parent_self.requires_grad:
+                dx = []
+                for value in snapshot_b:
+                    term = grad * value
+                    if not math.isfinite(term):
+                        raise ValueError(
+                            "dot backward intermediate must be finite"
+                        )
+                    dx.append(term)
+                contributions.append((parent_self, dx))
+            if parent_other.requires_grad:
+                db = []
+                for value in snapshot_a:
+                    term = grad * value
+                    if not math.isfinite(term):
+                        raise ValueError(
+                            "dot backward intermediate must be finite"
+                        )
+                    db.append(term)
+                contributions.append((parent_other, db))
+            return contributions
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_other), backward_fn
+        )
+
     def tanh(self):
         out_data = _map_unary(self.data, math.tanh)
         _ensure_finite_data(out_data)
