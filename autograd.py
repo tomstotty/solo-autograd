@@ -608,10 +608,24 @@ def _cli_tensor():
     return 0
 
 
-def _cli_checkpoint_parameters():
-    """Parse the checkpoint stdin payload into an ordered name -> Tensor dict.
+class _DuplicateJSONObjectKey(ValueError):
+    """Raised when a parsed JSON object repeats a member name."""
 
-    Returns (parameters, error); exactly one of the two is None.
+
+def _reject_duplicate_keys(pairs):
+    """json object_pairs_hook preserving member order and rejecting dup names."""
+    seen = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise _DuplicateJSONObjectKey("duplicate keys are not allowed")
+        seen.add(key)
+    return dict(pairs)
+
+
+def _read_single_json_line():
+    """Read stdin as exactly one line, optionally followed by one newline.
+
+    Returns (text, error); exactly one of the two is None.
     """
     try:
         text = sys.stdin.read()
@@ -621,8 +635,23 @@ def _cli_checkpoint_parameters():
         text = text[:-1]
     if "\n" in text:
         return None, "stdin must contain exactly one line of JSON"
+    return text, None
+
+
+def _cli_checkpoint_parameters():
+    """Parse the checkpoint stdin payload into an ordered name -> Tensor dict.
+
+    Returns (parameters, error); exactly one of the two is None.
+    """
+    text, error = _read_single_json_line()
+    if error is not None:
+        return None, error
     try:
-        payload = json.loads(text)
+        payload = json.loads(
+            text, object_pairs_hook=_reject_duplicate_keys
+        )
+    except _DuplicateJSONObjectKey as exc:
+        return None, str(exc)
     except ValueError:
         return None, "invalid JSON input"
     if not isinstance(payload, dict) or set(payload) != {"parameters"}:
@@ -708,10 +737,121 @@ def _cli_checkpoint_load(path):
     return 0
 
 
+def _cli_evaluate(path):
+    """Load w/b scalars from a dump_state file and evaluate mean-square loss.
+
+    The input samples and state are fully validated before any output; the
+    state file is opened read-only and never modified.
+    """
+    try:
+        with open(path, "rb") as state_file:
+            raw = state_file.read()
+    except OSError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    try:
+        state_text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    text, error = _read_single_json_line()
+    if error is not None:
+        print(error, file=sys.stderr)
+        return 2
+    try:
+        payload = json.loads(
+            text, object_pairs_hook=_reject_duplicate_keys
+        )
+    except _DuplicateJSONObjectKey as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    except ValueError:
+        print("invalid JSON input", file=sys.stderr)
+        return 2
+    if not isinstance(payload, dict) or list(payload) != ["samples"]:
+        print(
+            "input must be an object containing only the samples key",
+            file=sys.stderr,
+        )
+        return 2
+    samples = payload["samples"]
+    if not isinstance(samples, list) or len(samples) == 0:
+        print("samples must be a non-empty array", file=sys.stderr)
+        return 2
+    points = []
+    for sample in samples:
+        if not isinstance(sample, list) or len(sample) != 2:
+            print("each sample must be exactly [x, y]", file=sys.stderr)
+            return 2
+        x, y = sample
+        if (
+            isinstance(x, bool)
+            or not isinstance(x, float)
+            or not math.isfinite(x)
+            or isinstance(y, bool)
+            or not isinstance(y, float)
+            or not math.isfinite(y)
+        ):
+            print("sample coordinates must be finite floats", file=sys.stderr)
+            return 2
+        points.append((x, y))
+
+    try:
+        entries = _StateParser(state_text).parse()
+    except ValueError:
+        print("state does not match the dump_state format", file=sys.stderr)
+        return 2
+    if len(entries) != 2:
+        print("state must contain exactly parameters w and b", file=sys.stderr)
+        return 2
+    (w_name, w_data, _), (b_name, b_data, _) = entries
+    if w_name != "w" or b_name != "b":
+        print(
+            "state parameters must be w then b, in that order",
+            file=sys.stderr,
+        )
+        return 2
+    if isinstance(w_data, list) or isinstance(b_data, list):
+        print("w and b must be scalar tensors", file=sys.stderr)
+        return 2
+
+    total = 0.0
+    for x, y in points:
+        product = w_data * x
+        if not math.isfinite(product):
+            print("intermediate value must be finite", file=sys.stderr)
+            return 2
+        residual = product + b_data - y
+        if not math.isfinite(residual):
+            print("intermediate value must be finite", file=sys.stderr)
+            return 2
+        term = residual * residual
+        if not math.isfinite(term):
+            print("intermediate value must be finite", file=sys.stderr)
+            return 2
+        total += term
+        if not math.isfinite(total):
+            print("intermediate value must be finite", file=sys.stderr)
+            return 2
+    loss = total / len(points)
+    if not math.isfinite(loss):
+        print("result must be finite", file=sys.stderr)
+        return 2
+    sys.stdout.write('{"loss":' + _format_float(loss) + "}\n")
+    return 0
+
+
 def main(argv):
     if len(argv) == 1 and argv[0] == "tensor":
         try:
             return _cli_tensor()
+        except Exception as exc:  # noqa: BLE001 - unexpected CLI failure
+            print(str(exc), file=sys.stderr)
+            return 1
+    if len(argv) == 2 and argv[0] == "evaluate":
+        try:
+            return _cli_evaluate(argv[1])
         except Exception as exc:  # noqa: BLE001 - unexpected CLI failure
             print(str(exc), file=sys.stderr)
             return 1
@@ -728,7 +868,9 @@ def main(argv):
             print(str(exc), file=sys.stderr)
             return 1
     print(
-        "usage: python autograd.py tensor | checkpoint {save|load} PATH",
+        "usage: python autograd.py tensor"
+        " | checkpoint {save|load} PATH"
+        " | evaluate PATH",
         file=sys.stderr,
     )
     return 1
