@@ -108,6 +108,50 @@ def _validate_grad(grad, like):
     raise TypeError("grad must be a float or a list of floats")
 
 
+def _log_softmax_values(data):
+    """Compute log-softmax values via the max-shift, checking every step.
+
+    m = max(data), z_i = exp(x_i - m), s = sum(z), and
+    l_i = x_i - m - log(s). exp(x_i) is never evaluated; every
+    intermediate (difference, z, s, log(s), l) must stay finite.
+    """
+    m = max(data)
+    z = []
+    for value in data:
+        diff = value - m
+        if not math.isfinite(diff):
+            raise ValueError("log_softmax intermediate must be finite")
+        z_i = math.exp(diff)
+        if not math.isfinite(z_i):
+            raise ValueError("log_softmax intermediate must be finite")
+        z.append(z_i)
+    s = sum(z)
+    if not math.isfinite(s):
+        raise ValueError("log_softmax intermediate must be finite")
+    log_s = math.log(s)
+    if not math.isfinite(log_s):
+        raise ValueError("log_softmax intermediate must be finite")
+    out_data = []
+    for value in data:
+        l_i = value - m - log_s
+        if not math.isfinite(l_i):
+            raise ValueError("log_softmax intermediate must be finite")
+        out_data.append(l_i)
+    return out_data
+
+
+def _validate_1d_float_data(data, name):
+    """Validate a non-empty 1D finite-float list for the softmax-family ops."""
+    if not isinstance(data, list) or len(data) == 0:
+        raise ValueError(name + " requires a non-empty 1D float list")
+    for value in data:
+        if isinstance(value, bool) or not isinstance(value, float):
+            raise TypeError(name + " data elements must be floats")
+    for value in data:
+        if not math.isfinite(value):
+            raise ValueError(name + " data elements must be finite")
+
+
 class Tensor:
     def __init__(self, data, requires_grad=False):
         normalized = _validate_data(data)
@@ -255,6 +299,54 @@ class Tensor:
         def backward_fn(grad):
             dot = sum(g * y for g, y in zip(grad, out))
             contribution = [y * (g - dot) for g, y in zip(grad, out)]
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
+    def log_softmax(self):
+        data = self.data
+        _validate_1d_float_data(data, "log_softmax")
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        out_data = _log_softmax_values(data)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        out = out_data
+
+        def backward_fn(grad):
+            # exp(l_i) is the softmax probability; dx_i = g_i - p_i*sum(g)
+            total = sum(grad)
+            contribution = [
+                g - math.exp(l_i) * total
+                for g, l_i in zip(grad, out)
+            ]
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
+    def cross_entropy(self, target):
+        data = self.data
+        _validate_1d_float_data(data, "cross_entropy")
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        if isinstance(target, bool) or not isinstance(target, int):
+            raise TypeError("target must be an int")
+        if target < 0 or target >= len(data):
+            raise ValueError("target index out of range")
+        log_probs = _log_softmax_values(data)
+        out_data = -log_probs[target]
+        _ensure_finite_data(out_data)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        probs = [math.exp(l_i) for l_i in log_probs]
+        target_index = target
+
+        def backward_fn(grad):
+            # dx_i = g*p_i everywhere, then dx_target -= g
+            contribution = [grad * p_i for p_i in probs]
+            contribution[target_index] -= grad
             return [(parent, contribution)]
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
