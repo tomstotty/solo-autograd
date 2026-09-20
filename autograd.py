@@ -7,13 +7,12 @@ import sys
 
 
 def _as_finite_float(value):
-    """Validate a scalar number; TypeError on bad type, ValueError if non-finite."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError("expected a finite number")
-    result = float(value)
-    if not math.isfinite(result):
-        raise ValueError("expected a finite number")
-    return result
+    """Validate a scalar float; TypeError on bad type, ValueError if non-finite."""
+    if isinstance(value, bool) or not isinstance(value, float):
+        raise TypeError("expected a finite float")
+    if not math.isfinite(value):
+        raise ValueError("expected a finite float")
+    return value
 
 
 def _validate_data(data):
@@ -22,11 +21,10 @@ def _validate_data(data):
         raise TypeError(
             "data must be a finite float scalar or a non-empty 1D float list"
         )
-    if isinstance(data, (int, float)):
-        result = float(data)
-        if not math.isfinite(result):
+    if isinstance(data, float):
+        if not math.isfinite(data):
             raise ValueError("data must be finite")
-        return result
+        return data
     if isinstance(data, list):
         if len(data) == 0:
             raise ValueError("data list must be non-empty")
@@ -34,6 +32,20 @@ def _validate_data(data):
     raise TypeError(
         "data must be a finite float scalar or a non-empty 1D float list"
     )
+
+
+def _ensure_finite_data(data):
+    """ValueError if a forward result contains a non-finite value."""
+    values = data if isinstance(data, list) else [data]
+    if not all(math.isfinite(v) for v in values):
+        raise ValueError("forward result must be finite")
+
+
+def _ensure_finite_grad(value):
+    """ValueError if a gradient to accumulate contains a non-finite value."""
+    values = value if isinstance(value, list) else [value]
+    if not all(math.isfinite(v) for v in values):
+        raise ValueError("gradient must be finite")
 
 
 def _broadcast_apply(a, b, op):
@@ -51,6 +63,13 @@ def _broadcast_apply(a, b, op):
     return [op(x, y) for x, y in zip(a, b)]
 
 
+def _map_unary(data, op):
+    """Apply op elementwise over a scalar or vector."""
+    if isinstance(data, list):
+        return [op(x) for x in data]
+    return op(data)
+
+
 def _reduce_like(parent_data, value):
     """Sum a broadcast gradient back down to the parent's shape."""
     if not isinstance(parent_data, list) and isinstance(value, list):
@@ -58,38 +77,32 @@ def _reduce_like(parent_data, value):
     return value
 
 
-def _accumulate(node, value):
-    """Accumulate a gradient into a node that participates in the graph."""
-    if not node.requires_grad:
-        return
-    if node.grad is None:
-        node.grad = value
-    elif isinstance(value, list):
-        node.grad = [x + y for x, y in zip(node.grad, value)]
-    else:
-        node.grad = node.grad + value
+def _merge_grad(a, b):
+    """Combine two gradient contributions of identical shape."""
+    if isinstance(a, list):
+        return [x + y for x, y in zip(a, b)]
+    return a + b
 
 
 def _validate_grad(grad, like):
     """Validate an externally supplied outgoing gradient against tensor data."""
     if isinstance(grad, bool):
-        raise TypeError("grad must be a number or a list of numbers")
+        raise TypeError("grad must be a float or a list of floats")
     if isinstance(like, float):
         if isinstance(grad, list):
             raise ValueError("grad shape must match tensor shape")
-        if not isinstance(grad, (int, float)):
-            raise TypeError("grad must be a number for a scalar tensor")
-        result = float(grad)
-        if not math.isfinite(result):
+        if not isinstance(grad, float):
+            raise TypeError("grad must be a float for a scalar tensor")
+        if not math.isfinite(grad):
             raise ValueError("grad must be finite")
-        return result
+        return grad
     if isinstance(grad, list):
         if len(grad) != len(like):
             raise ValueError("grad shape must match tensor shape")
         return [_as_finite_float(x) for x in grad]
-    if isinstance(grad, (int, float)):
+    if isinstance(grad, float):
         raise ValueError("grad shape must match tensor shape")
-    raise TypeError("grad must be a number or a list of numbers")
+    raise TypeError("grad must be a float or a list of floats")
 
 
 class Tensor:
@@ -116,28 +129,27 @@ class Tensor:
     def _coerce(self, other):
         if isinstance(other, Tensor):
             return other
-        if isinstance(other, bool) or not isinstance(other, (int, float)):
-            raise TypeError("other must be a Tensor or a finite number")
-        if not math.isfinite(float(other)):
+        if isinstance(other, bool) or not isinstance(other, float):
+            raise TypeError("other must be a Tensor or a finite float")
+        if not math.isfinite(other):
             raise ValueError("other must be finite")
-        return Tensor(float(other))
+        return Tensor(other)
 
     def add(self, other):
         other = self._coerce(other)
         out_data = _broadcast_apply(
             self.data, other.data, lambda x, y: x + y
         )
+        _ensure_finite_data(out_data)
         if not (self.requires_grad or other.requires_grad):
             return Tensor._make(out_data, False, (), None)
         parent_self, parent_other = self, other
 
         def backward_fn(grad):
-            _accumulate(
-                parent_self, _reduce_like(parent_self.data, grad)
-            )
-            _accumulate(
-                parent_other, _reduce_like(parent_other.data, grad)
-            )
+            return [
+                (parent_self, _reduce_like(parent_self.data, grad)),
+                (parent_other, _reduce_like(parent_other.data, grad)),
+            ]
 
         return Tensor._make(
             out_data, True, (parent_self, parent_other), backward_fn
@@ -148,6 +160,7 @@ class Tensor:
         out_data = _broadcast_apply(
             self.data, other.data, lambda x, y: x * y
         )
+        _ensure_finite_data(out_data)
         if not (self.requires_grad or other.requires_grad):
             return Tensor._make(out_data, False, (), None)
         parent_self, parent_other = self, other
@@ -156,12 +169,47 @@ class Tensor:
         def backward_fn(grad):
             grad_self = _broadcast_apply(grad, b, lambda x, y: x * y)
             grad_other = _broadcast_apply(grad, a, lambda x, y: x * y)
-            _accumulate(parent_self, _reduce_like(a, grad_self))
-            _accumulate(parent_other, _reduce_like(b, grad_other))
+            return [
+                (parent_self, _reduce_like(a, grad_self)),
+                (parent_other, _reduce_like(b, grad_other)),
+            ]
 
         return Tensor._make(
             out_data, True, (parent_self, parent_other), backward_fn
         )
+
+    def tanh(self):
+        out_data = _map_unary(self.data, math.tanh)
+        _ensure_finite_data(out_data)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        out = out_data
+
+        def backward_fn(grad):
+            contribution = _broadcast_apply(
+                grad, out, lambda g, y: g * (1.0 - y * y)
+            )
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
+    def sum(self):
+        if isinstance(self.data, list):
+            out_data = sum(self.data)
+        else:
+            out_data = self.data
+        _ensure_finite_data(out_data)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+
+        def backward_fn(grad):
+            if isinstance(parent.data, list):
+                return [(parent, [grad] * len(parent.data))]
+            return [(parent, grad)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
 
     def zero_grad(self):
         self.grad = None
@@ -192,15 +240,44 @@ class Tensor:
 
         build(self)
 
-        # Recompute the output and every intermediate on each pass so that
-        # repeated backward() calls accumulate only into graph leaves.
+        # Phase 1: compute every gradient without mutating any node, so a
+        # non-finite gradient aborts the pass with all grads untouched.
+        grads = {id(self): grad}
+        for node in reversed(topo):
+            if node._backward_fn is None:
+                continue
+            node_grad = grads.get(id(node))
+            if node_grad is None:
+                continue
+            for parent, contribution in node._backward_fn(node_grad):
+                if not parent.requires_grad:
+                    continue
+                _ensure_finite_grad(contribution)
+                existing = grads.get(id(parent))
+                if existing is None:
+                    grads[id(parent)] = contribution
+                else:
+                    merged = _merge_grad(existing, contribution)
+                    _ensure_finite_grad(merged)
+                    grads[id(parent)] = merged
+
+        # Phase 2: resolve the final grad for every node, validate, then
+        # apply. Non-leaf grads are recomputed; leaf grads accumulate.
+        assignments = []
         for node in topo:
             if node._parents:
-                node.grad = None
-        _accumulate(self, grad)
-        for node in reversed(topo):
-            if node._backward_fn is not None:
-                node._backward_fn(node.grad)
+                assignments.append((node, grads.get(id(node))))
+            elif node.requires_grad:
+                value = grads.get(id(node))
+                if value is not None:
+                    if node.grad is not None:
+                        value = _merge_grad(node.grad, value)
+                    assignments.append((node, value))
+        for node, value in assignments:
+            if value is not None:
+                _ensure_finite_grad(value)
+        for node, value in assignments:
+            node.grad = value
 
     def to_json(self):
         return (
@@ -212,6 +289,61 @@ class Tensor:
             + ("true" if self.requires_grad else "false")
             + "}"
         )
+
+
+def gradcheck(fn, data, eps=1e-6, atol=1e-5):
+    """Compare analytic gradients from backward() with central differences.
+
+    Returns (passed, max_abs_error) where passed is True only when every
+    per-element absolute error is at most atol.
+    """
+    if not callable(fn):
+        raise TypeError("fn must be callable")
+    if isinstance(eps, bool) or not isinstance(eps, float):
+        raise TypeError("eps must be a finite float")
+    if not math.isfinite(eps) or eps <= 0.0:
+        raise ValueError("eps must be a positive finite float")
+    if isinstance(atol, bool) or not isinstance(atol, float):
+        raise TypeError("atol must be a finite float")
+    if not math.isfinite(atol) or atol < 0.0:
+        raise ValueError("atol must be a non-negative finite float")
+    tensor = Tensor(data, True)
+
+    def scalar_data(result):
+        if not isinstance(result, Tensor):
+            raise TypeError("fn must return a Tensor")
+        if isinstance(result.data, list):
+            raise ValueError("fn must return a scalar Tensor")
+        return result.data
+
+    result = fn(tensor)
+    scalar_data(result)
+    if not result._parents:
+        raise ValueError("fn result must be part of a graph")
+    result.backward()
+    if tensor.grad is None:
+        raise ValueError("fn result is not connected to the input")
+
+    vector = isinstance(tensor.data, list)
+    base = tensor.data if vector else [tensor.data]
+    analytic = tensor.grad if vector else [tensor.grad]
+
+    max_abs_error = 0.0
+    passed = True
+    for index in range(len(base)):
+        plus = list(base)
+        minus = list(base)
+        plus[index] = base[index] + eps
+        minus[index] = base[index] - eps
+        f_plus = scalar_data(fn(Tensor(plus if vector else plus[0])))
+        f_minus = scalar_data(fn(Tensor(minus if vector else minus[0])))
+        numeric = (f_plus - f_minus) / (2.0 * eps)
+        error = abs(analytic[index] - numeric)
+        if error > max_abs_error:
+            max_abs_error = error
+        if error > atol:
+            passed = False
+    return (passed, max_abs_error)
 
 
 def _format_float(value):
