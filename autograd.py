@@ -291,6 +291,57 @@ class Tensor:
         )
 
 
+class SGD:
+    """Vanilla SGD optimizer: data -= lr * grad for finite float tensors."""
+
+    def __init__(self, parameters, lr):
+        if not isinstance(parameters, list):
+            raise TypeError("parameters must be a list of Tensor")
+        for parameter in parameters:
+            if not isinstance(parameter, Tensor):
+                raise TypeError("parameters must contain only Tensor objects")
+        if len(parameters) == 0:
+            raise ValueError("parameters list must be non-empty")
+        if len({id(parameter) for parameter in parameters}) != len(parameters):
+            raise ValueError("parameters must not contain duplicate tensors")
+        self._parameters = list(parameters)
+
+        if isinstance(lr, bool) or not isinstance(lr, float):
+            raise TypeError("lr must be a finite positive float")
+        if not math.isfinite(lr) or lr <= 0.0:
+            raise ValueError("lr must be a finite positive float")
+        self.lr = lr
+
+    def step(self):
+        # Phase 1: validate every grad and precompute every new data value,
+        # so a failure leaves all data/grad/requires_grad untouched.
+        updates = []
+        for parameter in self._parameters:
+            if not parameter.requires_grad or parameter.grad is None:
+                continue
+            grad = _validate_grad(parameter.grad, parameter.data)
+            if isinstance(parameter.data, list):
+                new_data = [
+                    x - self.lr * g for x, g in zip(parameter.data, grad)
+                ]
+            else:
+                new_data = parameter.data - self.lr * grad
+            values = new_data if isinstance(new_data, list) else [new_data]
+            if not all(math.isfinite(value) for value in values):
+                raise ValueError("updated data must be finite")
+            updates.append((parameter, new_data))
+
+        # Phase 2: commit. Only data changes; grad/requires_grad are kept.
+        for parameter, new_data in updates:
+            parameter.data = new_data
+        return None
+
+    def zero_grad(self):
+        for parameter in self._parameters:
+            parameter.grad = None
+        return None
+
+
 def gradcheck(fn, data, eps=1e-6, atol=1e-5):
     """Compare analytic gradients from backward() with central differences.
 
