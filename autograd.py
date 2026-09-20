@@ -597,6 +597,35 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def gather(self, indices):
+        data = _require_nonempty_float_vector(self, "gather")
+        if not isinstance(indices, list):
+            raise TypeError("indices must be a list of non-bool ints")
+        for index in indices:
+            if isinstance(index, bool) or not isinstance(index, int):
+                raise TypeError("indices elements must be non-bool ints")
+        if len(indices) == 0:
+            raise ValueError("indices must be non-empty")
+        n = len(data)
+        for index in indices:
+            if index < 0 or index >= n:
+                raise ValueError("indices index out of range")
+        out_data = [data[index] for index in indices]
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # Snapshot the indices so later caller-side mutation cannot change
+        # the backward pass.
+        saved_indices = list(indices)
+
+        def backward_fn(grad):
+            dx = [0.0] * n
+            for o in range(len(saved_indices)):
+                dx[saved_indices[o]] += grad[o]
+            return [(parent, dx)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def zero_grad(self):
         self.grad = None
         return None
