@@ -289,6 +289,175 @@ class Tensor:
             out_data, True, (parent_self, parent_other), backward_fn
         )
 
+    def cosine_similarity(self, other, eps=1e-12):
+        if not isinstance(other, Tensor):
+            raise TypeError("other must be a Tensor")
+        a = _require_nonempty_float_vector(self, "cosine_similarity")
+        b = _require_nonempty_float_vector(other, "cosine_similarity")
+        if len(a) != len(b):
+            raise ValueError("cosine_similarity vector lengths must match")
+        if isinstance(eps, bool) or not isinstance(eps, float):
+            raise TypeError("eps must be a positive finite float")
+        if not math.isfinite(eps) or eps <= 0.0:
+            raise ValueError("eps must be a positive finite float")
+        # Accumulate the dot product and both squared norms index by index
+        # from 0.0, multiplying before adding at each index; a non-finite
+        # product or partial sum aborts before a result tensor exists, so
+        # no state can change on failure.
+        acc_d = 0.0
+        acc_a = 0.0
+        acc_b = 0.0
+        for i in range(len(a)):
+            product_d = a[i] * b[i]
+            if not math.isfinite(product_d):
+                raise ValueError(
+                    "cosine_similarity intermediate must be finite"
+                )
+            acc_d += product_d
+            if not math.isfinite(acc_d):
+                raise ValueError(
+                    "cosine_similarity intermediate must be finite"
+                )
+            product_a = a[i] * a[i]
+            if not math.isfinite(product_a):
+                raise ValueError(
+                    "cosine_similarity intermediate must be finite"
+                )
+            acc_a += product_a
+            if not math.isfinite(acc_a):
+                raise ValueError(
+                    "cosine_similarity intermediate must be finite"
+                )
+            product_b = b[i] * b[i]
+            if not math.isfinite(product_b):
+                raise ValueError(
+                    "cosine_similarity intermediate must be finite"
+                )
+            acc_b += product_b
+            if not math.isfinite(acc_b):
+                raise ValueError(
+                    "cosine_similarity intermediate must be finite"
+                )
+        denom_a = acc_a + eps
+        if not math.isfinite(denom_a):
+            raise ValueError("cosine_similarity intermediate must be finite")
+        u = math.sqrt(denom_a)
+        if not math.isfinite(u):
+            raise ValueError("cosine_similarity intermediate must be finite")
+        denom_b = acc_b + eps
+        if not math.isfinite(denom_b):
+            raise ValueError("cosine_similarity intermediate must be finite")
+        v = math.sqrt(denom_b)
+        if not math.isfinite(v):
+            raise ValueError("cosine_similarity intermediate must be finite")
+        q = u * v
+        if not math.isfinite(q):
+            raise ValueError("cosine_similarity intermediate must be finite")
+        out_data = acc_d / q
+        if not math.isfinite(out_data):
+            raise ValueError("cosine_similarity intermediate must be finite")
+        if not (self.requires_grad or other.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_other = self, other
+        # Snapshot both operands and the forward intermediates so later
+        # caller-side mutation of either input list cannot change what a
+        # pending backward pass uses.
+        snapshot_a = list(parent_self.data)
+        snapshot_b = list(parent_other.data)
+        n = len(snapshot_a)
+
+        def backward_fn(grad):
+            g = grad
+            dx = None
+            db = None
+            if parent_self.requires_grad:
+                dx = []
+                for i in range(n):
+                    over_q = snapshot_b[i] / q
+                    if not math.isfinite(over_q):
+                        raise ValueError(
+                            "cosine_similarity backward intermediate"
+                            " must be finite"
+                        )
+                    ya = out_data * snapshot_a[i]
+                    if not math.isfinite(ya):
+                        raise ValueError(
+                            "cosine_similarity backward intermediate"
+                            " must be finite"
+                        )
+                    over_a = ya / denom_a
+                    if not math.isfinite(over_a):
+                        raise ValueError(
+                            "cosine_similarity backward intermediate"
+                            " must be finite"
+                        )
+                    inner = over_q - over_a
+                    if not math.isfinite(inner):
+                        raise ValueError(
+                            "cosine_similarity backward intermediate"
+                            " must be finite"
+                        )
+                    value = g * inner
+                    if not math.isfinite(value):
+                        raise ValueError(
+                            "cosine_similarity backward intermediate"
+                            " must be finite"
+                        )
+                    dx.append(value)
+            if parent_other.requires_grad:
+                db = []
+                for i in range(n):
+                    over_q = snapshot_a[i] / q
+                    if not math.isfinite(over_q):
+                        raise ValueError(
+                            "cosine_similarity backward intermediate"
+                            " must be finite"
+                        )
+                    yb = out_data * snapshot_b[i]
+                    if not math.isfinite(yb):
+                        raise ValueError(
+                            "cosine_similarity backward intermediate"
+                            " must be finite"
+                        )
+                    over_b = yb / denom_b
+                    if not math.isfinite(over_b):
+                        raise ValueError(
+                            "cosine_similarity backward intermediate"
+                            " must be finite"
+                        )
+                    inner = over_q - over_b
+                    if not math.isfinite(inner):
+                        raise ValueError(
+                            "cosine_similarity backward intermediate"
+                            " must be finite"
+                        )
+                    value = g * inner
+                    if not math.isfinite(value):
+                        raise ValueError(
+                            "cosine_similarity backward intermediate"
+                            " must be finite"
+                        )
+                    db.append(value)
+            if parent_self is parent_other:
+                merged = [x + y for x, y in zip(dx, db)]
+                for value in merged:
+                    if not math.isfinite(value):
+                        raise ValueError(
+                            "cosine_similarity backward intermediate"
+                            " must be finite"
+                        )
+                return [(parent_self, merged)]
+            contributions = []
+            if dx is not None:
+                contributions.append((parent_self, dx))
+            if db is not None:
+                contributions.append((parent_other, db))
+            return contributions
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_other), backward_fn
+        )
+
     def tanh(self):
         out_data = _map_unary(self.data, math.tanh)
         _ensure_finite_data(out_data)
