@@ -214,6 +214,51 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def softmax(self):
+        data = self.data
+        if not isinstance(data, list) or len(data) == 0:
+            raise ValueError("softmax requires a non-empty 1D float list")
+        for value in data:
+            if isinstance(value, bool) or not isinstance(value, float):
+                raise TypeError("softmax data elements must be floats")
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        for value in data:
+            if not math.isfinite(value):
+                raise ValueError("softmax data elements must be finite")
+        # Shift by the maximum so exp is only ever evaluated on values
+        # in (-inf, 0]; exp(x_i) directly is never computed.
+        m = max(data)
+        z = []
+        for value in data:
+            diff = value - m
+            if not math.isfinite(diff):
+                raise ValueError("softmax intermediate must be finite")
+            z_i = math.exp(diff)
+            if not math.isfinite(z_i):
+                raise ValueError("softmax intermediate must be finite")
+            z.append(z_i)
+        s = sum(z)
+        if not math.isfinite(s):
+            raise ValueError("softmax intermediate must be finite")
+        out_data = []
+        for z_i in z:
+            y_i = z_i / s
+            if not math.isfinite(y_i):
+                raise ValueError("softmax intermediate must be finite")
+            out_data.append(y_i)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        out = out_data
+
+        def backward_fn(grad):
+            dot = sum(g * y for g, y in zip(grad, out))
+            contribution = [y * (g - dot) for g, y in zip(grad, out)]
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def zero_grad(self):
         self.grad = None
         return None
@@ -579,6 +624,16 @@ def _json_value(value):
     return _format_float(float(value))
 
 
+def _write_stdout_bytes(text):
+    """Write text to stdout as UTF-8 bytes, bypassing newline translation."""
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is not None:
+        buffer.write(text.encode("utf-8"))
+        buffer.flush()
+    else:
+        sys.stdout.write(text)
+
+
 def _cli_tensor():
     line = sys.stdin.readline()
     try:
@@ -869,7 +924,9 @@ def _cli_evaluate(path):
     if not math.isfinite(loss):
         print("evaluation produced a non-finite value", file=sys.stderr)
         return 2
-    sys.stdout.write('{"loss":' + _format_float(loss) + "}\n")
+    # Write raw UTF-8 bytes so Windows text-mode newline translation cannot
+    # turn the single trailing LF into CRLF.
+    _write_stdout_bytes('{"loss":' + _format_float(loss) + "}\n")
     return 0
 
 
