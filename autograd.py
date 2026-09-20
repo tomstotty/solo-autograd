@@ -425,6 +425,61 @@ class Tensor:
             out_data, True, (parent_self, parent_kernel), backward_fn
         )
 
+    def max_pool1d(self, kernel_size, stride=None, padding=0):
+        data = _require_nonempty_float_vector(self, "max_pool1d")
+        if isinstance(kernel_size, bool) or not isinstance(kernel_size, int):
+            raise TypeError("kernel_size must be a positive int")
+        if kernel_size <= 0:
+            raise ValueError("kernel_size must be a positive int")
+        if stride is None:
+            stride = kernel_size
+        if isinstance(stride, bool) or not isinstance(stride, int):
+            raise TypeError("stride must be a positive int")
+        if stride <= 0:
+            raise ValueError("stride must be a positive int")
+        if isinstance(padding, bool) or not isinstance(padding, int):
+            raise TypeError("padding must be a non-negative int")
+        if padding < 0:
+            raise ValueError("padding must be a non-negative int")
+        n = len(data)
+        out_len = (n + 2 * padding - kernel_size) // stride + 1
+        if out_len <= 0:
+            raise ValueError("max_pool1d output length must be positive")
+        # Max over each window; out-of-range input positions (from
+        # padding) are skipped. Ties keep the smallest input index.
+        out_data = []
+        argmax = []
+        for o in range(out_len):
+            best = None
+            best_j = None
+            for i in range(kernel_size):
+                j = o * stride + i - padding
+                if 0 <= j < n and (best is None or data[j] > best):
+                    best = data[j]
+                    best_j = j
+            if best is None:
+                raise ValueError(
+                    "max_pool1d window must cover a valid input index"
+                )
+            out_data.append(best)
+            argmax.append(best_j)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+
+        def backward_fn(grad):
+            dx = [0.0] * n
+            for o in range(out_len):
+                j = argmax[o]
+                dx[j] += grad[o]
+                if not math.isfinite(dx[j]):
+                    raise ValueError(
+                        "max_pool1d backward intermediate must be finite"
+                    )
+            return [(parent, dx)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def zero_grad(self):
         self.grad = None
         return None
