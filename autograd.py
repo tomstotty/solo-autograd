@@ -108,6 +108,55 @@ def _validate_grad(grad, like):
     raise TypeError("grad must be a float or a list of floats")
 
 
+def _require_nonempty_float_vector(tensor, op):
+    """Validate the shared log_softmax/cross_entropy preconditions."""
+    data = tensor.data
+    if not isinstance(data, list) or len(data) == 0:
+        raise ValueError(op + " requires a non-empty 1D float list")
+    for value in data:
+        if isinstance(value, bool) or not isinstance(value, float):
+            raise TypeError(op + " data elements must be floats")
+    if not isinstance(tensor.requires_grad, bool):
+        raise TypeError("requires_grad must be a bool")
+    for value in data:
+        if not math.isfinite(value):
+            raise ValueError(op + " data elements must be finite")
+    return data
+
+
+def _log_softmax_values(data):
+    """Compute log-softmax values stably.
+
+    Shift by the maximum so exp is only ever evaluated on values in
+    (-inf, 0]; exp(x_i) directly is never computed.
+    """
+    m = max(data)
+    diffs = []
+    z = []
+    for value in data:
+        diff = value - m
+        if not math.isfinite(diff):
+            raise ValueError("log_softmax intermediate must be finite")
+        diffs.append(diff)
+        z_i = math.exp(diff)
+        if not math.isfinite(z_i):
+            raise ValueError("log_softmax intermediate must be finite")
+        z.append(z_i)
+    s = sum(z)
+    if not math.isfinite(s):
+        raise ValueError("log_softmax intermediate must be finite")
+    log_s = math.log(s)
+    if not math.isfinite(log_s):
+        raise ValueError("log_softmax intermediate must be finite")
+    out = []
+    for diff in diffs:
+        l_i = diff - log_s
+        if not math.isfinite(l_i):
+            raise ValueError("log_softmax intermediate must be finite")
+        out.append(l_i)
+    return out
+
+
 class Tensor:
     def __init__(self, data, requires_grad=False):
         normalized = _validate_data(data)
@@ -255,6 +304,43 @@ class Tensor:
         def backward_fn(grad):
             dot = sum(g * y for g, y in zip(grad, out))
             contribution = [y * (g - dot) for g, y in zip(grad, out)]
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
+    def log_softmax(self):
+        data = _require_nonempty_float_vector(self, "log_softmax")
+        out_data = _log_softmax_values(data)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        out = out_data
+
+        def backward_fn(grad):
+            total = sum(grad)
+            contribution = [
+                g - math.exp(l_i) * total for g, l_i in zip(grad, out)
+            ]
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
+    def cross_entropy(self, target):
+        data = _require_nonempty_float_vector(self, "cross_entropy")
+        if isinstance(target, bool) or not isinstance(target, int):
+            raise TypeError("target must be a non-bool int")
+        if target < 0 or target >= len(data):
+            raise ValueError("target index out of range")
+        log_values = _log_softmax_values(data)
+        out_data = -log_values[target]
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        target_index = target
+
+        def backward_fn(grad):
+            contribution = [grad * math.exp(l_i) for l_i in log_values]
+            contribution[target_index] -= grad
             return [(parent, contribution)]
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
