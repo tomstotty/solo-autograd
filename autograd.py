@@ -197,6 +197,56 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def softmax(self):
+        data = self.data
+        if not isinstance(data, list) or len(data) == 0:
+            raise ValueError(
+                "softmax requires a non-empty 1D list of finite floats"
+            )
+        for value in data:
+            if isinstance(value, bool) or not isinstance(value, float):
+                raise TypeError("softmax elements must be finite floats")
+            if not math.isfinite(value):
+                raise ValueError("softmax elements must be finite floats")
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        # Shift by the max before exponentiating; exp(x_i) directly could
+        # overflow even when every softmax output is well behaved.
+        shift = max(data)
+        diffs = []
+        for value in data:
+            diff = value - shift
+            if not math.isfinite(diff):
+                raise ValueError("softmax differences must be finite")
+            diffs.append(diff)
+        z_values = []
+        for diff in diffs:
+            z = math.exp(diff)
+            if not math.isfinite(z):
+                raise ValueError("softmax exponentials must be finite")
+            z_values.append(z)
+        total = sum(z_values)
+        if not math.isfinite(total):
+            raise ValueError("softmax normalization must be finite")
+        out_data = []
+        for z in z_values:
+            y = z / total
+            if not math.isfinite(y):
+                raise ValueError("softmax outputs must be finite")
+            out_data.append(y)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        out = out_data
+
+        def backward_fn(grad):
+            dot = sum(g * y for g, y in zip(grad, out))
+            if not math.isfinite(dot):
+                raise ValueError("gradient must be finite")
+            return [(parent, [y * (g - dot) for g, y in zip(grad, out)])]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def sum(self):
         if isinstance(self.data, list):
             out_data = sum(self.data)
@@ -869,7 +919,12 @@ def _cli_evaluate(path):
     if not math.isfinite(loss):
         print("evaluation produced a non-finite value", file=sys.stderr)
         return 2
-    sys.stdout.write('{"loss":' + _format_float(loss) + "}\n")
+    # Write raw UTF-8 bytes so Windows text mode cannot turn the single
+    # trailing LF into CRLF.
+    sys.stdout.buffer.write(
+        ('{"loss":' + _format_float(loss) + "}\n").encode("utf-8")
+    )
+    sys.stdout.buffer.flush()
     return 0
 
 
