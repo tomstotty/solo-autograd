@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Minimal autograd framework: finite scalar / 1D float tensors."""
 
+import contextlib
 import json
 import math
+import os
 import re
 import sys
+import tempfile
 
 
 def _as_finite_float(value):
@@ -606,6 +609,102 @@ def _cli_tensor():
     return 0
 
 
+def _json_object(pairs):
+    """object_pairs_hook that preserves order and rejects duplicate keys."""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
+def _read_checkpoint_parameters():
+    """Build the ordered parameters dict from one stdin JSON line.
+
+    Raises ValueError or TypeError for any malformed input; values are
+    validated through the Tensor constructor.
+    """
+    line = sys.stdin.readline()
+    try:
+        payload = json.loads(line, object_pairs_hook=_json_object)
+    except ValueError as exc:
+        raise ValueError("invalid JSON input") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("input must be a JSON object")
+    if list(payload.keys()) != ["parameters"]:
+        raise ValueError("only parameters is allowed")
+    members = payload["parameters"]
+    if not isinstance(members, dict) or len(members) == 0:
+        raise ValueError("parameters must be a non-empty JSON object")
+    parameters = {}
+    for name, item in members.items():
+        if not isinstance(item, dict) or list(item.keys()) != [
+            "data",
+            "requires_grad",
+        ]:
+            raise ValueError(
+                "each parameter must contain only data then requires_grad"
+            )
+        parameters[name] = Tensor(item["data"], item["requires_grad"])
+    return parameters
+
+
+def _atomic_write(path, content):
+    """Write UTF-8 bytes via a temp file, fsync, then os.replace."""
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".autograd-checkpoint-", dir=directory
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content.encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.remove(tmp_path)
+        raise
+
+
+def _cli_checkpoint(action, path):
+    try:
+        parameters = _read_checkpoint_parameters()
+    except (TypeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    if action == "save":
+        try:
+            content = dump_state(parameters)
+        except (TypeError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        try:
+            _atomic_write(path, content)
+        except OSError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        return 0
+
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    try:
+        load_state(parameters, text)
+        output = dump_state(parameters)
+    except (TypeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    sys.stdout.write(output + "\n")
+    return 0
+
+
 def main(argv):
     if len(argv) == 1 and argv[0] == "tensor":
         try:
@@ -613,7 +712,21 @@ def main(argv):
         except Exception as exc:  # noqa: BLE001 - unexpected CLI failure
             print(str(exc), file=sys.stderr)
             return 1
-    print("usage: python autograd.py tensor", file=sys.stderr)
+    if (
+        len(argv) == 3
+        and argv[0] == "checkpoint"
+        and argv[1] in ("save", "load")
+    ):
+        try:
+            return _cli_checkpoint(argv[1], argv[2])
+        except Exception as exc:  # noqa: BLE001 - unexpected CLI failure
+            print(str(exc), file=sys.stderr)
+            return 1
+    print(
+        "usage: python autograd.py tensor"
+        " | python autograd.py checkpoint {save,load} PATH",
+        file=sys.stderr,
+    )
     return 1
 
 
