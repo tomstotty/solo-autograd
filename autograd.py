@@ -345,6 +345,106 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def conv1d(self, kernel, stride=1, padding=0):
+        if not isinstance(kernel, Tensor):
+            raise TypeError("kernel must be a Tensor")
+        x = _require_nonempty_float_vector(self, "conv1d")
+        w = _require_nonempty_float_vector(kernel, "conv1d")
+        if isinstance(stride, bool) or not isinstance(stride, int):
+            raise TypeError("stride must be a non-bool positive int")
+        if stride <= 0:
+            raise ValueError("stride must be a positive int")
+        if isinstance(padding, bool) or not isinstance(padding, int):
+            raise TypeError("padding must be a non-bool non-negative int")
+        if padding < 0:
+            raise ValueError("padding must be a non-negative int")
+        n = len(x)
+        kernel_len = len(w)
+        out_len = (n + 2 * padding - kernel_len) // stride + 1
+        if out_len <= 0:
+            raise ValueError("conv1d output length must be positive")
+        # Single-channel 1D cross-correlation: the kernel is applied as-is
+        # (never flipped); positions falling outside the padded input skip.
+        out_data = []
+        for o in range(out_len):
+            total = 0.0
+            for i in range(kernel_len):
+                j = o * stride + i - padding
+                if 0 <= j < n:
+                    product = x[j] * w[i]
+                    if not math.isfinite(product):
+                        raise ValueError("conv1d multiply-add must be finite")
+                    total = total + product
+                    if not math.isfinite(total):
+                        raise ValueError("conv1d multiply-add must be finite")
+            out_data.append(total)
+        if not (self.requires_grad or kernel.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_kernel = self, kernel
+        need_self = self.requires_grad
+        need_kernel = kernel.requires_grad
+        same_object = self is kernel
+
+        def backward_fn(grad):
+            # Accumulate into fresh buffers in (o, i) order and validate
+            # every multiply-add, so a non-finite result aborts the pass
+            # before the engine merges anything into an existing grad.
+            dx = [0.0] * n if need_self else None
+            dk = [0.0] * kernel_len if need_kernel else None
+            for o in range(out_len):
+                g = grad[o]
+                for i in range(kernel_len):
+                    j = o * stride + i - padding
+                    if j < 0 or j >= n:
+                        continue
+                    if dx is not None:
+                        term = g * w[i]
+                        if not math.isfinite(term):
+                            raise ValueError(
+                                "conv1d backward multiply-add must be finite"
+                            )
+                        value = dx[j] + term
+                        if not math.isfinite(value):
+                            raise ValueError(
+                                "conv1d backward multiply-add must be finite"
+                            )
+                        dx[j] = value
+                    if dk is not None:
+                        term = g * x[j]
+                        if not math.isfinite(term):
+                            raise ValueError(
+                                "conv1d backward multiply-add must be finite"
+                            )
+                        value = dk[i] + term
+                        if not math.isfinite(value):
+                            raise ValueError(
+                                "conv1d backward multiply-add must be finite"
+                            )
+                        dk[i] = value
+            if same_object:
+                merged = []
+                for dx_value, dk_value in zip(dx, dk):
+                    value = dx_value + dk_value
+                    if not math.isfinite(value):
+                        raise ValueError(
+                            "conv1d gradient merge must be finite"
+                        )
+                    merged.append(value)
+                return [(parent_self, merged)]
+            contributions = []
+            if need_self:
+                contributions.append((parent_self, dx))
+            if need_kernel:
+                contributions.append((parent_kernel, dk))
+            return contributions
+
+        return Tensor._make(
+            out_data,
+            True,
+            (parent_self, parent_kernel),
+            backward_fn,
+        )
+
     def zero_grad(self):
         self.grad = None
         return None
