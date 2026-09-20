@@ -3,6 +3,7 @@
 
 import json
 import math
+import re
 import sys
 
 
@@ -425,6 +426,225 @@ def _json_value(value):
     if isinstance(value, list):
         return "[" + ",".join(_format_float(float(x)) for x in value) + "]"
     return _format_float(float(value))
+
+
+_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# Exactly the text _format_float can emit: an optional minus, an integer with
+# no leading zeroes, a dot and exactly 6 fractional digits.
+_NUMBER_RE = re.compile(r"-?(?:0|[1-9][0-9]*)\.[0-9]{6}")
+
+
+def _validate_parameters(parameters):
+    """Validate a non-empty dict of name -> unique Tensor; return its items."""
+    if not isinstance(parameters, dict):
+        raise TypeError("parameters must be a dict of named Tensors")
+    if len(parameters) == 0:
+        raise ValueError("parameters must be non-empty")
+    items = list(parameters.items())
+    for name, tensor in items:
+        if not isinstance(name, str) or _NAME_RE.fullmatch(name) is None:
+            raise ValueError("parameter names must match [A-Za-z_][A-Za-z0-9_]*")
+        if not isinstance(tensor, Tensor):
+            raise TypeError("parameter values must be Tensors")
+    if len({id(tensor) for _, tensor in items}) != len(items):
+        raise ValueError("parameters must not contain duplicate Tensors")
+    return items
+
+
+def dump_state(parameters):
+    """Serialize named Tensors as a compact JSON string."""
+    items = _validate_parameters(parameters)
+    parts = []
+    for name, tensor in items:
+        _validate_data(tensor.data)
+        if not isinstance(tensor.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        parts.append(
+            '{"name":"'
+            + name
+            + '","data":'
+            + _json_value(tensor.data)
+            + ',"requires_grad":'
+            + ("true" if tensor.requires_grad else "false")
+            + "}"
+        )
+    return '{"parameters":[' + ",".join(parts) + "]}"
+
+
+class _StrictStateParser:
+    """Hand-written parser accepting only dump_state's exact JSON dialect."""
+
+    def __init__(self, text):
+        self.text = text
+        self.pos = 0
+
+    def error(self):
+        raise ValueError("state text does not match the expected format")
+
+    def take(self, char):
+        if self.pos >= len(self.text) or self.text[self.pos] != char:
+            self.error()
+        self.pos += 1
+
+    def parse_value(self):
+        if self.pos >= len(self.text):
+            self.error()
+        char = self.text[self.pos]
+        if char == "{":
+            return self.parse_object()
+        if char == "[":
+            return self.parse_array()
+        if char == '"':
+            return self.parse_string()
+        if char == "-" or char.isdigit():
+            return self.parse_number()
+        if self.text.startswith("true", self.pos):
+            self.pos += 4
+            return True
+        if self.text.startswith("false", self.pos):
+            self.pos += 5
+            return False
+        if self.text.startswith("null", self.pos):
+            self.pos += 4
+            return None
+        self.error()
+
+    def parse_number(self):
+        match = _NUMBER_RE.match(self.text, self.pos)
+        if match is None:
+            self.error()
+        token = match.group(0)
+        # dump_state renders negative zero as "0.000000".
+        if token.startswith("-") and float(token) == 0.0:
+            self.error()
+        end = match.end()
+        # Reject any JSON number that is not exactly a 6-decimal float.
+        if end < len(self.text) and self.text[end] in "0123456789.eE+-":
+            self.error()
+        self.pos = end
+        return float(token)
+
+    def parse_string(self):
+        # dump_state only emits unescaped [A-Za-z_][A-Za-z0-9_]* names, so
+        # escapes and control characters are outside the accepted dialect.
+        self.pos += 1
+        start = self.pos
+        while True:
+            if self.pos >= len(self.text):
+                self.error()
+            char = self.text[self.pos]
+            if char == '"':
+                content = self.text[start:self.pos]
+                self.pos += 1
+                return content
+            if char == "\\" or ord(char) < 0x20:
+                self.error()
+            self.pos += 1
+
+    def parse_array(self):
+        self.take("[")
+        result = []
+        if self.pos < len(self.text) and self.text[self.pos] == "]":
+            self.pos += 1
+            return result
+        while True:
+            result.append(self.parse_value())
+            if self.pos >= len(self.text):
+                self.error()
+            if self.text[self.pos] == "]":
+                self.pos += 1
+                return result
+            self.take(",")
+
+    def parse_object(self):
+        self.take("{")
+        result = {}
+        if self.pos < len(self.text) and self.text[self.pos] == "}":
+            self.pos += 1
+            return result
+        while True:
+            if self.pos >= len(self.text) or self.text[self.pos] != '"':
+                self.error()
+            key = self.parse_string()
+            if key in result:
+                self.error()
+            self.take(":")
+            result[key] = self.parse_value()
+            if self.pos >= len(self.text):
+                self.error()
+            if self.text[self.pos] == "}":
+                self.pos += 1
+                return result
+            self.take(",")
+
+    def parse(self):
+        value = self.parse_value()
+        if self.pos != len(self.text):
+            self.error()
+        return value
+
+
+def _loaded_number(raw):
+    """A parsed data element must be a finite float (never bool/null/...)."""
+    if not isinstance(raw, float) or isinstance(raw, bool) or not math.isfinite(raw):
+        raise ValueError("data elements must be finite floats")
+    return raw
+
+
+def _loaded_data(raw, current):
+    """Validate parsed data and match its shape against the current Tensor."""
+    if isinstance(raw, list):
+        if len(raw) == 0:
+            raise ValueError("data list must be non-empty")
+        data = [_loaded_number(x) for x in raw]
+    else:
+        data = _loaded_number(raw)
+    if isinstance(current, list):
+        if not isinstance(data, list) or len(data) != len(current):
+            raise ValueError("data shape must match the current tensor")
+    elif isinstance(data, list):
+        raise ValueError("data shape must match the current tensor")
+    return data
+
+
+def load_state(parameters, text):
+    """Restore Tensors from text produced by dump_state.
+
+    Everything is parsed and validated before any Tensor is touched, so a
+    failure leaves all Tensors unchanged.
+    """
+    if not isinstance(text, str):
+        raise TypeError("text must be a str")
+    items = _validate_parameters(parameters)
+    parsed = _StrictStateParser(text).parse()
+
+    if not isinstance(parsed, dict) or list(parsed) != ["parameters"]:
+        raise ValueError("state text must have a single top-level 'parameters' key")
+    raw_parameters = parsed["parameters"]
+    if not isinstance(raw_parameters, list) or len(raw_parameters) != len(items):
+        raise ValueError("parameter count must match")
+
+    updates = []
+    for (name, tensor), entry in zip(items, raw_parameters):
+        if not isinstance(entry, dict) or list(entry) != [
+            "name",
+            "data",
+            "requires_grad",
+        ]:
+            raise ValueError("each parameter must have name, data, requires_grad")
+        if entry["name"] != name:
+            raise ValueError("parameter names and order must match")
+        if not isinstance(entry["requires_grad"], bool):
+            raise ValueError("requires_grad must be a bool")
+        _validate_data(tensor.data)
+        new_data = _loaded_data(entry["data"], tensor.data)
+        updates.append((tensor, new_data, entry["requires_grad"]))
+
+    for tensor, new_data, requires_grad in updates:
+        tensor.data = new_data
+        tensor.requires_grad = requires_grad
+        tensor.grad = None
+    return None
 
 
 def _cli_tensor():
