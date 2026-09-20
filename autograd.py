@@ -234,6 +234,78 @@ class Tensor:
             out_data, True, (parent_self, parent_other), backward_fn
         )
 
+    def dot(self, other):
+        if not isinstance(other, Tensor):
+            raise TypeError("dot other must be a Tensor")
+        a_data = self.data
+        b_data = other.data
+        if not isinstance(a_data, list) or len(a_data) == 0:
+            raise ValueError("dot requires non-empty 1D float lists")
+        if not isinstance(b_data, list) or len(b_data) == 0:
+            raise ValueError("dot requires non-empty 1D float lists")
+        for values in (a_data, b_data):
+            for value in values:
+                if isinstance(value, bool) or not isinstance(value, float):
+                    raise TypeError("dot data elements must be floats")
+        if not isinstance(self.requires_grad, bool) or not isinstance(
+            other.requires_grad, bool
+        ):
+            raise TypeError("requires_grad must be a bool")
+        if len(a_data) != len(b_data):
+            raise ValueError("dot vector lengths must match")
+        for values in (a_data, b_data):
+            for value in values:
+                if not math.isfinite(value):
+                    raise ValueError("dot data elements must be finite")
+        n = len(a_data)
+        # Index order from 0: multiply first, then add to the running
+        # total starting at 0.0; a non-finite product or partial sum aborts
+        # before any tensor is created.
+        total = 0.0
+        for i in range(n):
+            product = a_data[i] * b_data[i]
+            if not math.isfinite(product):
+                raise ValueError("dot intermediate must be finite")
+            total = total + product
+            if not math.isfinite(total):
+                raise ValueError("dot intermediate must be finite")
+        out_data = total
+        if not (self.requires_grad or other.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_other = self, other
+        # Snapshot both operand lists so later caller-side mutation of the
+        # inputs cannot change what a pending backward pass multiplies.
+        a_snapshot = list(a_data)
+        b_snapshot = list(b_data)
+
+        def backward_fn(grad):
+            contributions = []
+            if parent_self.requires_grad:
+                dx = []
+                for i in range(n):
+                    value = grad * b_snapshot[i]
+                    if not math.isfinite(value):
+                        raise ValueError(
+                            "dot backward intermediate must be finite"
+                        )
+                    dx.append(value)
+                contributions.append((parent_self, dx))
+            if parent_other.requires_grad:
+                db = []
+                for i in range(n):
+                    value = grad * a_snapshot[i]
+                    if not math.isfinite(value):
+                        raise ValueError(
+                            "dot backward intermediate must be finite"
+                        )
+                    db.append(value)
+                contributions.append((parent_other, db))
+            return contributions
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_other), backward_fn
+        )
+
     def tanh(self):
         out_data = _map_unary(self.data, math.tanh)
         _ensure_finite_data(out_data)
