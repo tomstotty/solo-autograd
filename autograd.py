@@ -687,16 +687,8 @@ def _cli_checkpoint_parameters():
     return parameters, None
 
 
-def _cli_checkpoint_save(path):
-    parameters, error = _cli_checkpoint_parameters()
-    if error is not None:
-        print(error, file=sys.stderr)
-        return 2
-    try:
-        content = dump_state(parameters)
-    except (TypeError, ValueError) as exc:
-        print(str(exc), file=sys.stderr)
-        return 2
+def _atomic_write(path, content):
+    """Write content to path atomically; raises OSError on failure."""
     directory = os.path.dirname(os.path.abspath(path))
     fd = None
     tmp_path = None
@@ -709,9 +701,6 @@ def _cli_checkpoint_save(path):
             os.fsync(tmp_file.fileno())
         os.replace(tmp_path, path)
         tmp_path = None
-    except OSError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
     finally:
         if fd is not None:
             os.close(fd)
@@ -720,6 +709,23 @@ def _cli_checkpoint_save(path):
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+
+def _cli_checkpoint_save(path):
+    parameters, error = _cli_checkpoint_parameters()
+    if error is not None:
+        print(error, file=sys.stderr)
+        return 2
+    try:
+        content = dump_state(parameters)
+    except (TypeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    try:
+        _atomic_write(path, content)
+    except OSError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     return 0
 
 
@@ -748,25 +754,11 @@ def _cli_checkpoint_load(path):
     return 0
 
 
-def _cli_evaluate_samples():
-    """Parse the evaluate stdin payload into a list of (x, y) float pairs.
+def _validate_samples(members):
+    """Validate a decoded samples array into a list of (x, y) float pairs.
 
     Returns (samples, error); exactly one of the two is None.
     """
-    text, error = _read_stdin_line()
-    if error is not None:
-        return None, error
-    try:
-        payload = _parse_json_pairs(text)
-    except ValueError:
-        return None, "invalid JSON input"
-    if not isinstance(payload, _ObjectPairs):
-        return None, "input must be an object with only the samples key"
-    if _has_duplicate_key(payload):
-        return None, "duplicate key in JSON input"
-    if [key for key, _ in payload] != ["samples"]:
-        return None, "input must be an object with only the samples key"
-    members = payload[0][1]
     if not isinstance(members, list) or isinstance(members, _ObjectPairs):
         return None, "samples must be a non-empty array of [x, y] pairs"
     if len(members) == 0:
@@ -787,6 +779,27 @@ def _cli_evaluate_samples():
                 return None, "sample values must be finite floats"
         samples.append((x, y))
     return samples, None
+
+
+def _cli_evaluate_samples():
+    """Parse the evaluate stdin payload into a list of (x, y) float pairs.
+
+    Returns (samples, error); exactly one of the two is None.
+    """
+    text, error = _read_stdin_line()
+    if error is not None:
+        return None, error
+    try:
+        payload = _parse_json_pairs(text)
+    except ValueError:
+        return None, "invalid JSON input"
+    if not isinstance(payload, _ObjectPairs):
+        return None, "input must be an object with only the samples key"
+    if _has_duplicate_key(payload):
+        return None, "duplicate key in JSON input"
+    if [key for key, _ in payload] != ["samples"]:
+        return None, "input must be an object with only the samples key"
+    return _validate_samples(payload[0][1])
 
 
 def _cli_evaluate(path):
@@ -855,6 +868,136 @@ def _cli_evaluate(path):
     return 0
 
 
+def _cli_train_config():
+    """Parse the train stdin payload into (samples, steps, lr, seed).
+
+    Returns (config, error); exactly one of the two is None.
+    """
+    text, error = _read_stdin_line()
+    if error is not None:
+        return None, error
+    try:
+        payload = _parse_json_pairs(text)
+    except ValueError:
+        return None, "invalid JSON input"
+    message = (
+        "input must be an object with only samples, steps, lr, seed"
+        " in that order"
+    )
+    if not isinstance(payload, _ObjectPairs):
+        return None, message
+    if _has_duplicate_key(payload):
+        return None, "duplicate key in JSON input"
+    if [key for key, _ in payload] != ["samples", "steps", "lr", "seed"]:
+        return None, message
+    samples, error = _validate_samples(payload[0][1])
+    if error is not None:
+        return None, error
+    steps = payload[1][1]
+    if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+        return None, "steps must be a positive integer"
+    lr = payload[2][1]
+    if isinstance(lr, bool) or not isinstance(lr, float):
+        return None, "lr must be a positive finite float"
+    if not math.isfinite(lr) or lr <= 0.0:
+        return None, "lr must be a positive finite float"
+    seed = payload[3][1]
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        return None, "seed must be an integer in 0..4294967295"
+    if seed < 0 or seed > 4294967295:
+        return None, "seed must be an integer in 0..4294967295"
+    return (samples, steps, lr, seed), None
+
+
+def _cli_train_parameters(input_path, seed):
+    """Build the initial (w, b) Tensors; returns (tensors, error, exit_code)."""
+    if input_path is None:
+        return (
+            (Tensor(seed / 4294967296.0, True), Tensor(0.0, True)),
+            None,
+            0,
+        )
+    try:
+        with open(input_path, "rb") as state_file:
+            raw = state_file.read()
+    except OSError as exc:
+        return None, str(exc), 1
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return None, str(exc), 1
+    try:
+        entries = _StateParser(text).parse()
+    except ValueError as exc:
+        return None, str(exc), 2
+    if len(entries) != 2 or entries[0][0] != "w" or entries[1][0] != "b":
+        return (
+            None,
+            "state must contain exactly the parameters w and b in order",
+            2,
+        )
+    if isinstance(entries[0][1], list) or isinstance(entries[1][1], list):
+        return None, "parameters w and b must be scalar Tensors", 2
+    if not entries[0][2] or not entries[1][2]:
+        return None, "parameters w and b must have requires_grad=true", 2
+    return (Tensor(entries[0][1], True), Tensor(entries[1][1], True)), None, 0
+
+
+def _mse_loss(w_tensor, b_tensor, samples):
+    """Compute sum((w*x + b - y)^2)/n as a Tensor over the samples in order."""
+    total = None
+    for x, y in samples:
+        residual = w_tensor.mul(x).add(b_tensor).add(-y)
+        squared = residual.mul(residual)
+        total = squared if total is None else total.add(squared)
+    return total.mul(1.0 / len(samples))
+
+
+def _quantize_scalar(value):
+    """Round a scalar to the six-decimal dump_state quantum (no -0.0)."""
+    return float(_format_float(value))
+
+
+def _cli_train(output_path, input_path):
+    config, error = _cli_train_config()
+    if error is not None:
+        print(error, file=sys.stderr)
+        return 2
+    samples, steps, lr, seed = config
+    tensors, error, exit_code = _cli_train_parameters(input_path, seed)
+    if error is not None:
+        print(error, file=sys.stderr)
+        return exit_code
+    w_tensor, b_tensor = tensors
+    optimizer = SGD([w_tensor, b_tensor], lr)
+    try:
+        for _ in range(steps):
+            optimizer.zero_grad()
+            loss = _mse_loss(w_tensor, b_tensor, samples)
+            loss.backward()
+            optimizer.step()
+            w_tensor.data = _quantize_scalar(w_tensor.data)
+            b_tensor.data = _quantize_scalar(b_tensor.data)
+        final_loss = _mse_loss(w_tensor, b_tensor, samples).data
+    except (TypeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    content = dump_state({"w": w_tensor, "b": b_tensor})
+    try:
+        _atomic_write(output_path, content)
+    except OSError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    sys.stdout.write(
+        '{"loss":'
+        + _format_float(final_loss)
+        + ',"steps":'
+        + str(steps)
+        + "}\n"
+    )
+    return 0
+
+
 def main(argv):
     if len(argv) == 1 and argv[0] == "tensor":
         try:
@@ -880,9 +1023,15 @@ def main(argv):
         except Exception as exc:  # noqa: BLE001 - unexpected CLI failure
             print(str(exc), file=sys.stderr)
             return 1
+    if len(argv) in (2, 3) and argv[0] == "train":
+        try:
+            return _cli_train(argv[1], argv[2] if len(argv) == 3 else None)
+        except Exception as exc:  # noqa: BLE001 - unexpected CLI failure
+            print(str(exc), file=sys.stderr)
+            return 1
     print(
         "usage: python autograd.py tensor | checkpoint {save|load} PATH"
-        " | evaluate PATH",
+        " | evaluate PATH | train OUTPUT [INPUT]",
         file=sys.stderr,
     )
     return 1
