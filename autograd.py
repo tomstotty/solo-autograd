@@ -3,8 +3,10 @@
 
 import json
 import math
+import os
 import re
 import sys
+import tempfile
 
 
 def _as_finite_float(value):
@@ -606,6 +608,106 @@ def _cli_tensor():
     return 0
 
 
+def _cli_checkpoint_parameters():
+    """Parse the checkpoint stdin payload into an ordered name -> Tensor dict.
+
+    Returns (parameters, error); exactly one of the two is None.
+    """
+    try:
+        text = sys.stdin.read()
+    except OSError:
+        return None, "failed to read stdin"
+    if text.endswith("\n"):
+        text = text[:-1]
+    if "\n" in text:
+        return None, "stdin must contain exactly one line of JSON"
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return None, "invalid JSON input"
+    if not isinstance(payload, dict) or set(payload) != {"parameters"}:
+        return None, "input must be an object with only the parameters key"
+    members = payload["parameters"]
+    if not isinstance(members, dict):
+        return None, "parameters must be an object"
+    if len(members) == 0:
+        return None, "parameters must be non-empty"
+    parameters = {}
+    for name, spec in members.items():
+        if not isinstance(spec, dict) or list(spec) != ["data", "requires_grad"]:
+            return (
+                None,
+                "each parameter must contain only data and requires_grad"
+                " in that order",
+            )
+        try:
+            parameters[name] = Tensor(spec["data"], spec["requires_grad"])
+        except (TypeError, ValueError) as exc:
+            return None, str(exc)
+    return parameters, None
+
+
+def _cli_checkpoint_save(path):
+    parameters, error = _cli_checkpoint_parameters()
+    if error is not None:
+        print(error, file=sys.stderr)
+        return 2
+    try:
+        content = dump_state(parameters)
+    except (TypeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    directory = os.path.dirname(os.path.abspath(path))
+    fd = None
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix=".checkpoint-", dir=directory)
+        with os.fdopen(fd, "wb") as tmp_file:
+            fd = None  # the file object owns the descriptor now
+            tmp_file.write(content.encode("utf-8"))
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.replace(tmp_path, path)
+        tmp_path = None
+    except OSError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    return 0
+
+
+def _cli_checkpoint_load(path):
+    try:
+        with open(path, "rb") as state_file:
+            raw = state_file.read()
+    except OSError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    parameters, error = _cli_checkpoint_parameters()
+    if error is not None:
+        print(error, file=sys.stderr)
+        return 2
+    try:
+        load_state(parameters, text)
+    except (TypeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    sys.stdout.write(dump_state(parameters) + "\n")
+    return 0
+
+
 def main(argv):
     if len(argv) == 1 and argv[0] == "tensor":
         try:
@@ -613,7 +715,22 @@ def main(argv):
         except Exception as exc:  # noqa: BLE001 - unexpected CLI failure
             print(str(exc), file=sys.stderr)
             return 1
-    print("usage: python autograd.py tensor", file=sys.stderr)
+    if (
+        len(argv) == 3
+        and argv[0] == "checkpoint"
+        and argv[1] in ("save", "load")
+    ):
+        try:
+            if argv[1] == "save":
+                return _cli_checkpoint_save(argv[2])
+            return _cli_checkpoint_load(argv[2])
+        except Exception as exc:  # noqa: BLE001 - unexpected CLI failure
+            print(str(exc), file=sys.stderr)
+            return 1
+    print(
+        "usage: python autograd.py tensor | checkpoint {save|load} PATH",
+        file=sys.stderr,
+    )
     return 1
 
 
