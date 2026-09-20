@@ -697,29 +697,10 @@ def _cli_checkpoint_save(path):
     except (TypeError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
-    directory = os.path.dirname(os.path.abspath(path))
-    fd = None
-    tmp_path = None
-    try:
-        fd, tmp_path = tempfile.mkstemp(prefix=".checkpoint-", dir=directory)
-        with os.fdopen(fd, "wb") as tmp_file:
-            fd = None  # the file object owns the descriptor now
-            tmp_file.write(content.encode("utf-8"))
-            tmp_file.flush()
-            os.fsync(tmp_file.fileno())
-        os.replace(tmp_path, path)
-        tmp_path = None
-    except OSError as exc:
-        print(str(exc), file=sys.stderr)
+    error = _atomic_write_checkpoint(path, content)
+    if error is not None:
+        print(error, file=sys.stderr)
         return 1
-    finally:
-        if fd is not None:
-            os.close(fd)
-        if tmp_path is not None:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
     return 0
 
 
@@ -855,6 +836,185 @@ def _cli_evaluate(path):
     return 0
 
 
+def _atomic_write_checkpoint(path, content):
+    """Atomically replace path with UTF-8 content; None on success, error text."""
+    directory = os.path.dirname(os.path.abspath(path))
+    fd = None
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix=".checkpoint-", dir=directory)
+        with os.fdopen(fd, "wb") as tmp_file:
+            fd = None  # the file object owns the descriptor now
+            tmp_file.write(content.encode("utf-8"))
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.replace(tmp_path, path)
+        tmp_path = None
+    except OSError as exc:
+        return str(exc)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    return None
+
+
+def _train_forward(w, b, samples):
+    """Mean-squared-error scalar Tensor: sum((w*x+b-y)^2) / n, sample order."""
+    total = None
+    for x, y in samples:
+        residual = w.mul(x).add(b).add(-y)
+        squared = residual.mul(residual)
+        total = squared if total is None else total.add(squared)
+    return total.mul(1.0 / len(samples))
+
+
+def _cli_train_config():
+    """Parse the train stdin payload.
+
+    Returns (config, error); exactly one is None. config is
+    (samples, steps, lr, seed) with samples a list of (x, y) float pairs.
+    """
+    text, error = _read_stdin_line()
+    if error is not None:
+        return None, error
+    try:
+        payload = _parse_json_pairs(text)
+    except ValueError:
+        return None, "invalid JSON input"
+    if not isinstance(payload, _ObjectPairs):
+        return None, "input must be an object"
+    if _has_duplicate_key(payload):
+        return None, "duplicate key in JSON input"
+    if [key for key, _ in payload] != ["samples", "steps", "lr", "seed"]:
+        return (
+            None,
+            "input must contain only samples, steps, lr and seed in that order",
+        )
+    samples_raw = payload[0][1]
+    steps = payload[1][1]
+    lr = payload[2][1]
+    seed = payload[3][1]
+    if not isinstance(samples_raw, list) or isinstance(
+        samples_raw, _ObjectPairs
+    ):
+        return None, "samples must be a non-empty array of [x, y] pairs"
+    if len(samples_raw) == 0:
+        return None, "samples must be a non-empty array of [x, y] pairs"
+    samples = []
+    for item in samples_raw:
+        if (
+            not isinstance(item, list)
+            or isinstance(item, _ObjectPairs)
+            or len(item) != 2
+        ):
+            return None, "each sample must be a [x, y] pair"
+        x, y = item
+        for value in (x, y):
+            if isinstance(value, bool) or not isinstance(value, float):
+                return None, "sample values must be finite floats"
+            if not math.isfinite(value):
+                return None, "sample values must be finite floats"
+        samples.append((x, y))
+    if isinstance(steps, bool) or not isinstance(steps, int):
+        return None, "steps must be a positive integer"
+    if steps <= 0:
+        return None, "steps must be a positive integer"
+    if isinstance(lr, bool) or not isinstance(lr, float):
+        return None, "lr must be a positive finite float"
+    if not math.isfinite(lr) or lr <= 0.0:
+        return None, "lr must be a positive finite float"
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        return None, "seed must be an integer between 0 and 4294967295"
+    if seed < 0 or seed > 4294967295:
+        return None, "seed must be an integer between 0 and 4294967295"
+    return (samples, steps, lr, seed), None
+
+
+def _cli_train(output_path, input_path):
+    if input_path is not None:
+        try:
+            with open(input_path, "rb") as state_file:
+                raw = state_file.read()
+        except OSError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        try:
+            state_text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+    else:
+        state_text = None
+    config, error = _cli_train_config()
+    if error is not None:
+        print(error, file=sys.stderr)
+        return 2
+    samples, steps, lr, seed = config
+    if state_text is not None:
+        try:
+            entries = _StateParser(state_text).parse()
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        if (
+            len(entries) != 2
+            or entries[0][0] != "w"
+            or entries[1][0] != "b"
+            or isinstance(entries[0][1], list)
+            or isinstance(entries[1][1], list)
+            or entries[0][2] is not True
+            or entries[1][2] is not True
+        ):
+            print(
+                "state must contain exactly the scalar parameters w and b"
+                " with requires_grad true in order",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            w = Tensor(entries[0][1], True)
+            b = Tensor(entries[1][1], True)
+        except (TypeError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+    else:
+        w = Tensor(seed / 4294967296.0, True)
+        b = Tensor(0.0, True)
+    try:
+        optimizer = SGD([w, b], lr)
+        for _ in range(steps):
+            optimizer.zero_grad()
+            loss = _train_forward(w, b, samples)
+            loss.backward()
+            optimizer.step()
+            # Quantize after every step so a reloaded checkpoint resumes the
+            # exact same trajectory as uninterrupted training.
+            w.data = float(_format_float(w.data))
+            b.data = float(_format_float(b.data))
+        final_loss = _train_forward(w, b, samples).data
+        content = dump_state({"w": w, "b": b})
+    except (TypeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    error = _atomic_write_checkpoint(output_path, content)
+    if error is not None:
+        print(error, file=sys.stderr)
+        return 1
+    sys.stdout.write(
+        '{"loss":'
+        + _format_float(final_loss)
+        + ',"steps":'
+        + str(steps)
+        + "}\n"
+    )
+    return 0
+
+
 def main(argv):
     if len(argv) == 1 and argv[0] == "tensor":
         try:
@@ -880,9 +1040,15 @@ def main(argv):
         except Exception as exc:  # noqa: BLE001 - unexpected CLI failure
             print(str(exc), file=sys.stderr)
             return 1
+    if len(argv) in (2, 3) and argv[0] == "train":
+        try:
+            return _cli_train(argv[1], argv[2] if len(argv) == 3 else None)
+        except Exception as exc:  # noqa: BLE001 - unexpected CLI failure
+            print(str(exc), file=sys.stderr)
+            return 1
     print(
         "usage: python autograd.py tensor | checkpoint {save|load} PATH"
-        " | evaluate PATH",
+        " | evaluate PATH | train OUTPUT [INPUT]",
         file=sys.stderr,
     )
     return 1
