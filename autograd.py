@@ -3,6 +3,7 @@
 
 import json
 import math
+import re
 import sys
 
 
@@ -410,6 +411,155 @@ def gradcheck(fn, data, eps=1e-6, atol=1e-5):
         if error > atol:
             passed = False
     return (passed, max_abs_error)
+
+
+_STATE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_STATE_NUMBER = re.compile(r"-?(?:0|[1-9][0-9]*)\.[0-9]{6}")
+
+
+def _check_state_parameters(parameters):
+    """Validate a dump_state/load_state parameters mapping."""
+    if not isinstance(parameters, dict):
+        raise TypeError("parameters must be a dict of name -> Tensor")
+    if len(parameters) == 0:
+        raise ValueError("parameters must be non-empty")
+    seen = set()
+    for name, tensor in parameters.items():
+        if not isinstance(name, str):
+            raise TypeError("parameter names must be strings")
+        if _STATE_NAME.fullmatch(name) is None:
+            raise ValueError("invalid parameter name")
+        if not isinstance(tensor, Tensor):
+            raise TypeError("parameter values must be Tensors")
+        if id(tensor) in seen:
+            raise ValueError("parameters must not contain duplicate Tensors")
+        seen.add(id(tensor))
+        _validate_data(tensor.data)
+        if not isinstance(tensor.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+
+
+def dump_state(parameters):
+    """Serialize named Tensors to a compact JSON state string.
+
+    The output contains no whitespace and no trailing newline; floats are
+    written with exactly six decimals and negative zero as 0.000000.
+    """
+    _check_state_parameters(parameters)
+    entries = []
+    for name, tensor in parameters.items():
+        entries.append(
+            '{"name":"'
+            + name
+            + '","data":'
+            + _json_value(tensor.data)
+            + ',"requires_grad":'
+            + ("true" if tensor.requires_grad else "false")
+            + "}"
+        )
+    return '{"parameters":[' + ",".join(entries) + "]}"
+
+
+class _StateParser:
+    """Strict parser for the exact textual form produced by dump_state."""
+
+    def __init__(self, text):
+        self._text = text
+        self._pos = 0
+
+    def _fail(self):
+        raise ValueError("text does not match the dump_state format")
+
+    def _expect(self, literal):
+        if not self._text.startswith(literal, self._pos):
+            self._fail()
+        self._pos += len(literal)
+
+    def _parse_number(self):
+        match = _STATE_NUMBER.match(self._text, self._pos)
+        if match is None:
+            self._fail()
+        token = match.group(0)
+        self._pos = match.end()
+        value = float(token)
+        if not math.isfinite(value) or (value == 0.0 and token[0] == "-"):
+            self._fail()
+        return value
+
+    def _parse_data(self):
+        if not self._text.startswith("[", self._pos):
+            return self._parse_number()
+        self._pos += 1
+        values = [self._parse_number()]
+        while self._text.startswith(",", self._pos):
+            self._pos += 1
+            values.append(self._parse_number())
+        self._expect("]")
+        return values
+
+    def _parse_entry(self):
+        self._expect('{"name":"')
+        match = _STATE_NAME.match(self._text, self._pos)
+        if match is None:
+            self._fail()
+        name = match.group(0)
+        self._pos = match.end()
+        self._expect('","data":')
+        data = self._parse_data()
+        self._expect(',"requires_grad":')
+        if self._text.startswith("true", self._pos):
+            self._pos += 4
+            requires_grad = True
+        elif self._text.startswith("false", self._pos):
+            self._pos += 5
+            requires_grad = False
+        else:
+            self._fail()
+        self._expect("}")
+        return (name, data, requires_grad)
+
+    def parse(self):
+        self._expect('{"parameters":[')
+        entries = [self._parse_entry()]
+        while self._text.startswith(",", self._pos):
+            self._pos += 1
+            entries.append(self._parse_entry())
+        self._expect("]}")
+        if self._pos != len(self._text):
+            self._fail()
+        return entries
+
+
+def load_state(parameters, text):
+    """Restore named Tensors from a string produced by dump_state.
+
+    On full validation success, overwrite each Tensor's data and
+    requires_grad and clear its grad; on any failure no Tensor is touched.
+    """
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+    _check_state_parameters(parameters)
+    entries = _StateParser(text).parse()
+    if len(entries) != len(parameters):
+        raise ValueError("state must contain exactly one entry per parameter")
+    updates = []
+    for (name, data, requires_grad), (expected_name, tensor) in zip(
+        entries, parameters.items()
+    ):
+        if name != expected_name:
+            raise ValueError("state names must match parameters in order")
+        current = tensor.data
+        if isinstance(current, list):
+            if not isinstance(data, list) or len(data) != len(current):
+                raise ValueError("state data shape must match tensor shape")
+        elif isinstance(data, list):
+            raise ValueError("state data shape must match tensor shape")
+        updates.append((tensor, data, requires_grad))
+    for tensor, data, requires_grad in updates:
+        tensor.data = data
+        tensor.requires_grad = requires_grad
+        tensor.grad = None
+    return None
 
 
 def _format_float(value):
