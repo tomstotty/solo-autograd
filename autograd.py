@@ -553,6 +553,58 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def logsumexp(self):
+        data = _require_nonempty_float_vector(self, "logsumexp")
+        # Snapshot the input so later caller-side mutation cannot change
+        # either the forward result or a pending backward pass.
+        x = list(data)
+        # Shift by the maximum so exp is only ever evaluated on values in
+        # (-inf, 0]; exp(x_i) directly is never computed.
+        m = max(x)
+        z = []
+        s = 0.0
+        for x_i in x:
+            diff = x_i - m
+            if not math.isfinite(diff):
+                raise ValueError("logsumexp intermediate must be finite")
+            z_i = math.exp(diff)
+            if not math.isfinite(z_i):
+                raise ValueError("logsumexp intermediate must be finite")
+            z.append(z_i)
+            s += z_i
+            if not math.isfinite(s):
+                raise ValueError("logsumexp intermediate must be finite")
+        log_s = math.log(s)
+        if not math.isfinite(log_s):
+            raise ValueError("logsumexp intermediate must be finite")
+        out_data = m + log_s
+        if not math.isfinite(out_data):
+            raise ValueError("logsumexp intermediate must be finite")
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        snapshot_x = x
+        snapshot_z = z
+        saved_s = s
+
+        def backward_fn(grad):
+            dx = [0.0] * len(snapshot_x)
+            for i, z_i in enumerate(snapshot_z):
+                product = grad * z_i
+                if not math.isfinite(product):
+                    raise ValueError(
+                        "logsumexp backward intermediate must be finite"
+                    )
+                dx_i = product / saved_s
+                if not math.isfinite(dx_i):
+                    raise ValueError(
+                        "logsumexp backward intermediate must be finite"
+                    )
+                dx[i] = dx_i
+            return [(parent, dx)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def cross_entropy(self, target):
         data = _require_nonempty_float_vector(self, "cross_entropy")
         if isinstance(target, bool) or not isinstance(target, int):
