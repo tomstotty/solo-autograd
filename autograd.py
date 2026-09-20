@@ -474,6 +474,53 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def dropout(self, p=0.5, seed=0):
+        data = _require_nonempty_float_vector(self, "dropout")
+        if isinstance(p, bool) or not isinstance(p, float):
+            raise TypeError("p must be a finite float in [0.0, 1.0)")
+        if not math.isfinite(p) or p < 0.0 or p >= 1.0:
+            raise ValueError("p must be a finite float in [0.0, 1.0)")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError("seed must be an integer between 0 and 4294967295")
+        if seed < 0 or seed > 4294967295:
+            raise ValueError("seed must be an integer between 0 and 4294967295")
+        # The mask comes from a local linear-congruential stream seeded by
+        # the caller; no global random state is ever consulted.
+        scale = 1.0 - p
+        mask = []
+        out_data = []
+        s = seed
+        for value in data:
+            s = (1664525 * s + 1013904223) % 4294967296
+            keep = s / 4294967296.0 >= p
+            mask.append(keep)
+            if keep:
+                scaled = value / scale
+                if not math.isfinite(scaled):
+                    raise ValueError("dropout result must be finite")
+                out_data.append(scaled)
+            else:
+                out_data.append(0.0)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+
+        def backward_fn(grad):
+            contribution = []
+            for g, keep in zip(grad, mask):
+                if keep:
+                    scaled_grad = g / scale
+                    if not math.isfinite(scaled_grad):
+                        raise ValueError(
+                            "dropout backward intermediate must be finite"
+                        )
+                    contribution.append(scaled_grad)
+                else:
+                    contribution.append(0.0)
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def zero_grad(self):
         self.grad = None
         return None
