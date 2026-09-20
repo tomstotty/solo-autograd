@@ -873,11 +873,12 @@ def _train_forward(w, b, samples):
     return total.mul(1.0 / len(samples))
 
 
-def _cli_train_config():
-    """Parse the train stdin payload.
+def _cli_train_config(include_momentum=False):
+    """Parse the train/momentum stdin payload.
 
     Returns (config, error); exactly one is None. config is
-    (samples, steps, lr, seed) with samples a list of (x, y) float pairs.
+    (samples, steps, lr, seed) for train, or
+    (samples, steps, lr, momentum, seed) when include_momentum is True.
     """
     text, error = _read_stdin_line()
     if error is not None:
@@ -890,7 +891,17 @@ def _cli_train_config():
         return None, "input must be an object"
     if _has_duplicate_key(payload):
         return None, "duplicate key in JSON input"
-    if [key for key, _ in payload] != ["samples", "steps", "lr", "seed"]:
+    expected_keys = ["samples", "steps", "lr"]
+    if include_momentum:
+        expected_keys.append("momentum")
+    expected_keys.append("seed")
+    if [key for key, _ in payload] != expected_keys:
+        if include_momentum:
+            return (
+                None,
+                "input must contain only samples, steps, lr, momentum"
+                " and seed in that order",
+            )
         return (
             None,
             "input must contain only samples, steps, lr and seed in that order",
@@ -898,7 +909,11 @@ def _cli_train_config():
     samples_raw = payload[0][1]
     steps = payload[1][1]
     lr = payload[2][1]
-    seed = payload[3][1]
+    if include_momentum:
+        momentum_value = payload[3][1]
+        seed = payload[4][1]
+    else:
+        seed = payload[3][1]
     if not isinstance(samples_raw, list) or isinstance(
         samples_raw, _ObjectPairs
     ):
@@ -928,26 +943,54 @@ def _cli_train_config():
         return None, "lr must be a positive finite float"
     if not math.isfinite(lr) or lr <= 0.0:
         return None, "lr must be a positive finite float"
+    if include_momentum:
+        momentum_error = (
+            "momentum must be a finite float between 0.0 (inclusive)"
+            " and 1.0 (exclusive)"
+        )
+        if isinstance(momentum_value, bool) or not isinstance(
+            momentum_value, float
+        ):
+            return None, momentum_error
+        if (
+            not math.isfinite(momentum_value)
+            or momentum_value < 0.0
+            or momentum_value >= 1.0
+        ):
+            return None, momentum_error
     if isinstance(seed, bool) or not isinstance(seed, int):
         return None, "seed must be an integer between 0 and 4294967295"
     if seed < 0 or seed > 4294967295:
         return None, "seed must be an integer between 0 and 4294967295"
+    if include_momentum:
+        return (samples, steps, lr, momentum_value, seed), None
     return (samples, steps, lr, seed), None
+
+
+def _read_state_file(input_path):
+    """Read a checkpoint path as strict UTF-8.
+
+    Returns (text, exit_code, error); on success exit_code is 0 and the
+    other two are None-ish. Missing/unreadable files exit 1 like other I/O
+    failures; non-UTF-8 state is a usage error and exits 2.
+    """
+    try:
+        with open(input_path, "rb") as state_file:
+            raw = state_file.read()
+    except OSError as exc:
+        return None, 1, str(exc)
+    try:
+        return raw.decode("utf-8"), 0, None
+    except UnicodeDecodeError as exc:
+        return None, 2, str(exc)
 
 
 def _cli_train(output_path, input_path):
     if input_path is not None:
-        try:
-            with open(input_path, "rb") as state_file:
-                raw = state_file.read()
-        except OSError as exc:
-            print(str(exc), file=sys.stderr)
-            return 1
-        try:
-            state_text = raw.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            print(str(exc), file=sys.stderr)
-            return 1
+        state_text, code, error = _read_state_file(input_path)
+        if error is not None:
+            print(error, file=sys.stderr)
+            return code
     else:
         state_text = None
     config, error = _cli_train_config()
@@ -1015,6 +1058,108 @@ def _cli_train(output_path, input_path):
     return 0
 
 
+def _cli_momentum(output_path, input_path):
+    if input_path is not None:
+        state_text, code, error = _read_state_file(input_path)
+        if error is not None:
+            print(error, file=sys.stderr)
+            return code
+    else:
+        state_text = None
+    config, error = _cli_train_config(include_momentum=True)
+    if error is not None:
+        print(error, file=sys.stderr)
+        return 2
+    samples, steps, lr, momentum, seed = config
+    if state_text is not None:
+        try:
+            entries = _StateParser(state_text).parse()
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        if len(entries) != 4 or [entry[0] for entry in entries] != [
+            "w",
+            "b",
+            "vw",
+            "vb",
+        ] or any(isinstance(entry[1], list) for entry in entries):
+            print(
+                "state must contain exactly the scalar parameters w, b,"
+                " vw and vb in order",
+                file=sys.stderr,
+            )
+            return 2
+        if (
+            entries[0][2] is not True
+            or entries[1][2] is not True
+            or entries[2][2] is not False
+            or entries[3][2] is not False
+        ):
+            print(
+                "w and b must have requires_grad true; vw and vb must have"
+                " requires_grad false",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            w = Tensor(entries[0][1], True)
+            b = Tensor(entries[1][1], True)
+            vw = entries[2][1]
+            vb = entries[3][1]
+        except (TypeError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+    else:
+        w = Tensor(seed / 4294967296.0, True)
+        b = Tensor(0.0, True)
+        vw = 0.0
+        vb = 0.0
+    try:
+        for _ in range(steps):
+            w.zero_grad()
+            b.zero_grad()
+            loss = _train_forward(w, b, samples)
+            loss.backward()
+            # Compute the velocity buffers and new parameters before
+            # committing anything, so a non-finite result aborts the step
+            # with all four values untouched.
+            new_vw = momentum * vw + w.grad
+            new_vb = momentum * vb + b.grad
+            if not math.isfinite(new_vw) or not math.isfinite(new_vb):
+                raise ValueError("momentum buffer must be finite")
+            new_w = w.data - lr * new_vw
+            new_b = b.data - lr * new_vb
+            if not math.isfinite(new_w) or not math.isfinite(new_b):
+                raise ValueError("updated data must be finite")
+            # Quantize after every step so a reloaded checkpoint resumes the
+            # exact same trajectory as uninterrupted training.
+            vw = float(_format_float(new_vw))
+            vb = float(_format_float(new_vb))
+            w.data = float(_format_float(new_w))
+            b.data = float(_format_float(new_b))
+        final_loss = _train_forward(w, b, samples).data
+        vw_tensor = Tensor(vw, False)
+        vb_tensor = Tensor(vb, False)
+        content = dump_state(
+            {"w": w, "b": b, "vw": vw_tensor, "vb": vb_tensor}
+        )
+    except (TypeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    error = _atomic_write_checkpoint(output_path, content)
+    if error is not None:
+        print(error, file=sys.stderr)
+        return 1
+    sys.stdout.write(
+        '{"loss":'
+        + _format_float(final_loss)
+        + ',"steps":'
+        + str(steps)
+        + "}\n"
+    )
+    return 0
+
+
 def main(argv):
     if len(argv) == 1 and argv[0] == "tensor":
         try:
@@ -1046,9 +1191,18 @@ def main(argv):
         except Exception as exc:  # noqa: BLE001 - unexpected CLI failure
             print(str(exc), file=sys.stderr)
             return 1
+    if len(argv) in (2, 3) and argv[0] == "momentum":
+        try:
+            return _cli_momentum(
+                argv[1], argv[2] if len(argv) == 3 else None
+            )
+        except Exception as exc:  # noqa: BLE001 - unexpected CLI failure
+            print(str(exc), file=sys.stderr)
+            return 1
     print(
         "usage: python autograd.py tensor | checkpoint {save|load} PATH"
-        " | evaluate PATH | train OUTPUT [INPUT]",
+        " | evaluate PATH | train OUTPUT [INPUT]"
+        " | momentum OUTPUT [INPUT]",
         file=sys.stderr,
     )
     return 1
