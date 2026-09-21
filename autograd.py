@@ -1500,6 +1500,171 @@ class SGD:
         return None
 
 
+def _validate_step_array(value, like, name):
+    """Validate a grad/m/v array against parameter data for Adam.step."""
+    if isinstance(value, bool):
+        raise TypeError(name + " must be a float or a list of floats")
+    if isinstance(like, float):
+        if isinstance(value, list):
+            raise ValueError(name + " shape must match parameter shape")
+        if not isinstance(value, float):
+            raise TypeError(name + " must be a float for a scalar parameter")
+        if not math.isfinite(value):
+            raise ValueError(name + " must be finite")
+        return value
+    if isinstance(value, list):
+        if len(value) != len(like):
+            raise ValueError(name + " shape must match parameter shape")
+        return [_as_finite_float(x) for x in value]
+    if isinstance(value, float):
+        raise ValueError(name + " shape must match parameter shape")
+    raise TypeError(name + " must be a float or a list of floats")
+
+
+class Adam:
+    """Adam optimizer over a fixed list of Tensors."""
+
+    def __init__(self, parameters, lr, beta1=0.9, beta2=0.999, eps=1e-8):
+        if not isinstance(parameters, list):
+            raise TypeError("parameters must be a non-empty list of Tensors")
+        if len(parameters) == 0:
+            raise ValueError("parameters must be non-empty")
+        for parameter in parameters:
+            if not isinstance(parameter, Tensor):
+                raise TypeError("parameters must contain only Tensors")
+        if len({id(parameter) for parameter in parameters}) != len(parameters):
+            raise ValueError("parameters must not contain duplicate Tensors")
+        for parameter in parameters:
+            if not isinstance(parameter.requires_grad, bool):
+                raise TypeError("requires_grad must be a bool")
+            _validate_data(parameter.data)
+        if isinstance(lr, bool) or not isinstance(lr, float):
+            raise TypeError("lr must be a positive finite float")
+        if not math.isfinite(lr) or lr <= 0.0:
+            raise ValueError("lr must be a positive finite float")
+        for name, value in (("beta1", beta1), ("beta2", beta2)):
+            if isinstance(value, bool) or not isinstance(value, float):
+                raise TypeError(
+                    name + " must be a finite float in [0.0, 1.0)"
+                )
+            if not math.isfinite(value) or value < 0.0 or value >= 1.0:
+                raise ValueError(
+                    name + " must be a finite float in [0.0, 1.0)"
+                )
+        if isinstance(eps, bool) or not isinstance(eps, float):
+            raise TypeError("eps must be a positive finite float")
+        if not math.isfinite(eps) or eps <= 0.0:
+            raise ValueError("eps must be a positive finite float")
+        self.parameters = list(parameters)
+        self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.m = [
+            [0.0] * len(parameter.data)
+            if isinstance(parameter.data, list)
+            else 0.0
+            for parameter in self.parameters
+        ]
+        self.v = [
+            [0.0] * len(parameter.data)
+            if isinstance(parameter.data, list)
+            else 0.0
+            for parameter in self.parameters
+        ]
+        self.t = 0
+
+    def step(self):
+        active = [
+            (index, parameter)
+            for index, parameter in enumerate(self.parameters)
+            if parameter.requires_grad and parameter.grad is not None
+        ]
+        if not active:
+            return None
+        k = self.t + 1
+        bias1 = 1.0 - self.beta1 ** k
+        bias2 = 1.0 - self.beta2 ** k
+        # Compute and validate every new value before mutating anything, so
+        # a failure leaves all data, grad, m, v and t untouched.
+        updates = []
+        for index, parameter in active:
+            data = _validate_data(parameter.data)
+            grad = _validate_step_array(parameter.grad, data, "grad")
+            m = _validate_step_array(self.m[index], data, "m")
+            v = _validate_step_array(self.v[index], data, "v")
+            updates.append(
+                (
+                    index,
+                    parameter,
+                    self._updated_data(data, grad, m, v, bias1, bias2),
+                )
+            )
+        for index, parameter, (new_data, new_m, new_v) in updates:
+            parameter.data = new_data
+            self.m[index] = new_m
+            self.v[index] = new_v
+        self.t = k
+        return None
+
+    def _updated_data(self, data, grad, m, v, bias1, bias2):
+        if isinstance(data, list):
+            new_data = []
+            new_m = []
+            new_v = []
+            for i in range(len(data)):
+                value, m_i, v_i = self._updated_value(
+                    data[i], grad[i], m[i], v[i], bias1, bias2
+                )
+                new_data.append(value)
+                new_m.append(m_i)
+                new_v.append(v_i)
+            return new_data, new_m, new_v
+        value, new_m, new_v = self._updated_value(
+            data, grad, m, v, bias1, bias2
+        )
+        return value, new_m, new_v
+
+    def _updated_value(self, value, grad, m, v, bias1, bias2):
+        # m' = beta1 * m + (1 - beta1) * g, checked finite at each stage.
+        new_m = self.beta1 * m + (1.0 - self.beta1) * grad
+        if not math.isfinite(new_m):
+            raise ValueError("adam first moment must be finite")
+        # v' = beta2 * v + (1 - beta2) * g^2.
+        square = grad * grad
+        if not math.isfinite(square):
+            raise ValueError("adam second moment must be finite")
+        new_v = self.beta2 * v + (1.0 - self.beta2) * square
+        if not math.isfinite(new_v):
+            raise ValueError("adam second moment must be finite")
+        # p' = p - lr * m' / (1 - beta1^k) / (sqrt(v' / (1 - beta2^k)) + eps),
+        # evaluated left to right.
+        update = self.lr * new_m
+        if not math.isfinite(update):
+            raise ValueError("adam update must be finite")
+        update = update / bias1
+        if not math.isfinite(update):
+            raise ValueError("adam update must be finite")
+        v_hat = new_v / bias2
+        if not math.isfinite(v_hat):
+            raise ValueError("adam update must be finite")
+        denominator = math.sqrt(v_hat) + self.eps
+        if not math.isfinite(denominator):
+            raise ValueError("adam update must be finite")
+        update = update / denominator
+        if not math.isfinite(update):
+            raise ValueError("adam update must be finite")
+        new_value = value - update
+        if not math.isfinite(new_value):
+            raise ValueError("updated data must be finite")
+        return new_value, new_m, new_v
+
+    def zero_grad(self):
+        for parameter in self.parameters:
+            parameter.grad = None
+        return None
+
+
 def gradcheck(fn, data, eps=1e-6, atol=1e-5):
     """Compare analytic gradients from backward() with central differences.
 
