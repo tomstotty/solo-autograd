@@ -1256,6 +1256,132 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def softplus(self, beta=1.0, threshold=20.0):
+        # Re-validate at call time since the data may have been mutated
+        # after construction: a finite float scalar or a non-empty 1D
+        # float list. bools, ints and other types are a TypeError; an
+        # empty list or any non-finite value is a ValueError.
+        data = _validate_data(self.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        # beta and threshold are plain floats: bools, ints and anything
+        # else are a TypeError; non-finite values are a ValueError, and a
+        # non-positive beta is additionally a ValueError.
+        if isinstance(beta, bool) or not isinstance(beta, float):
+            raise TypeError("beta must be a positive finite float")
+        if not math.isfinite(beta) or beta <= 0.0:
+            raise ValueError("beta must be a positive finite float")
+        if isinstance(threshold, bool) or not isinstance(threshold, float):
+            raise TypeError("threshold must be a finite float")
+        if not math.isfinite(threshold):
+            raise ValueError("threshold must be finite")
+
+        def forward_value(x):
+            # z = beta*x; when z > threshold the linear branch y = x is
+            # used, otherwise y = log1p(exp(z))/beta. Every intermediate
+            # is checked as it is produced.
+            z = beta * x
+            if not math.isfinite(z):
+                raise ValueError("softplus intermediate must be finite")
+            if z > threshold:
+                y = x
+                if not math.isfinite(y):
+                    raise ValueError("softplus intermediate must be finite")
+                return y, z, True
+            exp_z = _finite_exp(z, "softplus intermediate must be finite")
+            log_term = math.log1p(exp_z)
+            if not math.isfinite(log_term):
+                raise ValueError("softplus intermediate must be finite")
+            y = log_term / beta
+            if not math.isfinite(y):
+                raise ValueError("softplus intermediate must be finite")
+            return y, z, False
+
+        # Elementwise evaluation in ascending index order; a non-finite
+        # intermediate aborts before a result tensor exists, so no state
+        # can change on failure.
+        if isinstance(data, list):
+            out_data = []
+            snapshot_z = []
+            snapshot_linear = []
+            for x in data:
+                y, z, linear = forward_value(x)
+                out_data.append(y)
+                snapshot_z.append(z)
+                snapshot_linear.append(linear)
+        else:
+            out_data, z_value, linear_value = forward_value(data)
+            snapshot_z = z_value
+            snapshot_linear = linear_value
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # Snapshot z and the per-element branch choice so later
+        # caller-side mutation or replacement of the input cannot change a
+        # pending backward pass. beta itself never needs to enter the
+        # backward formula: d/dx softplus(x; beta) = sigmoid(beta*x).
+        z_values = snapshot_z
+        linear_flags = snapshot_linear
+        vector = isinstance(out_data, list)
+
+        def backward_value(g, z, linear):
+            if linear:
+                h = g
+                if not math.isfinite(h):
+                    raise ValueError(
+                        "softplus backward intermediate must be finite"
+                    )
+                return h
+            if z >= 0.0:
+                q = _finite_exp(
+                    -z, "softplus backward intermediate must be finite"
+                )
+                d = 1.0 + q
+                if not math.isfinite(d):
+                    raise ValueError(
+                        "softplus backward intermediate must be finite"
+                    )
+                h = g / d
+            else:
+                q = _finite_exp(
+                    z, "softplus backward intermediate must be finite"
+                )
+                d = 1.0 + q
+                if not math.isfinite(d):
+                    raise ValueError(
+                        "softplus backward intermediate must be finite"
+                    )
+                product = g * q
+                if not math.isfinite(product):
+                    raise ValueError(
+                        "softplus backward intermediate must be finite"
+                    )
+                h = product / d
+            if not math.isfinite(h):
+                raise ValueError(
+                    "softplus backward intermediate must be finite"
+                )
+            return h
+
+        def backward_fn(grad):
+            # The linear branch contributes g; the smooth branch uses the
+            # numerically appropriate reciprocal sigmoid factor: g/(1+e^-z)
+            # for z >= 0 and g*e^z/(1+e^z) for z < 0. Each intermediate is
+            # checked as it is produced, and the generic engine validates
+            # the contribution itself and every merge into an existing grad.
+            if vector:
+                contribution = [
+                    backward_value(grad[i], z_values[i], linear_flags[i])
+                    for i in range(len(z_values))
+                ]
+            else:
+                contribution = backward_value(
+                    grad, z_values, linear_flags
+                )
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def tanh(self):
         out_data = _map_unary(self.data, math.tanh)
         _ensure_finite_data(out_data)
