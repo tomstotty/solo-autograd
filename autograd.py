@@ -1900,6 +1900,111 @@ class Adam:
         return None
 
 
+def clip_grad_norm_(parameters, max_norm, eps=1e-12):
+    """Clip gradients of parameters in place by their global L2 norm.
+
+    Only tensors with requires_grad True and a non-None grad participate.
+    Returns the norm measured before clipping (0.0 if nothing participates).
+    Every argument and grad is validated and every clipped grad is computed
+    before any tensor is mutated, so a failure leaves all tensors untouched.
+    """
+    if not isinstance(parameters, list):
+        raise TypeError("parameters must be a non-empty list of Tensors")
+    if len(parameters) == 0:
+        raise ValueError("parameters must be non-empty")
+    for parameter in parameters:
+        if not isinstance(parameter, Tensor):
+            raise TypeError("parameters must contain only Tensors")
+    if len({id(parameter) for parameter in parameters}) != len(parameters):
+        raise ValueError("parameters must not contain duplicate Tensors")
+    for name, value in (("max_norm", max_norm), ("eps", eps)):
+        if isinstance(value, bool) or not isinstance(value, float):
+            raise TypeError(name + " must be a positive finite float")
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(name + " must be a positive finite float")
+    for parameter in parameters:
+        if not isinstance(parameter.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        _validate_data(parameter.data)
+    active = [
+        parameter
+        for parameter in parameters
+        if parameter.requires_grad and parameter.grad is not None
+    ]
+    for parameter in active:
+        _check_clipping_grad(parameter.grad, parameter.data)
+    if not active:
+        return 0.0
+    total = 0.0
+    for parameter in active:
+        values = (
+            parameter.grad
+            if isinstance(parameter.grad, list)
+            else [parameter.grad]
+        )
+        for value in values:
+            product = value * value
+            if not math.isfinite(product):
+                raise ValueError("gradient norm must be finite")
+            total += product
+            if not math.isfinite(total):
+                raise ValueError("gradient norm must be finite")
+    norm = math.sqrt(total)
+    if not math.isfinite(norm):
+        raise ValueError("gradient norm must be finite")
+    if norm > max_norm:
+        denominator = norm + eps
+        if not math.isfinite(denominator):
+            raise ValueError("clip scale must be finite")
+        scale = max_norm / denominator
+        if not math.isfinite(scale):
+            raise ValueError("clip scale must be finite")
+    else:
+        scale = 1.0
+    updates = []
+    for parameter in active:
+        grad = parameter.grad
+        if isinstance(grad, list):
+            new_grad = []
+            for value in grad:
+                new_value = value * scale
+                if not math.isfinite(new_value):
+                    raise ValueError("clipped grad must be finite")
+                new_grad.append(new_value)
+        else:
+            new_grad = grad * scale
+            if not math.isfinite(new_grad):
+                raise ValueError("clipped grad must be finite")
+        updates.append((parameter, new_grad))
+    for parameter, new_grad in updates:
+        parameter.grad = new_grad
+    return norm
+
+
+def _check_clipping_grad(grad, data):
+    """Type/shape/finiteness check for one participating parameter's grad."""
+    if isinstance(data, list):
+        if not isinstance(grad, list):
+            if isinstance(grad, float) and not isinstance(grad, bool):
+                raise ValueError("grad shape must match tensor shape")
+            raise TypeError("grad must be a list of floats")
+        if len(grad) != len(data):
+            raise ValueError("grad shape must match tensor shape")
+        for value in grad:
+            if isinstance(value, bool) or not isinstance(value, float):
+                raise TypeError("grad elements must be floats")
+        for value in grad:
+            if not math.isfinite(value):
+                raise ValueError("grad must be finite")
+    else:
+        if isinstance(grad, list):
+            raise ValueError("grad shape must match tensor shape")
+        if isinstance(grad, bool) or not isinstance(grad, float):
+            raise TypeError("grad must be a float")
+        if not math.isfinite(grad):
+            raise ValueError("grad must be finite")
+
+
 def gradcheck(fn, data, eps=1e-6, atol=1e-5):
     """Compare analytic gradients from backward() with central differences.
 
