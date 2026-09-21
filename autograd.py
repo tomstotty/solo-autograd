@@ -686,6 +686,120 @@ class Tensor:
             out_data, True, (parent_self, parent_other), backward_fn
         )
 
+    def huber_loss(self, target, delta=1.0):
+        if not isinstance(target, Tensor):
+            raise TypeError("target must be a Tensor")
+        a = _require_nonempty_float_vector(self, "huber_loss")
+        b = _require_nonempty_float_vector(target, "huber_loss")
+        if len(a) != len(b):
+            raise ValueError("huber_loss vector lengths must match")
+        if isinstance(delta, bool) or not isinstance(delta, float):
+            raise TypeError("delta must be a positive finite float")
+        if not math.isfinite(delta) or delta <= 0.0:
+            raise ValueError("delta must be a positive finite float")
+        # Copy both operands at call time so later caller-side mutation or
+        # replacement of either input can change neither the forward result
+        # nor a pending backward pass.
+        x = list(a)
+        y = list(b)
+        n = len(x)
+        # Accumulate the Huber term index by index from 0.0 in ascending
+        # order: r_i = x_i - y_i, 0.5*r_i*r_i when |r_i| <= delta else
+        # delta*(|r_i| - 0.5*delta); the total is divided by n at the end.
+        # A non-finite residual, term, partial sum or quotient aborts
+        # before a result tensor exists, so no state can change on failure.
+        residuals = []
+        q = 0.0
+        for i in range(n):
+            r_i = x[i] - y[i]
+            if not math.isfinite(r_i):
+                raise ValueError("huber_loss intermediate must be finite")
+            residuals.append(r_i)
+            a_i = abs(r_i)
+            if not math.isfinite(a_i):
+                raise ValueError("huber_loss intermediate must be finite")
+            if a_i <= delta:
+                square = r_i * r_i
+                if not math.isfinite(square):
+                    raise ValueError(
+                        "huber_loss intermediate must be finite"
+                    )
+                term = 0.5 * square
+            else:
+                half_delta = 0.5 * delta
+                if not math.isfinite(half_delta):
+                    raise ValueError(
+                        "huber_loss intermediate must be finite"
+                    )
+                shifted = a_i - half_delta
+                if not math.isfinite(shifted):
+                    raise ValueError(
+                        "huber_loss intermediate must be finite"
+                    )
+                term = delta * shifted
+            if not math.isfinite(term):
+                raise ValueError("huber_loss intermediate must be finite")
+            q += term
+            if not math.isfinite(q):
+                raise ValueError("huber_loss intermediate must be finite")
+        out_data = q / n
+        if not math.isfinite(out_data):
+            raise ValueError("huber_loss intermediate must be finite")
+        if not (self.requires_grad or target.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_other = self, target
+        # Save the residuals with the graph so a pending backward pass is
+        # independent of any subsequent data mutation.
+        snapshot_r = residuals
+
+        def backward_fn(grad):
+            # h_i = g * d_i / n with d_i = r_i when |r_i| <= delta else
+            # +/-delta by the sign of r_i; self receives h, target -h.
+            # Only the sides that require grad are submitted; a non-finite
+            # intermediate aborts the whole pass before any grad is written.
+            h = []
+            for r_i in snapshot_r:
+                a_i = abs(r_i)
+                if not math.isfinite(a_i):
+                    raise ValueError(
+                        "huber_loss backward intermediate must be finite"
+                    )
+                if a_i <= delta:
+                    d_i = r_i
+                elif r_i > 0.0:
+                    d_i = delta
+                else:
+                    d_i = -delta
+                product = grad * d_i
+                if not math.isfinite(product):
+                    raise ValueError(
+                        "huber_loss backward intermediate must be finite"
+                    )
+                value = product / n
+                if not math.isfinite(value):
+                    raise ValueError(
+                        "huber_loss backward intermediate must be finite"
+                    )
+                h.append(value)
+            contributions = []
+            if parent_self.requires_grad:
+                contributions.append((parent_self, h))
+            if parent_other.requires_grad:
+                negated = []
+                for value in h:
+                    neg = -value
+                    if not math.isfinite(neg):
+                        raise ValueError(
+                            "huber_loss backward intermediate must be finite"
+                        )
+                    negated.append(neg)
+                contributions.append((parent_other, negated))
+            return contributions
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_other), backward_fn
+        )
+
     def binary_cross_entropy_with_logits(self, target):
         if not isinstance(target, Tensor):
             raise TypeError("target must be a Tensor")
