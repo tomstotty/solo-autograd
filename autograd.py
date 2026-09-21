@@ -91,6 +91,50 @@ def _merge_grad(a, b):
     return a + b
 
 
+def _pow_value(base, exponent):
+    """One positive-base power; ValueError on overflow or non-finite."""
+    try:
+        value = base**exponent
+    except OverflowError:
+        raise ValueError("pow result must be finite") from None
+    if not math.isfinite(value):
+        raise ValueError("pow result must be finite")
+    return value
+
+
+def _pow_grad_base(g, a, b):
+    """da = g * b * a**(b - 1) with a finite check at each step."""
+    try:
+        power = a ** (b - 1.0)
+    except OverflowError:
+        raise ValueError(
+            "pow backward intermediate must be finite"
+        ) from None
+    if not math.isfinite(power):
+        raise ValueError("pow backward intermediate must be finite")
+    scaled = g * b
+    if not math.isfinite(scaled):
+        raise ValueError("pow backward intermediate must be finite")
+    value = scaled * power
+    if not math.isfinite(value):
+        raise ValueError("pow backward intermediate must be finite")
+    return value
+
+
+def _pow_grad_exponent(g, a, y):
+    """db = g * y * log(a) with a finite check at each step."""
+    log_a = math.log(a)
+    if not math.isfinite(log_a):
+        raise ValueError("pow backward intermediate must be finite")
+    scaled = g * y
+    if not math.isfinite(scaled):
+        raise ValueError("pow backward intermediate must be finite")
+    value = scaled * log_a
+    if not math.isfinite(value):
+        raise ValueError("pow backward intermediate must be finite")
+    return value
+
+
 def _validate_grad(grad, like):
     """Validate an externally supplied outgoing gradient against tensor data."""
     if isinstance(grad, bool):
@@ -372,6 +416,110 @@ class Tensor:
                         if not math.isfinite(total):
                             raise ValueError(
                                 "div backward intermediate must be finite"
+                            )
+                    contributions.append((parent_other, total))
+            return contributions
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_other), backward_fn
+        )
+
+    def pow(self, exponent):
+        other = self._coerce(exponent)
+        a = _validate_data(self.data)
+        b = _validate_data(other.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        if not isinstance(other.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        a_vector = isinstance(a, list)
+        b_vector = isinstance(b, list)
+        if a_vector and b_vector and len(a) != len(b):
+            raise ValueError("vector lengths must match")
+        bases = a if a_vector else [a]
+        for base in bases:
+            if base <= 0.0:
+                raise ValueError("pow base must be positive")
+        # Raise element by element in ascending output-index order; an
+        # overflow or non-finite power aborts before a result tensor
+        # exists, so no state can change on failure.
+        if a_vector and b_vector:
+            out_data = []
+            for i in range(len(a)):
+                out_data.append(_pow_value(a[i], b[i]))
+        elif a_vector:
+            out_data = []
+            for i in range(len(a)):
+                out_data.append(_pow_value(a[i], b))
+        elif b_vector:
+            out_data = []
+            for i in range(len(b)):
+                out_data.append(_pow_value(a, b[i]))
+        else:
+            out_data = _pow_value(a, b)
+        if not (self.requires_grad or other.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_other = self, other
+        # Snapshot both operands and the forward result so later
+        # caller-side mutation or replacement of either input cannot
+        # change what a pending backward pass uses.
+        snapshot_a = list(a) if a_vector else a
+        snapshot_b = list(b) if b_vector else b
+        snapshot_y = list(out_data) if isinstance(out_data, list) else out_data
+        y_vector = isinstance(snapshot_y, list)
+
+        def backward_fn(grad):
+            grad_values = grad if isinstance(grad, list) else [grad]
+            contributions = []
+            if parent_self.requires_grad:
+                if a_vector:
+                    da = []
+                    for i in range(len(snapshot_a)):
+                        exponent_i = snapshot_b[i] if b_vector else snapshot_b
+                        da.append(
+                            _pow_grad_base(
+                                grad_values[i], snapshot_a[i], exponent_i
+                            )
+                        )
+                    contributions.append((parent_self, da))
+                else:
+                    # A broadcast scalar parent reduces by accumulating
+                    # from 0.0 in ascending output-index order.
+                    total = 0.0
+                    for i in range(len(grad_values)):
+                        exponent_i = snapshot_b[i] if b_vector else snapshot_b
+                        value = _pow_grad_base(
+                            grad_values[i], snapshot_a, exponent_i
+                        )
+                        total += value
+                        if not math.isfinite(total):
+                            raise ValueError(
+                                "pow backward intermediate must be finite"
+                            )
+                    contributions.append((parent_self, total))
+            if parent_other.requires_grad:
+                if b_vector:
+                    db = []
+                    for i in range(len(snapshot_b)):
+                        base_i = snapshot_a[i] if a_vector else snapshot_a
+                        db.append(
+                            _pow_grad_exponent(
+                                grad_values[i], base_i, snapshot_y[i]
+                            )
+                        )
+                    contributions.append((parent_other, db))
+                else:
+                    total = 0.0
+                    for i in range(len(grad_values)):
+                        base_i = snapshot_a[i] if a_vector else snapshot_a
+                        y_i = snapshot_y[i] if y_vector else snapshot_y
+                        value = _pow_grad_exponent(
+                            grad_values[i], base_i, y_i
+                        )
+                        total += value
+                        if not math.isfinite(total):
+                            raise ValueError(
+                                "pow backward intermediate must be finite"
                             )
                     contributions.append((parent_other, total))
             return contributions
