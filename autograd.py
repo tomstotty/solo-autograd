@@ -573,6 +573,89 @@ class Tensor:
             out_data, True, (parent_self, parent_other), backward_fn
         )
 
+    def mse_loss(self, target):
+        if not isinstance(target, Tensor):
+            raise TypeError("target must be a Tensor")
+        a = _require_nonempty_float_vector(self, "mse_loss")
+        b = _require_nonempty_float_vector(target, "mse_loss")
+        if len(a) != len(b):
+            raise ValueError("mse_loss vector lengths must match")
+        # Copy both operands at call time so later caller-side mutation or
+        # replacement of either input can change neither the forward result
+        # nor a pending backward pass.
+        x = list(a)
+        y = list(b)
+        n = len(x)
+        # Accumulate the squared residual index by index from 0.0 in
+        # ascending order, subtracting, squaring and adding at each index;
+        # a non-finite residual, square, partial sum or quotient aborts
+        # before a result tensor exists, so no state can change on failure.
+        residuals = []
+        q = 0.0
+        for i in range(n):
+            r_i = x[i] - y[i]
+            if not math.isfinite(r_i):
+                raise ValueError("mse_loss intermediate must be finite")
+            residuals.append(r_i)
+            square = r_i * r_i
+            if not math.isfinite(square):
+                raise ValueError("mse_loss intermediate must be finite")
+            q += square
+            if not math.isfinite(q):
+                raise ValueError("mse_loss intermediate must be finite")
+        out_data = q / n
+        if not math.isfinite(out_data):
+            raise ValueError("mse_loss intermediate must be finite")
+        if not (self.requires_grad or target.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_other = self, target
+        # Save x, y and the residuals with the graph so a pending backward
+        # pass is independent of any subsequent data mutation.
+        snapshot_x = x
+        snapshot_y = y
+        snapshot_r = residuals
+
+        def backward_fn(grad):
+            # h_i = g * 2 * r_i / n, multiplying and dividing in that
+            # order per index; a non-finite intermediate aborts the whole
+            # pass before any grad is written.
+            h = []
+            for r_i in snapshot_r:
+                scaled = grad * 2.0
+                if not math.isfinite(scaled):
+                    raise ValueError(
+                        "mse_loss backward intermediate must be finite"
+                    )
+                product = scaled * r_i
+                if not math.isfinite(product):
+                    raise ValueError(
+                        "mse_loss backward intermediate must be finite"
+                    )
+                value = product / n
+                if not math.isfinite(value):
+                    raise ValueError(
+                        "mse_loss backward intermediate must be finite"
+                    )
+                h.append(value)
+            contributions = []
+            if parent_self.requires_grad:
+                contributions.append((parent_self, h))
+            if parent_other.requires_grad:
+                negated = []
+                for value in h:
+                    neg = -value
+                    if not math.isfinite(neg):
+                        raise ValueError(
+                            "mse_loss backward intermediate must be finite"
+                        )
+                    negated.append(neg)
+                contributions.append((parent_other, negated))
+            return contributions
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_other), backward_fn
+        )
+
     def cosine_similarity(self, other, eps=1e-12):
         if not isinstance(other, Tensor):
             raise TypeError("other must be a Tensor")
