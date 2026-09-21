@@ -699,7 +699,7 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
-    def conv1d(self, kernel, stride=1, padding=0):
+    def conv1d(self, kernel, stride=1, padding=0, dilation=1):
         if not isinstance(kernel, Tensor):
             raise TypeError("kernel must be a Tensor")
         data = _require_nonempty_float_vector(self, "conv1d")
@@ -712,9 +712,14 @@ class Tensor:
             raise TypeError("padding must be a non-negative int")
         if padding < 0:
             raise ValueError("padding must be a non-negative int")
+        if isinstance(dilation, bool) or not isinstance(dilation, int):
+            raise TypeError("dilation must be a positive int")
+        if dilation <= 0:
+            raise ValueError("dilation must be a positive int")
         n = len(data)
         k = len(weights)
-        out_len = (n + 2 * padding - k) // stride + 1
+        effective = dilation * (k - 1) + 1
+        out_len = (n + 2 * padding - effective) // stride + 1
         if out_len <= 0:
             raise ValueError("conv1d output length must be positive")
         # Cross-correlation: the kernel is never flipped; out-of-range
@@ -723,7 +728,7 @@ class Tensor:
         for o in range(out_len):
             acc = 0.0
             for i in range(k):
-                j = o * stride + i - padding
+                j = o * stride + i * dilation - padding
                 if 0 <= j < n:
                     product = data[j] * weights[i]
                     if not math.isfinite(product):
@@ -746,7 +751,7 @@ class Tensor:
             for o in range(out_len):
                 g = grad[o]
                 for i in range(k):
-                    j = o * stride + i - padding
+                    j = o * stride + i * dilation - padding
                     if 0 <= j < n:
                         contrib_x = g * weights[i]
                         if not math.isfinite(contrib_x):
