@@ -102,6 +102,24 @@ def _merge_grad(a, b):
     return a + b
 
 
+def _sub_grad(a, b):
+    """Subtract two gradient values of identical shape."""
+    if isinstance(a, list):
+        return [x - y for x, y in zip(a, b)]
+    return a - b
+
+
+def _same_grad_shape(a, b):
+    """True when two gradient values have matching scalar/vector shape."""
+    if isinstance(a, list) or isinstance(b, list):
+        return (
+            isinstance(a, list)
+            and isinstance(b, list)
+            and len(a) == len(b)
+        )
+    return True
+
+
 def _validate_grad(grad, like):
     """Validate an externally supplied outgoing gradient against tensor data."""
     if isinstance(grad, bool):
@@ -212,6 +230,7 @@ class Tensor:
         self.grad = None
         self._parents = ()
         self._backward_fn = None
+        self._backward_record = None
 
     @classmethod
     def _make(cls, data, requires_grad, parents, backward_fn):
@@ -221,6 +240,7 @@ class Tensor:
         obj.grad = None
         obj._parents = parents
         obj._backward_fn = backward_fn
+        obj._backward_record = None
         return obj
 
     def _coerce(self, other):
@@ -1258,6 +1278,56 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def mean(self):
+        # Re-validate at call time since the data may have been mutated
+        # after construction: a finite float scalar or a non-empty 1D
+        # float list. bools, ints and other types are a TypeError; an
+        # empty list or any non-finite value is a ValueError.
+        data = _validate_data(self.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        if isinstance(data, list):
+            # Accumulate from 0.0 in ascending index order, then divide
+            # by the length; a non-finite partial sum or quotient aborts
+            # before a result tensor exists, so no state can change on
+            # failure.
+            total = 0.0
+            for value in data:
+                total += value
+                if not math.isfinite(total):
+                    raise ValueError("mean intermediate must be finite")
+            out_data = total / len(data)
+            if not math.isfinite(out_data):
+                raise ValueError("mean intermediate must be finite")
+        else:
+            # A scalar's mean is the scalar itself.
+            out_data = data
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # Snapshot the input shape so later caller-side mutation or
+        # replacement of the input cannot change a pending backward pass.
+        snapshot_n = len(data) if isinstance(data, list) else None
+
+        def backward_fn(grad):
+            # Scalar input: the contribution is g itself; vector input:
+            # every element receives g/n. The generic engine validates
+            # the contribution itself and every merge into an existing
+            # grad.
+            if snapshot_n is None:
+                return [(parent, grad)]
+            contribution = []
+            for _ in range(snapshot_n):
+                value = grad / snapshot_n
+                if not math.isfinite(value):
+                    raise ValueError(
+                        "mean backward intermediate must be finite"
+                    )
+                contribution.append(value)
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def variance(self, correction=0):
         data = _require_nonempty_float_vector(self, "variance")
         if isinstance(correction, bool) or not isinstance(correction, int):
@@ -1859,6 +1929,24 @@ class Tensor:
         else:
             grad = _validate_grad(grad, self.data)
 
+        # Repeated backward on the same result accumulates the upstream
+        # grad and recomputes this graph's contributions from the running
+        # total, replacing this root's own previous leaf contributions
+        # instead of merging a second copy into them. backward(a) followed
+        # by backward(b) therefore leaves exactly the leaf grads a single
+        # backward(a + b) on an identical fresh graph would leave, while
+        # contributions from any other graph still merge in. The record is
+        # only updated after a fully successful pass, so a failed backward
+        # changes nothing.
+        record = self._backward_record
+        if record is not None and _same_grad_shape(record[0], grad):
+            upstream = _merge_grad(record[0], grad)
+            _ensure_finite_grad(upstream)
+            previous = record[1]
+        else:
+            upstream = grad
+            previous = None
+
         topo = []
         visited = set()
 
@@ -1874,7 +1962,7 @@ class Tensor:
 
         # Phase 1: compute every gradient without mutating any node, so a
         # non-finite gradient aborts the pass with all grads untouched.
-        grads = {id(self): grad}
+        grads = {id(self): upstream}
         for node in reversed(topo):
             if node._backward_fn is None:
                 continue
@@ -1896,20 +1984,31 @@ class Tensor:
         # Phase 2: resolve the final grad for every node, validate, then
         # apply. Non-leaf grads are recomputed; leaf grads accumulate.
         assignments = []
+        leaves = {}
         for node in topo:
             if node._parents:
                 assignments.append((node, grads.get(id(node))))
             elif node.requires_grad:
-                value = grads.get(id(node))
-                if value is not None:
+                contribution = grads.get(id(node))
+                if contribution is not None:
+                    leaves[id(node)] = (node, contribution)
+                    value = contribution
                     if node.grad is not None:
-                        value = _merge_grad(node.grad, value)
+                        base = node.grad
+                        if previous is not None:
+                            entry = previous.get(id(node))
+                            if entry is not None and _same_grad_shape(
+                                entry[1], node.grad
+                            ):
+                                base = _sub_grad(node.grad, entry[1])
+                        value = _merge_grad(base, contribution)
                     assignments.append((node, value))
         for node, value in assignments:
             if value is not None:
                 _ensure_finite_grad(value)
         for node, value in assignments:
             node.grad = value
+        self._backward_record = (upstream, leaves)
 
     def to_json(self):
         return (
