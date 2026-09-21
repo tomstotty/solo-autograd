@@ -139,6 +139,36 @@ def _require_nonempty_float_vector(tensor, op):
     return data
 
 
+def _stable_sigmoid_value(x):
+    """Evaluate sigmoid(x) stably, never exponentiating a large positive.
+
+    For x >= 0: e = exp(-x), d = 1 + e, y = 1/d.
+    For x < 0:  e = exp(x),  d = 1 + e, y = e/d.
+    ValueError if any of e, d, y is non-finite.
+    """
+    if x >= 0.0:
+        e = math.exp(-x)
+        if not math.isfinite(e):
+            raise ValueError("sigmoid intermediate must be finite")
+        d = 1.0 + e
+        if not math.isfinite(d):
+            raise ValueError("sigmoid intermediate must be finite")
+        y = 1.0 / d
+        if not math.isfinite(y):
+            raise ValueError("sigmoid intermediate must be finite")
+        return y
+    e = math.exp(x)
+    if not math.isfinite(e):
+        raise ValueError("sigmoid intermediate must be finite")
+    d = 1.0 + e
+    if not math.isfinite(d):
+        raise ValueError("sigmoid intermediate must be finite")
+    y = e / d
+    if not math.isfinite(y):
+        raise ValueError("sigmoid intermediate must be finite")
+    return y
+
+
 def _log_softmax_values(data):
     """Compute log-softmax values stably.
 
@@ -1013,6 +1043,74 @@ class Tensor:
         return Tensor._make(
             out_data, True, (parent_self, parent_other), backward_fn
         )
+
+    def sigmoid(self):
+        # Re-validate at call time since the data may have been mutated
+        # after construction: a finite float scalar or a non-empty 1D
+        # float list. bools, ints and other types are a TypeError; an
+        # empty list or any non-finite value is a ValueError.
+        data = _validate_data(self.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        # Elementwise stable evaluation in ascending index order via
+        # _stable_sigmoid_value: exp is only ever evaluated on values in
+        # (-inf, 0], never on a large positive argument. A non-finite e, d
+        # or y aborts before a result tensor exists, so no state can
+        # change on failure.
+        if isinstance(data, list):
+            out_data = [_stable_sigmoid_value(x) for x in data]
+        else:
+            out_data = _stable_sigmoid_value(data)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # Snapshot the forward output so later caller-side mutation or
+        # replacement of the input cannot change a pending backward pass.
+        snapshot_y = list(out_data) if isinstance(out_data, list) else out_data
+
+        def backward_fn(grad):
+            # Elementwise g*y*(1.0-y); each intermediate is checked as it
+            # is produced, and the generic engine validates the
+            # contribution itself and every merge into an existing grad.
+            if isinstance(grad, list):
+                contribution = []
+                for i in range(len(snapshot_y)):
+                    one_minus = 1.0 - snapshot_y[i]
+                    if not math.isfinite(one_minus):
+                        raise ValueError(
+                            "sigmoid backward intermediate must be finite"
+                        )
+                    product = grad[i] * snapshot_y[i]
+                    if not math.isfinite(product):
+                        raise ValueError(
+                            "sigmoid backward intermediate must be finite"
+                        )
+                    value = product * one_minus
+                    if not math.isfinite(value):
+                        raise ValueError(
+                            "sigmoid backward intermediate must be finite"
+                        )
+                    contribution.append(value)
+            else:
+                one_minus = 1.0 - snapshot_y
+                if not math.isfinite(one_minus):
+                    raise ValueError(
+                        "sigmoid backward intermediate must be finite"
+                    )
+                product = grad * snapshot_y
+                if not math.isfinite(product):
+                    raise ValueError(
+                        "sigmoid backward intermediate must be finite"
+                    )
+                value = product * one_minus
+                if not math.isfinite(value):
+                    raise ValueError(
+                        "sigmoid backward intermediate must be finite"
+                    )
+                contribution = value
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
 
     def tanh(self):
         out_data = _map_unary(self.data, math.tanh)
