@@ -656,6 +656,159 @@ class Tensor:
             out_data, True, (parent_self, parent_other), backward_fn
         )
 
+    def binary_cross_entropy_with_logits(self, target):
+        if not isinstance(target, Tensor):
+            raise TypeError("target must be a Tensor")
+        a = _require_nonempty_float_vector(
+            self, "binary_cross_entropy_with_logits"
+        )
+        b = _require_nonempty_float_vector(
+            target, "binary_cross_entropy_with_logits"
+        )
+        if len(a) != len(b):
+            raise ValueError(
+                "binary_cross_entropy_with_logits vector lengths must match"
+            )
+        for value in b:
+            if value < 0.0 or value > 1.0:
+                raise ValueError(
+                    "binary_cross_entropy_with_logits target values must be in"
+                    " [0.0, 1.0]"
+                )
+        # Copy both operands at call time so later caller-side mutation or
+        # replacement of either input can change neither the forward result
+        # nor a pending backward pass.
+        x = list(a)
+        y = list(b)
+        n = len(x)
+        # Accumulate the numerically stable logits loss term
+        # max(x_i, 0) - x_i*y_i + log1p(exp(-|x_i|)) index by index from
+        # 0.0 in ascending order; a non-finite intermediate, partial sum or
+        # quotient aborts before a result tensor exists, so no state can
+        # change on failure.
+        sigmoids = []
+        q = 0.0
+        for i in range(n):
+            x_i = x[i]
+            y_i = y[i]
+            relu = x_i if x_i > 0.0 else 0.0
+            if not math.isfinite(relu):
+                raise ValueError(
+                    "binary_cross_entropy_with_logits intermediate must be"
+                    " finite"
+                )
+            product = x_i * y_i
+            if not math.isfinite(product):
+                raise ValueError(
+                    "binary_cross_entropy_with_logits intermediate must be"
+                    " finite"
+                )
+            log_term = math.log1p(math.exp(-abs(x_i)))
+            if not math.isfinite(log_term):
+                raise ValueError(
+                    "binary_cross_entropy_with_logits intermediate must be"
+                    " finite"
+                )
+            term = relu - product + log_term
+            if not math.isfinite(term):
+                raise ValueError(
+                    "binary_cross_entropy_with_logits intermediate must be"
+                    " finite"
+                )
+            q += term
+            if not math.isfinite(q):
+                raise ValueError(
+                    "binary_cross_entropy_with_logits intermediate must be"
+                    " finite"
+                )
+            if x_i >= 0.0:
+                s_i = 1.0 / (1.0 + math.exp(-x_i))
+            else:
+                e = math.exp(x_i)
+                s_i = e / (1.0 + e)
+            if not math.isfinite(s_i):
+                raise ValueError(
+                    "binary_cross_entropy_with_logits intermediate must be"
+                    " finite"
+                )
+            sigmoids.append(s_i)
+        out_data = q / n
+        if not math.isfinite(out_data):
+            raise ValueError(
+                "binary_cross_entropy_with_logits intermediate must be finite"
+            )
+        if not (self.requires_grad or target.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_other = self, target
+        # Save x, y and the sigmoid values with the graph so a pending
+        # backward pass is independent of any subsequent data mutation.
+        snapshot_x = x
+        snapshot_y = y
+        snapshot_s = sigmoids
+
+        def backward_fn(grad):
+            # An explicit grad must be a finite float (the output is a
+            # scalar); None, bools, ints, lists and other types are rejected.
+            if isinstance(grad, list):
+                raise ValueError("grad must be a finite float")
+            if grad is None or isinstance(grad, bool) or not isinstance(
+                grad, float
+            ):
+                raise TypeError("grad must be a finite float")
+            if not math.isfinite(grad):
+                raise ValueError("grad must be finite")
+            # Build every contribution before returning, so a non-finite
+            # backward intermediate aborts the whole pass before any grad is
+            # written. When both operands are the same Tensor the two
+            # contributions are merged elementwise before submission.
+            dx = None
+            dy = None
+            if parent_self.requires_grad:
+                dx = []
+                for i in range(n):
+                    value = grad * (snapshot_s[i] - snapshot_y[i]) / n
+                    if not math.isfinite(value):
+                        raise ValueError(
+                            "binary_cross_entropy_with_logits backward"
+                            " intermediate must be finite"
+                        )
+                    dx.append(value)
+            if parent_other.requires_grad:
+                dy = []
+                for i in range(n):
+                    value = -grad * snapshot_x[i] / n
+                    if not math.isfinite(value):
+                        raise ValueError(
+                            "binary_cross_entropy_with_logits backward"
+                            " intermediate must be finite"
+                        )
+                    dy.append(value)
+            contributions = []
+            if parent_self is parent_other:
+                if dx is not None and dy is not None:
+                    merged = [u + v for u, v in zip(dx, dy)]
+                    for value in merged:
+                        if not math.isfinite(value):
+                            raise ValueError(
+                                "binary_cross_entropy_with_logits backward"
+                                " intermediate must be finite"
+                            )
+                    contributions.append((parent_self, merged))
+                elif dx is not None:
+                    contributions.append((parent_self, dx))
+                elif dy is not None:
+                    contributions.append((parent_self, dy))
+            else:
+                if dx is not None:
+                    contributions.append((parent_self, dx))
+                if dy is not None:
+                    contributions.append((parent_other, dy))
+            return contributions
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_other), backward_fn
+        )
+
     def cosine_similarity(self, other, eps=1e-12):
         if not isinstance(other, Tensor):
             raise TypeError("other must be a Tensor")
