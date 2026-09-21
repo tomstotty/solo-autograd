@@ -128,6 +128,36 @@ def _require_nonempty_float_vector(tensor, op):
     return data
 
 
+def _require_finite_scalar_or_vector(tensor, op):
+    """Validate a finite float scalar or non-empty 1D float list operand.
+
+    Mirrors _require_nonempty_float_vector but also accepts a finite float
+    scalar; element types and the requires_grad flag are checked before
+    element finiteness.
+    """
+    data = tensor.data
+    if isinstance(data, bool) or not isinstance(data, (float, list)):
+        raise TypeError(
+            op + " data must be a finite float scalar or a non-empty 1D"
+            " float list"
+        )
+    if isinstance(data, list):
+        if len(data) == 0:
+            raise ValueError(op + " data list must be non-empty")
+        for value in data:
+            if isinstance(value, bool) or not isinstance(value, float):
+                raise TypeError(op + " data elements must be floats")
+    if not isinstance(tensor.requires_grad, bool):
+        raise TypeError("requires_grad must be a bool")
+    if isinstance(data, list):
+        for value in data:
+            if not math.isfinite(value):
+                raise ValueError(op + " data elements must be finite")
+    elif not math.isfinite(data):
+        raise ValueError(op + " data must be finite")
+    return data
+
+
 def _log_softmax_values(data):
     """Compute log-softmax values stably.
 
@@ -229,6 +259,101 @@ class Tensor:
                 (parent_self, _reduce_like(a, grad_self)),
                 (parent_other, _reduce_like(b, grad_other)),
             ]
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_other), backward_fn
+        )
+
+    def div(self, other):
+        other = self._coerce(other)
+        a = _require_finite_scalar_or_vector(self, "div")
+        b = _require_finite_scalar_or_vector(other, "div")
+        a_vector = isinstance(a, list)
+        b_vector = isinstance(b, list)
+        if a_vector and b_vector and len(a) != len(b):
+            raise ValueError("div vector lengths must match")
+        if a_vector:
+            n = len(a)
+        elif b_vector:
+            n = len(b)
+        else:
+            n = 1
+        # Compute a/b for each output index in ascending order; a zero (or
+        # signed-zero) denominator or non-finite quotient aborts before a
+        # result tensor exists, so no state can change on failure.
+        quotients = []
+        for i in range(n):
+            a_i = a[i] if a_vector else a
+            b_i = b[i] if b_vector else b
+            if b_i == 0.0:
+                raise ValueError("div denominator must not be zero")
+            quotient = a_i / b_i
+            if not math.isfinite(quotient):
+                raise ValueError("div intermediate must be finite")
+            quotients.append(quotient)
+        out_data = quotients if (a_vector or b_vector) else quotients[0]
+        if not (self.requires_grad or other.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_other = self, other
+        # Snapshot both operands so later caller-side mutation or replacement
+        # of either input cannot change what a pending backward pass uses.
+        snapshot_a = list(a) if a_vector else a
+        snapshot_b = list(b) if b_vector else b
+        a_is_vector = a_vector
+        b_is_vector = b_vector
+
+        def backward_fn(grad):
+            grad_values = grad if isinstance(grad, list) else [grad]
+            da_terms = [] if a_is_vector else 0.0
+            db_terms = [] if b_is_vector else 0.0
+            for i in range(n):
+                g_i = grad_values[i]
+                a_i = snapshot_a[i] if a_is_vector else snapshot_a
+                b_i = snapshot_b[i] if b_is_vector else snapshot_b
+                if parent_self.requires_grad:
+                    da_i = g_i / b_i
+                    if not math.isfinite(da_i):
+                        raise ValueError(
+                            "div backward intermediate must be finite"
+                        )
+                    if a_is_vector:
+                        da_terms.append(da_i)
+                    else:
+                        da_terms += da_i
+                        if not math.isfinite(da_terms):
+                            raise ValueError(
+                                "div backward reduction must be finite"
+                            )
+                if parent_other.requires_grad:
+                    ga = g_i * a_i
+                    if not math.isfinite(ga):
+                        raise ValueError(
+                            "div backward intermediate must be finite"
+                        )
+                    b_squared = b_i * b_i
+                    if not math.isfinite(b_squared):
+                        raise ValueError(
+                            "div backward intermediate must be finite"
+                        )
+                    db_i = (-ga) / b_squared
+                    if not math.isfinite(db_i):
+                        raise ValueError(
+                            "div backward intermediate must be finite"
+                        )
+                    if b_is_vector:
+                        db_terms.append(db_i)
+                    else:
+                        db_terms += db_i
+                        if not math.isfinite(db_terms):
+                            raise ValueError(
+                                "div backward reduction must be finite"
+                            )
+            contributions = []
+            if parent_self.requires_grad:
+                contributions.append((parent_self, da_terms))
+            if parent_other.requires_grad:
+                contributions.append((parent_other, db_terms))
+            return contributions
 
         return Tensor._make(
             out_data, True, (parent_self, parent_other), backward_fn
