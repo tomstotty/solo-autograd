@@ -1446,23 +1446,112 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
-    def cross_entropy(self, target):
+    def cross_entropy(self, target, label_smoothing=0.0):
         data = _require_nonempty_float_vector(self, "cross_entropy")
         if isinstance(target, bool) or not isinstance(target, int):
             raise TypeError("target must be a non-bool int")
-        if target < 0 or target >= len(data):
+        n = len(data)
+        if target < 0 or target >= n:
             raise ValueError("target index out of range")
-        log_values = _log_softmax_values(data)
-        out_data = -log_values[target]
+        if isinstance(label_smoothing, bool) or not isinstance(
+            label_smoothing, float
+        ):
+            raise TypeError(
+                "label_smoothing must be a finite float in [0.0, 1.0)"
+            )
+        if (
+            not math.isfinite(label_smoothing)
+            or label_smoothing < 0.0
+            or label_smoothing >= 1.0
+        ):
+            raise ValueError(
+                "label_smoothing must be a finite float in [0.0, 1.0)"
+            )
+        alpha = label_smoothing
+        # Snapshot the input at call time so later caller-side mutation or
+        # replacement of data can change neither the forward result nor a
+        # pending backward pass.
+        x = list(data)
+        # Stable log-softmax in ascending index order: m = max(x),
+        # z_i = exp(x_i - m), s = sum(z), l_i = x_i - m - log(s). exp is
+        # only ever evaluated on values in (-inf, 0]. A non-finite
+        # intermediate aborts before a result tensor exists, so no state
+        # can change on failure.
+        m = max(x)
+        z = []
+        s = 0.0
+        for x_i in x:
+            diff = x_i - m
+            if not math.isfinite(diff):
+                raise ValueError("cross_entropy intermediate must be finite")
+            z_i = math.exp(diff)
+            if not math.isfinite(z_i):
+                raise ValueError("cross_entropy intermediate must be finite")
+            z.append(z_i)
+            s += z_i
+            if not math.isfinite(s):
+                raise ValueError("cross_entropy intermediate must be finite")
+        log_s = math.log(s)
+        if not math.isfinite(log_s):
+            raise ValueError("cross_entropy intermediate must be finite")
+        l = []
+        for x_i in x:
+            l_i = x_i - m - log_s
+            if not math.isfinite(l_i):
+                raise ValueError("cross_entropy intermediate must be finite")
+            l.append(l_i)
+        # Smoothed target distribution: q_i = alpha/n, with an extra
+        # 1.0 - alpha added at the target index.
+        base = alpha / n
+        if not math.isfinite(base):
+            raise ValueError("cross_entropy intermediate must be finite")
+        q = [base] * n
+        q_target = base + (1.0 - alpha)
+        if not math.isfinite(q_target):
+            raise ValueError("cross_entropy intermediate must be finite")
+        q[target] = q_target
+        # L = -sum_i q_i * l_i, subtracting each contribution from a
+        # running total starting at 0.0 in ascending index order.
+        out_data = 0.0
+        for i in range(n):
+            contribution = q[i] * l[i]
+            if not math.isfinite(contribution):
+                raise ValueError("cross_entropy intermediate must be finite")
+            out_data -= contribution
+            if not math.isfinite(out_data):
+                raise ValueError("cross_entropy intermediate must be finite")
         if not self.requires_grad:
             return Tensor._make(out_data, False, (), None)
         parent = self
-        target_index = target
+        # Save l and q with the graph so a pending backward pass is
+        # independent of any subsequent data mutation.
+        snapshot_l = l
+        snapshot_q = q
 
         def backward_fn(grad):
-            contribution = [grad * math.exp(l_i) for l_i in log_values]
-            contribution[target_index] -= grad
-            return [(parent, contribution)]
+            # dx_i = g * (exp(l_i) - q_i); exp is only evaluated on
+            # l_i <= 0. Each intermediate is checked as it is produced,
+            # and the generic engine validates the contribution itself and
+            # every merge into an existing grad.
+            dx = []
+            for i in range(n):
+                e_i = math.exp(snapshot_l[i])
+                if not math.isfinite(e_i):
+                    raise ValueError(
+                        "cross_entropy backward intermediate must be finite"
+                    )
+                difference = e_i - snapshot_q[i]
+                if not math.isfinite(difference):
+                    raise ValueError(
+                        "cross_entropy backward intermediate must be finite"
+                    )
+                value = grad * difference
+                if not math.isfinite(value):
+                    raise ValueError(
+                        "cross_entropy backward intermediate must be finite"
+                    )
+                dx.append(value)
+            return [(parent, dx)]
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
