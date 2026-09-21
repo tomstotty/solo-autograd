@@ -656,6 +656,195 @@ class Tensor:
             out_data, True, (parent_self, parent_other), backward_fn
         )
 
+    def binary_cross_entropy_with_logits(self, target):
+        if not isinstance(target, Tensor):
+            raise TypeError("target must be a Tensor")
+        a = _require_nonempty_float_vector(
+            self, "binary_cross_entropy_with_logits"
+        )
+        b = _require_nonempty_float_vector(
+            target, "binary_cross_entropy_with_logits"
+        )
+        if len(a) != len(b):
+            raise ValueError(
+                "binary_cross_entropy_with_logits vector lengths must match"
+            )
+        for y_i in b:
+            if y_i < 0.0 or y_i > 1.0:
+                raise ValueError(
+                    "binary_cross_entropy_with_logits target values must lie"
+                    " in [0.0, 1.0]"
+                )
+        # Copy both operands at call time so later caller-side mutation or
+        # replacement of either input can change neither the forward result
+        # nor a pending backward pass.
+        x = list(a)
+        y = list(b)
+        n = len(x)
+        # Accumulate the per-index BCE-with-logits term from 0.0 in ascending
+        # index order: max(x_i, 0) - x_i*y_i + log1p(exp(-|x_i|)); the total
+        # is divided by n at the end. A non-finite intermediate aborts before
+        # a result tensor exists, so no state can change on failure.
+        total = 0.0
+        for i in range(n):
+            x_i = x[i]
+            y_i = y[i]
+            relu = max(x_i, 0.0)
+            if not math.isfinite(relu):
+                raise ValueError(
+                    "binary_cross_entropy_with_logits intermediate must be"
+                    " finite"
+                )
+            product = x_i * y_i
+            if not math.isfinite(product):
+                raise ValueError(
+                    "binary_cross_entropy_with_logits intermediate must be"
+                    " finite"
+                )
+            difference = relu - product
+            if not math.isfinite(difference):
+                raise ValueError(
+                    "binary_cross_entropy_with_logits intermediate must be"
+                    " finite"
+                )
+            abs_x = abs(x_i)
+            if not math.isfinite(abs_x):
+                raise ValueError(
+                    "binary_cross_entropy_with_logits intermediate must be"
+                    " finite"
+                )
+            neg_abs = -abs_x
+            if not math.isfinite(neg_abs):
+                raise ValueError(
+                    "binary_cross_entropy_with_logits intermediate must be"
+                    " finite"
+                )
+            exp_term = math.exp(neg_abs)
+            if not math.isfinite(exp_term):
+                raise ValueError(
+                    "binary_cross_entropy_with_logits intermediate must be"
+                    " finite"
+                )
+            log_term = math.log1p(exp_term)
+            if not math.isfinite(log_term):
+                raise ValueError(
+                    "binary_cross_entropy_with_logits intermediate must be"
+                    " finite"
+                )
+            term = difference + log_term
+            if not math.isfinite(term):
+                raise ValueError(
+                    "binary_cross_entropy_with_logits intermediate must be"
+                    " finite"
+                )
+            total += term
+            if not math.isfinite(total):
+                raise ValueError(
+                    "binary_cross_entropy_with_logits intermediate must be"
+                    " finite"
+                )
+        out_data = total / n
+        if not math.isfinite(out_data):
+            raise ValueError(
+                "binary_cross_entropy_with_logits intermediate must be finite"
+            )
+        if not (self.requires_grad or target.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_other = self, target
+        # Save x and y with the graph so a pending backward pass is
+        # independent of any subsequent data mutation.
+        snapshot_x = x
+        snapshot_y = y
+
+        def backward_fn(grad):
+            # s_i is the sigmoid of x_i, evaluated via the non-overflowing
+            # branch for each sign; dx_i = g*(s_i - y_i)/n and
+            # dy_i = -g*x_i/n. Only the sides that require grad are computed
+            # and submitted; a non-finite intermediate aborts the whole pass
+            # before any grad is written.
+            contributions = []
+            if parent_self.requires_grad:
+                dx = []
+                for i in range(n):
+                    x_i = snapshot_x[i]
+                    y_i = snapshot_y[i]
+                    if x_i >= 0.0:
+                        exp_neg = math.exp(-x_i)
+                        if not math.isfinite(exp_neg):
+                            raise ValueError(
+                                "binary_cross_entropy_with_logits backward"
+                                " intermediate must be finite"
+                            )
+                        denominator = 1.0 + exp_neg
+                        if not math.isfinite(denominator):
+                            raise ValueError(
+                                "binary_cross_entropy_with_logits backward"
+                                " intermediate must be finite"
+                            )
+                        s_i = 1.0 / denominator
+                    else:
+                        e = math.exp(x_i)
+                        if not math.isfinite(e):
+                            raise ValueError(
+                                "binary_cross_entropy_with_logits backward"
+                                " intermediate must be finite"
+                            )
+                        denominator = 1.0 + e
+                        if not math.isfinite(denominator):
+                            raise ValueError(
+                                "binary_cross_entropy_with_logits backward"
+                                " intermediate must be finite"
+                            )
+                        s_i = e / denominator
+                    if not math.isfinite(s_i):
+                        raise ValueError(
+                            "binary_cross_entropy_with_logits backward"
+                            " intermediate must be finite"
+                        )
+                    delta = s_i - y_i
+                    if not math.isfinite(delta):
+                        raise ValueError(
+                            "binary_cross_entropy_with_logits backward"
+                            " intermediate must be finite"
+                        )
+                    scaled_x = grad * delta
+                    if not math.isfinite(scaled_x):
+                        raise ValueError(
+                            "binary_cross_entropy_with_logits backward"
+                            " intermediate must be finite"
+                        )
+                    dx_i = scaled_x / n
+                    if not math.isfinite(dx_i):
+                        raise ValueError(
+                            "binary_cross_entropy_with_logits backward"
+                            " intermediate must be finite"
+                        )
+                    dx.append(dx_i)
+                contributions.append((parent_self, dx))
+            if parent_other.requires_grad:
+                dy = []
+                for i in range(n):
+                    x_i = snapshot_x[i]
+                    scaled_y = grad * x_i
+                    if not math.isfinite(scaled_y):
+                        raise ValueError(
+                            "binary_cross_entropy_with_logits backward"
+                            " intermediate must be finite"
+                        )
+                    dy_i = -scaled_y / n
+                    if not math.isfinite(dy_i):
+                        raise ValueError(
+                            "binary_cross_entropy_with_logits backward"
+                            " intermediate must be finite"
+                        )
+                    dy.append(dy_i)
+                contributions.append((parent_other, dy))
+            return contributions
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_other), backward_fn
+        )
+
     def cosine_similarity(self, other, eps=1e-12):
         if not isinstance(other, Tensor):
             raise TypeError("other must be a Tensor")
