@@ -1623,6 +1623,49 @@ class Tensor:
         )
 
 
+def xavier_uniform(length, fan_in, fan_out, seed=0, requires_grad=True):
+    """Return a Tensor of `length` Xavier-uniform samples, drawn deterministically.
+
+    Uses limit = sqrt(6 / (fan_in + fan_out)) and a local LCG seeded by `seed`;
+    no global random state is touched. TypeError on bad argument types,
+    ValueError on out-of-range arguments or non-finite results.
+    """
+    for name, value in (
+        ("length", length),
+        ("fan_in", fan_in),
+        ("fan_out", fan_out),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(name + " must be a positive int")
+        if value <= 0:
+            raise ValueError(name + " must be a positive int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int in [0, 4294967295]")
+    if seed < 0 or seed > 4294967295:
+        raise ValueError("seed must be in [0, 4294967295]")
+    if not isinstance(requires_grad, bool):
+        raise TypeError("requires_grad must be a bool")
+    try:
+        limit = math.sqrt(6.0 / (fan_in + fan_out))
+    except OverflowError:
+        raise ValueError("xavier limit must be finite")
+    if not math.isfinite(limit):
+        raise ValueError("xavier limit must be finite")
+    data = []
+    s = seed
+    for _ in range(length):
+        s = (1664525 * s + 1013904223) % 4294967296
+        u = s / 4294967296.0
+        v = 2.0 * u - 1.0
+        value = v * limit
+        if not (
+            math.isfinite(u) and math.isfinite(v) and math.isfinite(value)
+        ):
+            raise ValueError("xavier_uniform values must be finite")
+        data.append(value)
+    return Tensor(data, requires_grad)
+
+
 class SGD:
     """Stochastic gradient descent over a fixed list of Tensors."""
 
