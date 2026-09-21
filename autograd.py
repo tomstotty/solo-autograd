@@ -1967,7 +1967,7 @@ class Tensor:
             out_data, True, (parent_self, parent_kernel), backward_fn
         )
 
-    def conv_transpose1d(self, kernel, stride=1, padding=0):
+    def conv_transpose1d(self, kernel, stride=1, padding=0, dilation=1):
         if not isinstance(kernel, Tensor):
             raise TypeError("kernel must be a Tensor")
         data = _require_nonempty_float_vector(self, "conv_transpose1d")
@@ -1980,24 +1980,37 @@ class Tensor:
             raise TypeError("padding must be a non-negative int")
         if padding < 0:
             raise ValueError("padding must be a non-negative int")
+        if isinstance(dilation, bool) or not isinstance(dilation, int):
+            raise TypeError("dilation must be a positive int")
+        if dilation <= 0:
+            raise ValueError("dilation must be a positive int")
         n = len(data)
         k = len(weights)
-        out_len = (n - 1) * stride - 2 * padding + k
+        s = stride
+        p = padding
+        d = dilation
+        out_len = (n - 1) * s - 2 * p + d * (k - 1) + 1
         if out_len <= 0:
             raise ValueError("conv_transpose1d output length must be positive")
-        # Full transposed cross-correlation: each input element scatters a
-        # scaled copy of the kernel onto the output, accumulating
-        # out[i*stride - padding + r] in ascending i then r order and
-        # skipping out-of-range positions; a non-finite product or partial
-        # sum aborts before a result tensor exists, so no state can change
-        # on failure.
+        # Snapshot both operands at call time so later caller-side mutation
+        # or replacement of either input can change neither the forward
+        # result nor a pending backward pass.
+        a = list(data)
+        b = list(weights)
+        # Dilated transposed cross-correlation: each input element scatters
+        # a scaled copy of the dilated kernel onto the output, accumulating
+        # out[i*stride - padding + r*dilation] in ascending i then r order
+        # and skipping out-of-range positions; a non-finite product or
+        # partial sum aborts before a result tensor exists, so no state can
+        # change on failure. With dilation=1 this is the plain transposed
+        # cross-correlation, preserving the previous behavior.
         out_data = [0.0] * out_len
         for i in range(n):
             for r in range(k):
-                j = i * stride - padding + r
+                j = i * s - p + r * d
                 if not 0 <= j < out_len:
                     continue
-                product = data[i] * weights[r]
+                product = a[i] * b[r]
                 if not math.isfinite(product):
                     raise ValueError(
                         "conv_transpose1d intermediate must be finite"
@@ -2010,21 +2023,17 @@ class Tensor:
         if not (self.requires_grad or kernel.requires_grad):
             return Tensor._make(out_data, False, (), None)
         parent_self, parent_kernel = self, kernel
-        # Snapshot both operands so later caller-side mutation of either
-        # input list cannot change what a pending backward pass uses.
-        snapshot_a = list(data)
-        snapshot_b = list(weights)
 
         def backward_fn(grad):
             dx = [0.0] * n
             dk = [0.0] * k
             for i in range(n):
                 for r in range(k):
-                    j = i * stride - padding + r
+                    j = i * s - p + r * d
                     if not 0 <= j < out_len:
                         continue
                     g = grad[j]
-                    contrib_x = g * snapshot_b[r]
+                    contrib_x = g * b[r]
                     if not math.isfinite(contrib_x):
                         raise ValueError(
                             "conv_transpose1d backward intermediate "
@@ -2036,7 +2045,7 @@ class Tensor:
                             "conv_transpose1d backward intermediate "
                             "must be finite"
                         )
-                    contrib_k = g * snapshot_a[i]
+                    contrib_k = g * a[i]
                     if not math.isfinite(contrib_k):
                         raise ValueError(
                             "conv_transpose1d backward intermediate "
