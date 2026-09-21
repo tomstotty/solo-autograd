@@ -2194,7 +2194,7 @@ class Tensor:
             out_data, True, (parent_self, parent_kernel), backward_fn
         )
 
-    def max_pool1d(self, kernel_size, stride=None, padding=0):
+    def max_pool1d(self, kernel_size, stride=None, padding=0, dilation=1):
         data = _require_nonempty_float_vector(self, "max_pool1d")
         if isinstance(kernel_size, bool) or not isinstance(kernel_size, int):
             raise TypeError("kernel_size must be a positive int")
@@ -2210,20 +2210,26 @@ class Tensor:
             raise TypeError("padding must be a non-negative int")
         if padding < 0:
             raise ValueError("padding must be a non-negative int")
+        if isinstance(dilation, bool) or not isinstance(dilation, int):
+            raise TypeError("dilation must be a positive int")
+        if dilation <= 0:
+            raise ValueError("dilation must be a positive int")
         n = len(data)
         k = kernel_size
-        out_len = (n + 2 * padding - k) // stride + 1
+        effective = dilation * (k - 1) + 1
+        out_len = (n + 2 * padding - effective) // stride + 1
         if out_len <= 0:
             raise ValueError("max_pool1d output length must be positive")
         # Out-of-range input positions (from padding) are skipped; on ties
-        # the smallest input index wins the gradient.
+        # the smallest input index wins the gradient. Window positions are
+        # visited in ascending i, which is also ascending j for dilation >= 1.
         out_data = []
         argmax_indices = []
         for o in range(out_len):
             best = None
             best_j = None
             for i in range(k):
-                j = o * stride + i - padding
+                j = o * stride + i * dilation - padding
                 if 0 <= j < n and (best is None or data[j] > best):
                     best = data[j]
                     best_j = j
