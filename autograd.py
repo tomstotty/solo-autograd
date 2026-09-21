@@ -491,6 +491,80 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def variance(self, correction=0):
+        data = _require_nonempty_float_vector(self, "variance")
+        if isinstance(correction, bool) or not isinstance(correction, int):
+            raise TypeError("correction must be a non-bool int")
+        if correction < 0 or correction >= len(data):
+            raise ValueError(
+                "correction must satisfy 0 <= correction < len(data)"
+            )
+        # Snapshot the input so later caller-side mutation cannot change
+        # either the forward result or a pending backward pass.
+        x = list(data)
+        n = len(x)
+        # Two passes, each accumulating from 0.0 in ascending index order,
+        # multiplying before adding at each index; a non-finite
+        # intermediate aborts before a result tensor exists, so no state
+        # can change on failure.
+        total = 0.0
+        for i in range(n):
+            total += x[i]
+            if not math.isfinite(total):
+                raise ValueError("variance intermediate must be finite")
+        mu = total / n
+        if not math.isfinite(mu):
+            raise ValueError("variance intermediate must be finite")
+        squared_sum = 0.0
+        for i in range(n):
+            diff = x[i] - mu
+            if not math.isfinite(diff):
+                raise ValueError("variance intermediate must be finite")
+            square = diff * diff
+            if not math.isfinite(square):
+                raise ValueError("variance intermediate must be finite")
+            squared_sum += square
+            if not math.isfinite(squared_sum):
+                raise ValueError("variance intermediate must be finite")
+        denominator = n - correction
+        out_data = squared_sum / denominator
+        if not math.isfinite(out_data):
+            raise ValueError("variance intermediate must be finite")
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        snapshot_x = x
+        saved_mu = mu
+        saved_denominator = denominator
+
+        def backward_fn(grad):
+            dx = [0.0] * n
+            for i in range(n):
+                scaled = grad * 2.0
+                if not math.isfinite(scaled):
+                    raise ValueError(
+                        "variance backward intermediate must be finite"
+                    )
+                diff = snapshot_x[i] - saved_mu
+                if not math.isfinite(diff):
+                    raise ValueError(
+                        "variance backward intermediate must be finite"
+                    )
+                product = scaled * diff
+                if not math.isfinite(product):
+                    raise ValueError(
+                        "variance backward intermediate must be finite"
+                    )
+                dx_i = product / saved_denominator
+                if not math.isfinite(dx_i):
+                    raise ValueError(
+                        "variance backward intermediate must be finite"
+                    )
+                dx[i] = dx_i
+            return [(parent, dx)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def softmax(self):
         data = self.data
         if not isinstance(data, list) or len(data) == 0:
