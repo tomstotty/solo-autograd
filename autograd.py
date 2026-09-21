@@ -209,16 +209,35 @@ class Tensor:
             raise TypeError("requires_grad must be a bool")
         self.data = normalized
         self.requires_grad = requires_grad
-        self.grad = None
+        self._grad = None
+        self._grad_external = None
+        self._grad_edges = {}
+        self._seed_total = None
         self._parents = ()
         self._backward_fn = None
+
+    @property
+    def grad(self):
+        return self._grad
+
+    @grad.setter
+    def grad(self, value):
+        # An external assignment replaces the gradient wholesale: the value
+        # becomes the baseline that later backward() passes accumulate onto,
+        # and any cached autograd contributions are forgotten.
+        self._grad = value
+        self._grad_external = value
+        self._grad_edges = {}
 
     @classmethod
     def _make(cls, data, requires_grad, parents, backward_fn):
         obj = cls.__new__(cls)
         obj.data = data
         obj.requires_grad = requires_grad
-        obj.grad = None
+        obj._grad = None
+        obj._grad_external = None
+        obj._grad_edges = {}
+        obj._seed_total = None
         obj._parents = parents
         obj._backward_fn = backward_fn
         return obj
@@ -1258,6 +1277,43 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def mean(self):
+        data = _validate_data(self.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        if isinstance(data, list):
+            # Accumulate from 0.0 in ascending index order, then divide by
+            # the length; a non-finite partial sum or result aborts before
+            # a result tensor exists, so no state can change on failure.
+            total = 0.0
+            for value in data:
+                total += value
+                if not math.isfinite(total):
+                    raise ValueError("mean intermediate must be finite")
+            out_data = total / len(data)
+            if not math.isfinite(out_data):
+                raise ValueError("mean intermediate must be finite")
+        else:
+            out_data = data
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # Snapshot the input shape so later caller-side mutation or
+        # replacement of data cannot change a pending backward pass.
+        snapshot_length = len(data) if isinstance(data, list) else 0
+
+        def backward_fn(grad):
+            if snapshot_length:
+                share = grad / snapshot_length
+                if not math.isfinite(share):
+                    raise ValueError(
+                        "mean backward intermediate must be finite"
+                    )
+                return [(parent, [share] * snapshot_length)]
+            return [(parent, grad)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def variance(self, correction=0):
         data = _require_nonempty_float_vector(self, "variance")
         if isinstance(correction, bool) or not isinstance(correction, int):
@@ -1859,6 +1915,23 @@ class Tensor:
         else:
             grad = _validate_grad(grad, self.data)
 
+        # Coalesce repeated backward() calls on this same result: the pass
+        # below runs with the summed seed, so the leaf grads produced by
+        # backward(g1) followed by backward(g2) are bit-identical to those
+        # of a single backward(g1 + g2) on an identical fresh graph.
+        if self._seed_total is None:
+            total_seed = grad
+        else:
+            if isinstance(self._seed_total, list) != isinstance(
+                grad, list
+            ) or (
+                isinstance(grad, list)
+                and len(self._seed_total) != len(grad)
+            ):
+                raise ValueError("grad shape must match tensor shape")
+            total_seed = _merge_grad(self._seed_total, grad)
+            _ensure_finite_grad(total_seed)
+
         topo = []
         visited = set()
 
@@ -1874,7 +1947,7 @@ class Tensor:
 
         # Phase 1: compute every gradient without mutating any node, so a
         # non-finite gradient aborts the pass with all grads untouched.
-        grads = {id(self): grad}
+        grads = {id(self): total_seed}
         for node in reversed(topo):
             if node._backward_fn is None:
                 continue
@@ -1893,23 +1966,40 @@ class Tensor:
                     _ensure_finite_grad(merged)
                     grads[id(parent)] = merged
 
-        # Phase 2: resolve the final grad for every node, validate, then
-        # apply. Non-leaf grads are recomputed; leaf grads accumulate.
-        assignments = []
+        # Phase 2: resolve the final grad for every node in scratch space,
+        # validate, then apply. Non-leaf grads are recomputed. A leaf grad
+        # combines the externally assigned baseline with the cached
+        # contribution of every root that has reached the leaf; this root's
+        # contribution, recomputed from its total seed, replaces the cached
+        # one instead of adding to it, while distinct roots still
+        # accumulate onto the leaf.
+        writes = []
+        edge_writes = []
         for node in topo:
             if node._parents:
-                assignments.append((node, grads.get(id(node))))
+                writes.append((node, grads.get(id(node))))
             elif node.requires_grad:
                 value = grads.get(id(node))
-                if value is not None:
-                    if node.grad is not None:
-                        value = _merge_grad(node.grad, value)
-                    assignments.append((node, value))
-        for node, value in assignments:
+                if value is None:
+                    continue
+                edges = dict(node._grad_edges)
+                edges[id(self)] = (self, value)
+                merged = node._grad_external
+                for _, contribution in edges.values():
+                    if merged is None:
+                        merged = contribution
+                    else:
+                        merged = _merge_grad(merged, contribution)
+                writes.append((node, merged))
+                edge_writes.append((node, edges))
+        for _, value in writes:
             if value is not None:
                 _ensure_finite_grad(value)
-        for node, value in assignments:
-            node.grad = value
+        self._seed_total = total_seed
+        for node, edges in edge_writes:
+            node._grad_edges = edges
+        for node, value in writes:
+            node._grad = value
 
     def to_json(self):
         return (
