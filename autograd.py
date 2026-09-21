@@ -573,6 +573,94 @@ class Tensor:
             out_data, True, (parent_self, parent_other), backward_fn
         )
 
+    def mse_loss(self, target):
+        if not isinstance(target, Tensor):
+            raise TypeError("target must be a Tensor")
+        _require_nonempty_float_vector(self, "mse_loss")
+        _require_nonempty_float_vector(target, "mse_loss")
+        if len(self.data) != len(target.data):
+            raise ValueError("mse_loss vector lengths must match")
+        # Copy both operands at call time and accumulate the squared-error
+        # sum index by index from 0.0; a non-finite difference, square,
+        # partial sum or result aborts before a result tensor exists, so no
+        # state can change on failure.
+        x = list(self.data)
+        y = list(target.data)
+        residuals = []
+        q = 0.0
+        for i in range(len(x)):
+            r_i = x[i] - y[i]
+            if not math.isfinite(r_i):
+                raise ValueError("mse_loss intermediate must be finite")
+            residuals.append(r_i)
+            square = r_i * r_i
+            if not math.isfinite(square):
+                raise ValueError("mse_loss intermediate must be finite")
+            q += square
+            if not math.isfinite(q):
+                raise ValueError("mse_loss intermediate must be finite")
+        out_data = q / len(x)
+        if not math.isfinite(out_data):
+            raise ValueError("mse_loss intermediate must be finite")
+        if not (self.requires_grad or target.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_target = self, target
+        # Snapshot both operands and the residuals so later caller-side
+        # mutation or replacement of either input cannot change what a
+        # pending backward pass uses.
+        snapshot_x = x
+        snapshot_y = y
+        snapshot_r = residuals
+        n = len(x)
+
+        def backward_fn(grad):
+            contributions = []
+            if parent_self.requires_grad:
+                dx = []
+                for r_i in snapshot_r:
+                    scaled = grad * 2.0
+                    if not math.isfinite(scaled):
+                        raise ValueError(
+                            "mse_loss backward intermediate must be finite"
+                        )
+                    product = scaled * r_i
+                    if not math.isfinite(product):
+                        raise ValueError(
+                            "mse_loss backward intermediate must be finite"
+                        )
+                    h_i = product / n
+                    if not math.isfinite(h_i):
+                        raise ValueError(
+                            "mse_loss backward intermediate must be finite"
+                        )
+                    dx.append(h_i)
+                contributions.append((parent_self, dx))
+            if parent_target.requires_grad:
+                dy = []
+                for r_i in snapshot_r:
+                    scaled = grad * 2.0
+                    if not math.isfinite(scaled):
+                        raise ValueError(
+                            "mse_loss backward intermediate must be finite"
+                        )
+                    product = scaled * r_i
+                    if not math.isfinite(product):
+                        raise ValueError(
+                            "mse_loss backward intermediate must be finite"
+                        )
+                    h_i = product / n
+                    if not math.isfinite(h_i):
+                        raise ValueError(
+                            "mse_loss backward intermediate must be finite"
+                        )
+                    dy.append(-h_i)
+                contributions.append((parent_target, dy))
+            return contributions
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_target), backward_fn
+        )
+
     def cosine_similarity(self, other, eps=1e-12):
         if not isinstance(other, Tensor):
             raise TypeError("other must be a Tensor")
