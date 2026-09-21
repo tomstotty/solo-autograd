@@ -1030,6 +1030,73 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def sigmoid(self):
+        data = _validate_data(self.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        # Stable elementwise sigmoid in ascending index order: exp is only
+        # ever evaluated on a non-positive argument, so a large positive
+        # input never reaches math.exp directly. A non-finite e, d or y
+        # aborts before a result tensor exists, so the input cannot change
+        # on failure.
+        def sigmoid_value(x):
+            if x >= 0.0:
+                e = math.exp(-x)
+                if not math.isfinite(e):
+                    raise ValueError("sigmoid intermediate must be finite")
+                d = 1.0 + e
+                if not math.isfinite(d):
+                    raise ValueError("sigmoid intermediate must be finite")
+                y = 1.0 / d
+            else:
+                e = math.exp(x)
+                if not math.isfinite(e):
+                    raise ValueError("sigmoid intermediate must be finite")
+                d = 1.0 + e
+                if not math.isfinite(d):
+                    raise ValueError("sigmoid intermediate must be finite")
+                y = e / d
+            if not math.isfinite(y):
+                raise ValueError("sigmoid intermediate must be finite")
+            return y
+
+        out_data = _map_unary(data, sigmoid_value)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # Snapshot the forward result so later caller-side mutation or
+        # replacement of the input data cannot change what a pending
+        # backward pass uses.
+        snapshot_y = list(out_data) if isinstance(out_data, list) else out_data
+
+        def backward_fn(grad):
+            # Strictly g*y*(1.0-y) per element; a non-finite intermediate
+            # or contribution aborts the whole pass before any grad is
+            # written.
+            def contribution(g, y):
+                product = g * y
+                if not math.isfinite(product):
+                    raise ValueError(
+                        "sigmoid backward intermediate must be finite"
+                    )
+                complement = 1.0 - y
+                if not math.isfinite(complement):
+                    raise ValueError(
+                        "sigmoid backward intermediate must be finite"
+                    )
+                value = product * complement
+                if not math.isfinite(value):
+                    raise ValueError(
+                        "sigmoid backward intermediate must be finite"
+                    )
+                return value
+
+            return [
+                (parent, _broadcast_apply(grad, snapshot_y, contribution))
+            ]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def sum(self):
         if isinstance(self.data, list):
             out_data = sum(self.data)
