@@ -234,6 +234,152 @@ class Tensor:
             out_data, True, (parent_self, parent_other), backward_fn
         )
 
+    def div(self, other):
+        other = self._coerce(other)
+        a = _validate_data(self.data)
+        b = _validate_data(other.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        if not isinstance(other.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        a_vector = isinstance(a, list)
+        b_vector = isinstance(b, list)
+        if a_vector and b_vector and len(a) != len(b):
+            raise ValueError("vector lengths must match")
+        denominators = b if b_vector else [b]
+        for denominator in denominators:
+            if denominator == 0.0:
+                raise ValueError("divisor must be non-zero")
+        # Divide element by element in ascending output-index order; a
+        # non-finite quotient aborts before a result tensor exists, so no
+        # state can change on failure.
+        if a_vector and b_vector:
+            out_data = []
+            for i in range(len(a)):
+                quotient = a[i] / b[i]
+                if not math.isfinite(quotient):
+                    raise ValueError("div result must be finite")
+                out_data.append(quotient)
+        elif a_vector:
+            out_data = []
+            for i in range(len(a)):
+                quotient = a[i] / b
+                if not math.isfinite(quotient):
+                    raise ValueError("div result must be finite")
+                out_data.append(quotient)
+        elif b_vector:
+            out_data = []
+            for i in range(len(b)):
+                quotient = a / b[i]
+                if not math.isfinite(quotient):
+                    raise ValueError("div result must be finite")
+                out_data.append(quotient)
+        else:
+            out_data = a / b
+            if not math.isfinite(out_data):
+                raise ValueError("div result must be finite")
+        if not (self.requires_grad or other.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_other = self, other
+        # Snapshot both operands so later caller-side mutation or
+        # replacement of either input cannot change what a pending
+        # backward pass uses.
+        snapshot_a = list(a) if a_vector else a
+        snapshot_b = list(b) if b_vector else b
+
+        def backward_fn(grad):
+            grad_values = grad if isinstance(grad, list) else [grad]
+            contributions = []
+            if parent_self.requires_grad:
+                if a_vector:
+                    da = []
+                    for i in range(len(snapshot_a)):
+                        denominator = (
+                            snapshot_b[i] if b_vector else snapshot_b
+                        )
+                        value = grad_values[i] / denominator
+                        if not math.isfinite(value):
+                            raise ValueError(
+                                "div backward intermediate must be finite"
+                            )
+                        da.append(value)
+                    contributions.append((parent_self, da))
+                else:
+                    # A broadcast scalar parent reduces by accumulating
+                    # from 0.0 in ascending output-index order.
+                    total = 0.0
+                    for i in range(len(grad_values)):
+                        denominator = (
+                            snapshot_b[i] if b_vector else snapshot_b
+                        )
+                        value = grad_values[i] / denominator
+                        if not math.isfinite(value):
+                            raise ValueError(
+                                "div backward intermediate must be finite"
+                            )
+                        total += value
+                        if not math.isfinite(total):
+                            raise ValueError(
+                                "div backward intermediate must be finite"
+                            )
+                    contributions.append((parent_self, total))
+            if parent_other.requires_grad:
+                if b_vector:
+                    db = []
+                    for i in range(len(snapshot_b)):
+                        numerator = (
+                            snapshot_a[i] if a_vector else snapshot_a
+                        )
+                        product = grad_values[i] * numerator
+                        if not math.isfinite(product):
+                            raise ValueError(
+                                "div backward intermediate must be finite"
+                            )
+                        square = snapshot_b[i] * snapshot_b[i]
+                        if not math.isfinite(square) or square == 0.0:
+                            raise ValueError(
+                                "div backward intermediate must be finite"
+                            )
+                        quotient = product / square
+                        if not math.isfinite(quotient):
+                            raise ValueError(
+                                "div backward intermediate must be finite"
+                            )
+                        db.append(-quotient)
+                    contributions.append((parent_other, db))
+                else:
+                    square = snapshot_b * snapshot_b
+                    if not math.isfinite(square) or square == 0.0:
+                        raise ValueError(
+                            "div backward intermediate must be finite"
+                        )
+                    total = 0.0
+                    for i in range(len(grad_values)):
+                        numerator = (
+                            snapshot_a[i] if a_vector else snapshot_a
+                        )
+                        product = grad_values[i] * numerator
+                        if not math.isfinite(product):
+                            raise ValueError(
+                                "div backward intermediate must be finite"
+                            )
+                        quotient = product / square
+                        if not math.isfinite(quotient):
+                            raise ValueError(
+                                "div backward intermediate must be finite"
+                            )
+                        total += -quotient
+                        if not math.isfinite(total):
+                            raise ValueError(
+                                "div backward intermediate must be finite"
+                            )
+                    contributions.append((parent_other, total))
+            return contributions
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_other), backward_fn
+        )
+
     def dot(self, other):
         if not isinstance(other, Tensor):
             raise TypeError("other must be a Tensor")
