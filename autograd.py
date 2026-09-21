@@ -1967,29 +1967,43 @@ class Tensor:
             out_data, True, (parent_self, parent_kernel), backward_fn
         )
 
-    def conv_transpose1d(self, kernel):
+    def conv_transpose1d(self, kernel, stride=1, padding=0):
         if not isinstance(kernel, Tensor):
             raise TypeError("kernel must be a Tensor")
         data = _require_nonempty_float_vector(self, "conv_transpose1d")
         weights = _require_nonempty_float_vector(kernel, "conv_transpose1d")
+        if isinstance(stride, bool) or not isinstance(stride, int):
+            raise TypeError("stride must be a positive int")
+        if stride <= 0:
+            raise ValueError("stride must be a positive int")
+        if isinstance(padding, bool) or not isinstance(padding, int):
+            raise TypeError("padding must be a non-negative int")
+        if padding < 0:
+            raise ValueError("padding must be a non-negative int")
         n = len(data)
         k = len(weights)
-        out_len = n + k - 1
+        out_len = (n - 1) * stride - 2 * padding + k
+        if out_len <= 0:
+            raise ValueError("conv_transpose1d output length must be positive")
         # Full transposed cross-correlation: each input element scatters a
-        # scaled copy of the kernel onto the output, accumulating out[i+r]
-        # in ascending i then r order; a non-finite product or partial sum
-        # aborts before a result tensor exists, so no state can change on
-        # failure.
+        # scaled copy of the kernel onto the output, accumulating
+        # out[i*stride - padding + r] in ascending i then r order and
+        # skipping out-of-range positions; a non-finite product or partial
+        # sum aborts before a result tensor exists, so no state can change
+        # on failure.
         out_data = [0.0] * out_len
         for i in range(n):
             for r in range(k):
+                j = i * stride - padding + r
+                if not 0 <= j < out_len:
+                    continue
                 product = data[i] * weights[r]
                 if not math.isfinite(product):
                     raise ValueError(
                         "conv_transpose1d intermediate must be finite"
                     )
-                out_data[i + r] += product
-                if not math.isfinite(out_data[i + r]):
+                out_data[j] += product
+                if not math.isfinite(out_data[j]):
                     raise ValueError(
                         "conv_transpose1d intermediate must be finite"
                     )
@@ -2006,7 +2020,10 @@ class Tensor:
             dk = [0.0] * k
             for i in range(n):
                 for r in range(k):
-                    g = grad[i + r]
+                    j = i * stride - padding + r
+                    if not 0 <= j < out_len:
+                        continue
+                    g = grad[j]
                     contrib_x = g * snapshot_b[r]
                     if not math.isfinite(contrib_x):
                         raise ValueError(
