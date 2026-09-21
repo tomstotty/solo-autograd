@@ -1915,6 +1915,213 @@ def load_state(parameters, text):
     return None
 
 
+_ADAM_INTEGER = re.compile(r"0|[1-9][0-9]*")
+
+
+def _check_adam_optimizer(optimizer):
+    """Validate every value dump_adam serializes from an Adam optimizer."""
+    if not isinstance(optimizer, Adam):
+        raise TypeError("optimizer must be an Adam instance")
+    parameters = optimizer.parameters
+    if not isinstance(parameters, list):
+        raise TypeError("parameters must be a non-empty list of Tensors")
+    if len(parameters) == 0:
+        raise ValueError("parameters must be non-empty")
+    for parameter in parameters:
+        if not isinstance(parameter, Tensor):
+            raise TypeError("parameters must contain only Tensors")
+    if len({id(parameter) for parameter in parameters}) != len(parameters):
+        raise ValueError("parameters must not contain duplicate Tensors")
+    for name in ("m", "v"):
+        buffers = getattr(optimizer, name)
+        if not isinstance(buffers, list):
+            raise TypeError(
+                name + " must be a list with one entry per parameter"
+            )
+        if len(buffers) != len(parameters):
+            raise ValueError(name + " length must match parameters")
+    for index, parameter in enumerate(parameters):
+        if not isinstance(parameter.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        data = _validate_data(parameter.data)
+        Adam._check_buffer(optimizer.m[index], data, "m")
+        Adam._check_buffer(optimizer.v[index], data, "v")
+    if isinstance(optimizer.t, bool) or not isinstance(optimizer.t, int):
+        raise TypeError("t must be a non-negative integer")
+    if optimizer.t < 0:
+        raise ValueError("t must be a non-negative integer")
+
+
+def dump_adam(optimizer):
+    """Serialize an Adam optimizer to a compact JSON string.
+
+    The output contains no whitespace and no trailing newline; floats are
+    written with exactly six decimals and negative zero as 0.000000.
+    """
+    _check_adam_optimizer(optimizer)
+    entries = []
+    for parameter in optimizer.parameters:
+        entries.append(
+            '{"data":'
+            + _json_value(parameter.data)
+            + ',"requires_grad":'
+            + ("true" if parameter.requires_grad else "false")
+            + "}"
+        )
+    return (
+        '{"parameters":['
+        + ",".join(entries)
+        + '],"m":['
+        + ",".join(_json_value(buffer) for buffer in optimizer.m)
+        + '],"v":['
+        + ",".join(_json_value(buffer) for buffer in optimizer.v)
+        + '],"t":'
+        + str(optimizer.t)
+        + "}"
+    )
+
+
+class _AdamParser:
+    """Strict parser for the exact textual form produced by dump_adam."""
+
+    def __init__(self, text):
+        self._text = text
+        self._pos = 0
+
+    def _fail(self):
+        raise ValueError("text does not match the dump_adam format")
+
+    def _expect(self, literal):
+        if not self._text.startswith(literal, self._pos):
+            self._fail()
+        self._pos += len(literal)
+
+    def _parse_number(self):
+        match = _STATE_NUMBER.match(self._text, self._pos)
+        if match is None:
+            self._fail()
+        token = match.group(0)
+        self._pos = match.end()
+        value = float(token)
+        if not math.isfinite(value) or (value == 0.0 and token[0] == "-"):
+            self._fail()
+        return value
+
+    def _parse_data(self):
+        if not self._text.startswith("[", self._pos):
+            return self._parse_number()
+        self._pos += 1
+        values = [self._parse_number()]
+        while self._text.startswith(",", self._pos):
+            self._pos += 1
+            values.append(self._parse_number())
+        self._expect("]")
+        return values
+
+    def _parse_parameter(self):
+        self._expect('{"data":')
+        data = self._parse_data()
+        self._expect(',"requires_grad":')
+        if self._text.startswith("true", self._pos):
+            self._pos += 4
+            requires_grad = True
+        elif self._text.startswith("false", self._pos):
+            self._pos += 5
+            requires_grad = False
+        else:
+            self._fail()
+        self._expect("}")
+        return (data, requires_grad)
+
+    def _parse_nonempty_array(self, parse_item):
+        self._expect("[")
+        items = [parse_item()]
+        while self._text.startswith(",", self._pos):
+            self._pos += 1
+            items.append(parse_item())
+        self._expect("]")
+        return items
+
+    def _parse_integer(self):
+        match = _ADAM_INTEGER.match(self._text, self._pos)
+        if match is None:
+            self._fail()
+        self._pos = match.end()
+        return int(match.group(0))
+
+    def parse(self):
+        self._expect('{"parameters":[')
+        parameters = [self._parse_parameter()]
+        while self._text.startswith(",", self._pos):
+            self._pos += 1
+            parameters.append(self._parse_parameter())
+        self._expect('],"m":')
+        moments = self._parse_nonempty_array(self._parse_data)
+        self._expect(',"v":')
+        velocities = self._parse_nonempty_array(self._parse_data)
+        self._expect(',"t":')
+        t = self._parse_integer()
+        self._expect("}")
+        if self._pos != len(self._text):
+            self._fail()
+        return (parameters, moments, velocities, t)
+
+
+def load_adam(optimizer, text):
+    """Restore an Adam optimizer from a string produced by dump_adam.
+
+    On full validation success, atomically overwrite each parameter's data
+    and requires_grad, replace m, v and t, and clear every grad; lr, beta1,
+    beta2 and eps are left untouched. On any failure no observable state
+    changes.
+    """
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+    _check_adam_optimizer(optimizer)
+    parameters, moments, velocities, t = _AdamParser(text).parse()
+    if len(parameters) != len(optimizer.parameters):
+        raise ValueError("state must contain exactly one entry per parameter")
+    if len(moments) != len(parameters) or len(velocities) != len(parameters):
+        raise ValueError("m and v must contain one entry per parameter")
+    updates = []
+    for index, parameter in enumerate(optimizer.parameters):
+        data, requires_grad = parameters[index]
+        moment = moments[index]
+        velocity = velocities[index]
+        current = parameter.data
+        if isinstance(current, list):
+            if not isinstance(data, list) or len(data) != len(current):
+                raise ValueError(
+                    "state data shape must match parameter shape"
+                )
+            if not isinstance(moment, list) or len(moment) != len(current):
+                raise ValueError("m shape must match parameter shape")
+            if not isinstance(velocity, list) or len(velocity) != len(current):
+                raise ValueError("v shape must match parameter shape")
+        else:
+            if isinstance(data, list):
+                raise ValueError(
+                    "state data shape must match parameter shape"
+                )
+            if isinstance(moment, list) or isinstance(velocity, list):
+                raise ValueError(
+                    "m and v shapes must match the parameter shape"
+                )
+        updates.append((parameter, data, requires_grad, moment, velocity))
+    new_m = []
+    new_v = []
+    for parameter, data, requires_grad, moment, velocity in updates:
+        parameter.data = data
+        parameter.requires_grad = requires_grad
+        parameter.grad = None
+        new_m.append(moment)
+        new_v.append(velocity)
+    optimizer.m = new_m
+    optimizer.v = new_v
+    optimizer.t = t
+    return None
+
+
 def _format_float(value):
     if not math.isfinite(value):
         raise ValueError("cannot serialize a non-finite float")
