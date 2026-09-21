@@ -1955,6 +1955,97 @@ def gradcheck(fn, data, eps=1e-6, atol=1e-5):
     return (passed, max_abs_error)
 
 
+def clip_grad_norm_(parameters, max_norm, eps=1e-12):
+    """Clip the total gradient norm of a list of Tensors in place.
+
+    Only Tensors with requires_grad True and a non-None grad participate.
+    When the total norm exceeds max_norm every participating grad is
+    scaled by max_norm / (norm + eps); otherwise grads are left as they
+    are. Returns the total norm before clipping as a float, or 0.0 when
+    no parameter participates. On any failure no Tensor is modified.
+    """
+    if not isinstance(parameters, list):
+        raise TypeError("parameters must be a non-empty list of Tensors")
+    if len(parameters) == 0:
+        raise ValueError("parameters must be non-empty")
+    for parameter in parameters:
+        if not isinstance(parameter, Tensor):
+            raise TypeError("parameters must contain only Tensors")
+    if len({id(parameter) for parameter in parameters}) != len(parameters):
+        raise ValueError("parameters must not contain duplicate Tensors")
+    if isinstance(max_norm, bool) or not isinstance(max_norm, float):
+        raise TypeError("max_norm must be a positive finite float")
+    if not math.isfinite(max_norm) or max_norm <= 0.0:
+        raise ValueError("max_norm must be a positive finite float")
+    if isinstance(eps, bool) or not isinstance(eps, float):
+        raise TypeError("eps must be a positive finite float")
+    if not math.isfinite(eps) or eps <= 0.0:
+        raise ValueError("eps must be a positive finite float")
+    for parameter in parameters:
+        _validate_data(parameter.data)
+        if not isinstance(parameter.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+    active = []
+    for parameter in parameters:
+        if not parameter.requires_grad or parameter.grad is None:
+            continue
+        Adam._check_grad(parameter.grad, parameter.data)
+        active.append(parameter)
+    if not active:
+        return 0.0
+    # Accumulate the squared norm from 0.0 in parameter order and
+    # ascending vector-index order; a non-finite product, partial sum or
+    # norm aborts before any grad is written.
+    total = 0.0
+    for parameter in active:
+        grad = parameter.grad
+        values = grad if isinstance(grad, list) else [grad]
+        for value in values:
+            product = value * value
+            if not math.isfinite(product):
+                raise ValueError(
+                    "clip_grad_norm_ intermediate must be finite"
+                )
+            total += product
+            if not math.isfinite(total):
+                raise ValueError(
+                    "clip_grad_norm_ intermediate must be finite"
+                )
+    norm = math.sqrt(total)
+    if not math.isfinite(norm):
+        raise ValueError("clip_grad_norm_ intermediate must be finite")
+    if norm > max_norm:
+        scale = max_norm / (norm + eps)
+    else:
+        scale = 1.0
+    if not math.isfinite(scale):
+        raise ValueError("clip_grad_norm_ intermediate must be finite")
+    # Compute and validate every new grad before mutating anything, so a
+    # non-finite intermediate aborts with all grads untouched.
+    updates = []
+    for parameter in active:
+        grad = parameter.grad
+        if isinstance(grad, list):
+            new_grad = []
+            for value in grad:
+                scaled = value * scale
+                if not math.isfinite(scaled):
+                    raise ValueError(
+                        "clip_grad_norm_ intermediate must be finite"
+                    )
+                new_grad.append(scaled)
+        else:
+            new_grad = grad * scale
+            if not math.isfinite(new_grad):
+                raise ValueError(
+                    "clip_grad_norm_ intermediate must be finite"
+                )
+        updates.append((parameter, new_grad))
+    for parameter, new_grad in updates:
+        parameter.grad = new_grad
+    return norm
+
+
 _STATE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _STATE_NUMBER = re.compile(r"-?(?:0|[1-9][0-9]*)\.[0-9]{6}")
 
