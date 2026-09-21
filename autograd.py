@@ -66,6 +66,17 @@ def _finite_power(base, exponent, message="power result must be finite"):
     return result
 
 
+def _finite_exp(x, message="exp result must be finite"):
+    """Evaluate math.exp, mapping overflow/non-finite to ValueError."""
+    try:
+        result = math.exp(x)
+    except OverflowError:
+        raise ValueError(message)
+    if not math.isfinite(result):
+        raise ValueError(message)
+    return result
+
+
 def _broadcast_apply(a, b, op):
     """Apply op over scalar/vector operands with scalar broadcasting."""
     a_vector = isinstance(a, list)
@@ -1257,6 +1268,110 @@ class Tensor:
             contribution = _broadcast_apply(
                 grad, out, lambda g, y: g * (1.0 - y * y)
             )
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
+    def exp(self):
+        # Re-validate at call time since the data may have been mutated
+        # after construction: a finite float scalar or a non-empty 1D
+        # float list. bools, ints and other types are a TypeError; an
+        # empty list or any non-finite value is a ValueError.
+        data = _validate_data(self.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        # Elementwise math.exp in ascending index order; an overflow or
+        # non-finite result aborts before a result tensor exists, so no
+        # state can change on failure.
+        out_data = _map_unary(data, _finite_exp)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # Snapshot the forward output so later caller-side mutation or
+        # replacement of the input cannot change a pending backward pass.
+        snapshot_y = (
+            list(out_data) if isinstance(out_data, list) else out_data
+        )
+
+        def backward_fn(grad):
+            # Elementwise g*y in ascending index order; each intermediate
+            # is checked as it is produced, and the generic engine
+            # validates the contribution itself and every merge into an
+            # existing grad.
+            if isinstance(grad, list):
+                contribution = []
+                for i in range(len(snapshot_y)):
+                    value = grad[i] * snapshot_y[i]
+                    if not math.isfinite(value):
+                        raise ValueError(
+                            "exp backward intermediate must be finite"
+                        )
+                    contribution.append(value)
+            else:
+                value = grad * snapshot_y
+                if not math.isfinite(value):
+                    raise ValueError(
+                        "exp backward intermediate must be finite"
+                    )
+                contribution = value
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
+    def log(self):
+        # Re-validate at call time since the data may have been mutated
+        # after construction: a finite float scalar or a non-empty 1D
+        # float list. bools, ints and other types are a TypeError; an
+        # empty list or any non-finite value is a ValueError.
+        data = _validate_data(self.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        # Elementwise math.log in ascending index order; every input must
+        # be strictly positive, and a non-finite result aborts before a
+        # result tensor exists, so no state can change on failure.
+        if isinstance(data, list):
+            out_data = []
+            for x in data:
+                if x <= 0.0:
+                    raise ValueError("log input must be positive")
+                y = math.log(x)
+                if not math.isfinite(y):
+                    raise ValueError("log result must be finite")
+                out_data.append(y)
+        else:
+            if data <= 0.0:
+                raise ValueError("log input must be positive")
+            out_data = math.log(data)
+            if not math.isfinite(out_data):
+                raise ValueError("log result must be finite")
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # Snapshot the forward input so later caller-side mutation or
+        # replacement of the input cannot change a pending backward pass.
+        snapshot_x = list(data) if isinstance(data, list) else data
+
+        def backward_fn(grad):
+            # Elementwise g/x in ascending index order; each intermediate
+            # is checked as it is produced, and the generic engine
+            # validates the contribution itself and every merge into an
+            # existing grad.
+            if isinstance(grad, list):
+                contribution = []
+                for i in range(len(snapshot_x)):
+                    value = grad[i] / snapshot_x[i]
+                    if not math.isfinite(value):
+                        raise ValueError(
+                            "log backward intermediate must be finite"
+                        )
+                    contribution.append(value)
+            else:
+                value = grad / snapshot_x
+                if not math.isfinite(value):
+                    raise ValueError(
+                        "log backward intermediate must be finite"
+                    )
+                contribution = value
             return [(parent, contribution)]
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
