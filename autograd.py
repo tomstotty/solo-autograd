@@ -1446,22 +1446,84 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
-    def cross_entropy(self, target):
+    def cross_entropy(self, target, label_smoothing=0.0):
         data = _require_nonempty_float_vector(self, "cross_entropy")
         if isinstance(target, bool) or not isinstance(target, int):
             raise TypeError("target must be a non-bool int")
         if target < 0 or target >= len(data):
             raise ValueError("target index out of range")
+        if isinstance(label_smoothing, bool) or not isinstance(
+            label_smoothing, float
+        ):
+            raise TypeError(
+                "label_smoothing must be a finite float in [0.0, 1.0)"
+            )
+        if (
+            not math.isfinite(label_smoothing)
+            or label_smoothing < 0.0
+            or label_smoothing >= 1.0
+        ):
+            raise ValueError(
+                "label_smoothing must be a finite float in [0.0, 1.0)"
+            )
         log_values = _log_softmax_values(data)
-        out_data = -log_values[target]
+        n = len(data)
+        # Smoothed target distribution: q_i = alpha/n at every index, with
+        # an extra 1.0 - alpha on the target index.
+        alpha = label_smoothing
+        base = alpha / n
+        if not math.isfinite(base):
+            raise ValueError("cross_entropy intermediate must be finite")
+        q = []
+        for i in range(n):
+            q_i = base
+            if i == target:
+                q_i = base + (1.0 - alpha)
+            if not math.isfinite(q_i):
+                raise ValueError("cross_entropy intermediate must be finite")
+            q.append(q_i)
+        # Accumulate L -= q_i*l_i from 0.0 in ascending index order; a
+        # non-finite contribution or partial sum aborts before a result
+        # tensor exists, so no state can change on failure.
+        loss = 0.0
+        for i in range(n):
+            contribution = q[i] * log_values[i]
+            if not math.isfinite(contribution):
+                raise ValueError("cross_entropy intermediate must be finite")
+            loss -= contribution
+            if not math.isfinite(loss):
+                raise ValueError("cross_entropy intermediate must be finite")
+        out_data = loss
         if not self.requires_grad:
             return Tensor._make(out_data, False, (), None)
         parent = self
-        target_index = target
+        # Snapshot l and q with the graph so later caller-side mutation of
+        # the input data cannot change a pending backward pass.
+        snapshot_l = log_values
+        snapshot_q = q
 
         def backward_fn(grad):
-            contribution = [grad * math.exp(l_i) for l_i in log_values]
-            contribution[target_index] -= grad
+            # dx_i = g * (exp(l_i) - q_i); each intermediate is checked as
+            # it is produced, and the generic engine validates the
+            # contribution itself and every merge into an existing grad.
+            contribution = []
+            for i in range(n):
+                e = math.exp(snapshot_l[i])
+                if not math.isfinite(e):
+                    raise ValueError(
+                        "cross_entropy backward intermediate must be finite"
+                    )
+                diff = e - snapshot_q[i]
+                if not math.isfinite(diff):
+                    raise ValueError(
+                        "cross_entropy backward intermediate must be finite"
+                    )
+                dx_i = grad * diff
+                if not math.isfinite(dx_i):
+                    raise ValueError(
+                        "cross_entropy backward intermediate must be finite"
+                    )
+                contribution.append(dx_i)
             return [(parent, contribution)]
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
