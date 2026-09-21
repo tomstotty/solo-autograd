@@ -1967,70 +1967,86 @@ class Tensor:
             out_data, True, (parent_self, parent_kernel), backward_fn
         )
 
-    def conv_transpose1d(self, kernel):
+    def conv_transpose1d(self, kernel, stride=1, padding=0):
         if not isinstance(kernel, Tensor):
             raise TypeError("kernel must be a Tensor")
         data = _require_nonempty_float_vector(self, "conv_transpose1d")
         weights = _require_nonempty_float_vector(kernel, "conv_transpose1d")
+        if isinstance(stride, bool) or not isinstance(stride, int):
+            raise TypeError("stride must be a positive int")
+        if stride <= 0:
+            raise ValueError("stride must be a positive int")
+        if isinstance(padding, bool) or not isinstance(padding, int):
+            raise TypeError("padding must be a non-negative int")
+        if padding < 0:
+            raise ValueError("padding must be a non-negative int")
         n = len(data)
         k = len(weights)
-        out_len = n + k - 1
+        out_len = (n - 1) * stride - 2 * padding + k
+        if out_len <= 0:
+            raise ValueError("conv_transpose1d output length must be positive")
+        # Snapshot both operands up front so later caller-side mutation of
+        # either input list cannot change the forward result or what a
+        # pending backward pass uses.
+        a = list(data)
+        b = list(weights)
         # Full transposed cross-correlation: each input element scatters a
-        # scaled copy of the kernel onto the output, accumulating out[i+r]
-        # in ascending i then r order; a non-finite product or partial sum
+        # scaled copy of the kernel onto the output at j = i*stride-padding+r,
+        # accumulating in ascending i then r order; out-of-range positions
+        # (from padding) are skipped. A non-finite product or partial sum
         # aborts before a result tensor exists, so no state can change on
         # failure.
         out_data = [0.0] * out_len
         for i in range(n):
             for r in range(k):
-                product = data[i] * weights[r]
-                if not math.isfinite(product):
-                    raise ValueError(
-                        "conv_transpose1d intermediate must be finite"
-                    )
-                out_data[i + r] += product
-                if not math.isfinite(out_data[i + r]):
-                    raise ValueError(
-                        "conv_transpose1d intermediate must be finite"
-                    )
+                j = i * stride - padding + r
+                if 0 <= j < out_len:
+                    product = a[i] * b[r]
+                    if not math.isfinite(product):
+                        raise ValueError(
+                            "conv_transpose1d intermediate must be finite"
+                        )
+                    out_data[j] += product
+                    if not math.isfinite(out_data[j]):
+                        raise ValueError(
+                            "conv_transpose1d intermediate must be finite"
+                        )
         if not (self.requires_grad or kernel.requires_grad):
             return Tensor._make(out_data, False, (), None)
         parent_self, parent_kernel = self, kernel
-        # Snapshot both operands so later caller-side mutation of either
-        # input list cannot change what a pending backward pass uses.
-        snapshot_a = list(data)
-        snapshot_b = list(weights)
 
         def backward_fn(grad):
             dx = [0.0] * n
             dk = [0.0] * k
             for i in range(n):
                 for r in range(k):
-                    g = grad[i + r]
-                    contrib_x = g * snapshot_b[r]
-                    if not math.isfinite(contrib_x):
-                        raise ValueError(
-                            "conv_transpose1d backward intermediate "
-                            "must be finite"
-                        )
-                    dx[i] += contrib_x
-                    if not math.isfinite(dx[i]):
-                        raise ValueError(
-                            "conv_transpose1d backward intermediate "
-                            "must be finite"
-                        )
-                    contrib_k = g * snapshot_a[i]
-                    if not math.isfinite(contrib_k):
-                        raise ValueError(
-                            "conv_transpose1d backward intermediate "
-                            "must be finite"
-                        )
-                    dk[r] += contrib_k
-                    if not math.isfinite(dk[r]):
-                        raise ValueError(
-                            "conv_transpose1d backward intermediate "
-                            "must be finite"
-                        )
+                    j = i * stride - padding + r
+                    if 0 <= j < out_len:
+                        g = grad[j]
+                        contrib_x = g * b[r]
+                        if not math.isfinite(contrib_x):
+                            raise ValueError(
+                                "conv_transpose1d backward intermediate "
+                                "must be finite"
+                            )
+                        dx[i] += contrib_x
+                        if not math.isfinite(dx[i]):
+                            raise ValueError(
+                                "conv_transpose1d backward intermediate "
+                                "must be finite"
+                            )
+                        contrib_k = g * a[i]
+                        if not math.isfinite(contrib_k):
+                            raise ValueError(
+                                "conv_transpose1d backward intermediate "
+                                "must be finite"
+                            )
+                        dk[r] += contrib_k
+                        if not math.isfinite(dk[r]):
+                            raise ValueError(
+                                "conv_transpose1d backward intermediate "
+                                "must be finite"
+                            )
             contributions = []
             if parent_self.requires_grad:
                 contributions.append((parent_self, dx))
