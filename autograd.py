@@ -1625,6 +1625,148 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def soft_cross_entropy(self, target):
+        if not isinstance(target, Tensor):
+            raise TypeError("target must be a Tensor")
+        x = _require_nonempty_float_vector(self, "soft_cross_entropy")
+        q = _require_nonempty_float_vector(target, "soft_cross_entropy")
+        if len(x) != len(q):
+            raise ValueError("soft_cross_entropy vector lengths must match")
+        for q_i in q:
+            if q_i < 0.0 or q_i > 1.0:
+                raise ValueError(
+                    "soft_cross_entropy target values must lie in [0.0, 1.0]"
+                )
+        # Snapshot both operands at call time so later caller-side mutation or
+        # replacement of either input can change neither the forward result
+        # nor a pending backward pass.
+        x = list(x)
+        q = list(q)
+        n = len(x)
+        # The target must be a probability distribution: sum the target in
+        # ascending index order starting from 0.0 and require exactly 1.0.
+        q_total = 0.0
+        for q_i in q:
+            q_total += q_i
+            if not math.isfinite(q_total):
+                raise ValueError(
+                    "soft_cross_entropy target must sum to 1.0"
+                )
+        if q_total != 1.0:
+            raise ValueError(
+                "soft_cross_entropy target must sum to 1.0"
+            )
+        # Stable log-softmax in ascending index order: m = max(x),
+        # z_i = exp(x_i - m), s accumulated from 0.0, l_i = x_i - m -
+        # log(s). exp is only ever evaluated on values in (-inf, 0]. A
+        # non-finite intermediate aborts before a result tensor exists, so
+        # no state can change on failure.
+        m = max(x)
+        s = 0.0
+        l = []
+        for x_i in x:
+            diff = x_i - m
+            if not math.isfinite(diff):
+                raise ValueError(
+                    "soft_cross_entropy intermediate must be finite"
+                )
+            z_i = math.exp(diff)
+            if not math.isfinite(z_i):
+                raise ValueError(
+                    "soft_cross_entropy intermediate must be finite"
+                )
+            s += z_i
+            if not math.isfinite(s):
+                raise ValueError(
+                    "soft_cross_entropy intermediate must be finite"
+                )
+        log_s = math.log(s)
+        if not math.isfinite(log_s):
+            raise ValueError("soft_cross_entropy intermediate must be finite")
+        for x_i in x:
+            l_i = x_i - m - log_s
+            if not math.isfinite(l_i):
+                raise ValueError(
+                    "soft_cross_entropy intermediate must be finite"
+                )
+            l.append(l_i)
+        # L = -sum_i q_i * l_i, subtracting each contribution from a
+        # running total starting at 0.0 in ascending index order.
+        out_data = 0.0
+        for i in range(n):
+            contribution = q[i] * l[i]
+            if not math.isfinite(contribution):
+                raise ValueError(
+                    "soft_cross_entropy intermediate must be finite"
+                )
+            out_data -= contribution
+            if not math.isfinite(out_data):
+                raise ValueError(
+                    "soft_cross_entropy intermediate must be finite"
+                )
+        if not (self.requires_grad or target.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_other = self, target
+        # Save l and q with the graph so a pending backward pass is
+        # independent of any subsequent data mutation.
+        snapshot_l = l
+        snapshot_q = q
+
+        def backward_fn(grad):
+            # dx_i = g * (exp(l_i) - q_i), dq_i = -g * l_i; exp is only
+            # evaluated on l_i <= 0. Each intermediate is checked as it is
+            # produced, and the generic engine validates the contributions
+            # themselves and every merge into an existing grad. Only the
+            # sides that require grad are computed and submitted; when the
+            # same tensor is both sides the two contributions are returned
+            # for that one parent and summed by the engine.
+            contributions = []
+            if parent_self.requires_grad:
+                dx = []
+                for i in range(n):
+                    e_i = math.exp(snapshot_l[i])
+                    if not math.isfinite(e_i):
+                        raise ValueError(
+                            "soft_cross_entropy backward intermediate must be"
+                            " finite"
+                        )
+                    difference = e_i - snapshot_q[i]
+                    if not math.isfinite(difference):
+                        raise ValueError(
+                            "soft_cross_entropy backward intermediate must be"
+                            " finite"
+                        )
+                    dx_i = grad * difference
+                    if not math.isfinite(dx_i):
+                        raise ValueError(
+                            "soft_cross_entropy backward intermediate must be"
+                            " finite"
+                        )
+                    dx.append(dx_i)
+                contributions.append((parent_self, dx))
+            if parent_other.requires_grad:
+                dq = []
+                for i in range(n):
+                    scaled = grad * snapshot_l[i]
+                    if not math.isfinite(scaled):
+                        raise ValueError(
+                            "soft_cross_entropy backward intermediate must be"
+                            " finite"
+                        )
+                    dq_i = -scaled
+                    if not math.isfinite(dq_i):
+                        raise ValueError(
+                            "soft_cross_entropy backward intermediate must be"
+                            " finite"
+                        )
+                    dq.append(dq_i)
+                contributions.append((parent_other, dq))
+            return contributions
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_other), backward_fn
+        )
+
     def conv1d(self, kernel, stride=1, padding=0, dilation=1):
         if not isinstance(kernel, Tensor):
             raise TypeError("kernel must be a Tensor")
