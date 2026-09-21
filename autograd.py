@@ -1967,7 +1967,7 @@ class Tensor:
             out_data, True, (parent_self, parent_kernel), backward_fn
         )
 
-    def conv_transpose1d(self, kernel, stride=1, padding=0):
+    def conv_transpose1d(self, kernel, stride=1, padding=0, dilation=1):
         if not isinstance(kernel, Tensor):
             raise TypeError("kernel must be a Tensor")
         data = _require_nonempty_float_vector(self, "conv_transpose1d")
@@ -1980,21 +1980,25 @@ class Tensor:
             raise TypeError("padding must be a non-negative int")
         if padding < 0:
             raise ValueError("padding must be a non-negative int")
+        if isinstance(dilation, bool) or not isinstance(dilation, int):
+            raise TypeError("dilation must be a positive int")
+        if dilation <= 0:
+            raise ValueError("dilation must be a positive int")
         n = len(data)
         k = len(weights)
-        out_len = (n - 1) * stride - 2 * padding + k
+        out_len = (n - 1) * stride - 2 * padding + dilation * (k - 1) + 1
         if out_len <= 0:
             raise ValueError("conv_transpose1d output length must be positive")
         # Full transposed cross-correlation: each input element scatters a
-        # scaled copy of the kernel onto the output, accumulating
-        # out[i*stride - padding + r] in ascending i then r order and
-        # skipping out-of-range positions; a non-finite product or partial
-        # sum aborts before a result tensor exists, so no state can change
-        # on failure.
+        # scaled, dilation-spaced copy of the kernel onto the output,
+        # accumulating out[i*stride - padding + r*dilation] in ascending i
+        # then r order and skipping out-of-range positions; a non-finite
+        # product or partial sum aborts before a result tensor exists, so
+        # no state can change on failure.
         out_data = [0.0] * out_len
         for i in range(n):
             for r in range(k):
-                j = i * stride - padding + r
+                j = i * stride - padding + r * dilation
                 if not 0 <= j < out_len:
                     continue
                 product = data[i] * weights[r]
@@ -2020,7 +2024,7 @@ class Tensor:
             dk = [0.0] * k
             for i in range(n):
                 for r in range(k):
-                    j = i * stride - padding + r
+                    j = i * stride - padding + r * dilation
                     if not 0 <= j < out_len:
                         continue
                     g = grad[j]
