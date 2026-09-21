@@ -2368,6 +2368,197 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def batch_norm(self, weight, bias, eps=1e-5):
+        if not isinstance(weight, Tensor):
+            raise TypeError("weight must be a Tensor")
+        if not isinstance(bias, Tensor):
+            raise TypeError("bias must be a Tensor")
+        # weight and bias must each hold a finite float scalar; the data
+        # may have been mutated after construction, so re-validate at call
+        # time. A list, bool, int or anything else is a TypeError; a
+        # non-finite float is a ValueError.
+        w = weight.data
+        if isinstance(w, bool) or not isinstance(w, float):
+            raise TypeError("weight data must be a finite float scalar")
+        if not math.isfinite(w):
+            raise ValueError("weight data must be finite")
+        b = bias.data
+        if isinstance(b, bool) or not isinstance(b, float):
+            raise TypeError("bias data must be a finite float scalar")
+        if not math.isfinite(b):
+            raise ValueError("bias data must be finite")
+        data = _require_nonempty_float_vector(self, "batch_norm")
+        if not isinstance(weight.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        if not isinstance(bias.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        if isinstance(eps, bool) or not isinstance(eps, float):
+            raise TypeError("eps must be a positive finite float")
+        if not math.isfinite(eps) or eps <= 0.0:
+            raise ValueError("eps must be a positive finite float")
+        # Snapshot the input and both parameters so later caller-side
+        # mutation or replacement can change neither the forward result
+        # nor a pending backward pass.
+        x = list(data)
+        n = len(x)
+        # Accumulate from 0.0 in ascending index order: mu = sum(x)/n,
+        # c_i = x_i - mu, v = sum(c_i*c_i)/n, r = 1/sqrt(v+eps),
+        # h_i = c_i*r, y_i = w*h_i + b. A non-finite intermediate aborts
+        # before a result tensor exists, so no state can change on
+        # failure.
+        total = 0.0
+        for i in range(n):
+            total += x[i]
+            if not math.isfinite(total):
+                raise ValueError("batch_norm intermediate must be finite")
+        mu = total / n
+        if not math.isfinite(mu):
+            raise ValueError("batch_norm intermediate must be finite")
+        centered = []
+        for i in range(n):
+            c_i = x[i] - mu
+            if not math.isfinite(c_i):
+                raise ValueError("batch_norm intermediate must be finite")
+            centered.append(c_i)
+        var_sum = 0.0
+        for c_i in centered:
+            var_sum += c_i * c_i
+            if not math.isfinite(var_sum):
+                raise ValueError("batch_norm intermediate must be finite")
+        var = var_sum / n
+        if not math.isfinite(var):
+            raise ValueError("batch_norm intermediate must be finite")
+        denom = var + eps
+        if not math.isfinite(denom):
+            raise ValueError("batch_norm intermediate must be finite")
+        r = 1.0 / math.sqrt(denom)
+        if not math.isfinite(r):
+            raise ValueError("batch_norm intermediate must be finite")
+        normalized = []
+        for c_i in centered:
+            h_i = c_i * r
+            if not math.isfinite(h_i):
+                raise ValueError("batch_norm intermediate must be finite")
+            normalized.append(h_i)
+        out_data = []
+        for h_i in normalized:
+            product = w * h_i
+            if not math.isfinite(product):
+                raise ValueError("batch_norm intermediate must be finite")
+            y_i = product + b
+            if not math.isfinite(y_i):
+                raise ValueError("batch_norm intermediate must be finite")
+            out_data.append(y_i)
+        if not (
+            self.requires_grad
+            or weight.requires_grad
+            or bias.requires_grad
+        ):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_weight, parent_bias = self, weight, bias
+        # Save w, r and the normalized values with the graph so a pending
+        # backward pass is independent of any subsequent data mutation.
+        saved_w = w
+        saved_r = r
+        saved_h = normalized
+
+        def backward_fn(grad):
+            # G = sum(g) and H = sum(g_i*h_i), each accumulated from 0.0
+            # in ascending index order; dx_i = w*r*(n*g_i - G - h_i*H)/n,
+            # dw = H, db = G. Only the sides that require grad are
+            # computed and submitted; a non-finite intermediate aborts the
+            # whole pass before any grad is written.
+            G = 0.0
+            for g in grad:
+                G += g
+                if not math.isfinite(G):
+                    raise ValueError(
+                        "batch_norm backward intermediate must be finite"
+                    )
+            H = 0.0
+            for i in range(n):
+                product = grad[i] * saved_h[i]
+                if not math.isfinite(product):
+                    raise ValueError(
+                        "batch_norm backward intermediate must be finite"
+                    )
+                H += product
+                if not math.isfinite(H):
+                    raise ValueError(
+                        "batch_norm backward intermediate must be finite"
+                    )
+            contributions = []
+            if parent_self.requires_grad:
+                wr = saved_w * saved_r
+                if not math.isfinite(wr):
+                    raise ValueError(
+                        "batch_norm backward intermediate must be finite"
+                    )
+                dx = []
+                for i in range(n):
+                    scaled = n * grad[i]
+                    if not math.isfinite(scaled):
+                        raise ValueError(
+                            "batch_norm backward intermediate must be"
+                            " finite"
+                        )
+                    shifted = scaled - G
+                    if not math.isfinite(shifted):
+                        raise ValueError(
+                            "batch_norm backward intermediate must be"
+                            " finite"
+                        )
+                    correction = saved_h[i] * H
+                    if not math.isfinite(correction):
+                        raise ValueError(
+                            "batch_norm backward intermediate must be"
+                            " finite"
+                        )
+                    bracket = shifted - correction
+                    if not math.isfinite(bracket):
+                        raise ValueError(
+                            "batch_norm backward intermediate must be"
+                            " finite"
+                        )
+                    product = wr * bracket
+                    if not math.isfinite(product):
+                        raise ValueError(
+                            "batch_norm backward intermediate must be"
+                            " finite"
+                        )
+                    dx_i = product / n
+                    if not math.isfinite(dx_i):
+                        raise ValueError(
+                            "batch_norm backward intermediate must be"
+                            " finite"
+                        )
+                    dx.append(dx_i)
+                contributions.append((parent_self, dx))
+            if parent_weight is parent_bias:
+                # A single object playing both roles receives one merged
+                # scalar contribution dw + db.
+                if parent_weight.requires_grad:
+                    merged = H + G
+                    if not math.isfinite(merged):
+                        raise ValueError(
+                            "batch_norm backward intermediate must be"
+                            " finite"
+                        )
+                    contributions.append((parent_weight, merged))
+            else:
+                if parent_weight.requires_grad:
+                    contributions.append((parent_weight, H))
+                if parent_bias.requires_grad:
+                    contributions.append((parent_bias, G))
+            return contributions
+
+        return Tensor._make(
+            out_data,
+            True,
+            (parent_self, parent_weight, parent_bias),
+            backward_fn,
+        )
+
     def gather(self, indices):
         data = _require_nonempty_float_vector(self, "gather")
         if not isinstance(indices, list):
