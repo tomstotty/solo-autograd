@@ -1967,6 +1967,81 @@ class Tensor:
             out_data, True, (parent_self, parent_kernel), backward_fn
         )
 
+    def conv_transpose1d(self, kernel):
+        if not isinstance(kernel, Tensor):
+            raise TypeError("kernel must be a Tensor")
+        data = _require_nonempty_float_vector(self, "conv_transpose1d")
+        weights = _require_nonempty_float_vector(kernel, "conv_transpose1d")
+        n = len(data)
+        k = len(weights)
+        out_len = n + k - 1
+        # Full transposed cross-correlation: each input element scatters a
+        # scaled copy of the kernel onto the output, accumulating out[i+r]
+        # in ascending i then r order; a non-finite product or partial sum
+        # aborts before a result tensor exists, so no state can change on
+        # failure.
+        out_data = [0.0] * out_len
+        for i in range(n):
+            for r in range(k):
+                product = data[i] * weights[r]
+                if not math.isfinite(product):
+                    raise ValueError(
+                        "conv_transpose1d intermediate must be finite"
+                    )
+                out_data[i + r] += product
+                if not math.isfinite(out_data[i + r]):
+                    raise ValueError(
+                        "conv_transpose1d intermediate must be finite"
+                    )
+        if not (self.requires_grad or kernel.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_kernel = self, kernel
+        # Snapshot both operands so later caller-side mutation of either
+        # input list cannot change what a pending backward pass uses.
+        snapshot_a = list(data)
+        snapshot_b = list(weights)
+
+        def backward_fn(grad):
+            dx = [0.0] * n
+            dk = [0.0] * k
+            for i in range(n):
+                for r in range(k):
+                    g = grad[i + r]
+                    contrib_x = g * snapshot_b[r]
+                    if not math.isfinite(contrib_x):
+                        raise ValueError(
+                            "conv_transpose1d backward intermediate "
+                            "must be finite"
+                        )
+                    dx[i] += contrib_x
+                    if not math.isfinite(dx[i]):
+                        raise ValueError(
+                            "conv_transpose1d backward intermediate "
+                            "must be finite"
+                        )
+                    contrib_k = g * snapshot_a[i]
+                    if not math.isfinite(contrib_k):
+                        raise ValueError(
+                            "conv_transpose1d backward intermediate "
+                            "must be finite"
+                        )
+                    dk[r] += contrib_k
+                    if not math.isfinite(dk[r]):
+                        raise ValueError(
+                            "conv_transpose1d backward intermediate "
+                            "must be finite"
+                        )
+            contributions = []
+            if parent_self.requires_grad:
+                contributions.append((parent_self, dx))
+            if parent_kernel.requires_grad:
+                contributions.append((parent_kernel, dk))
+            return contributions
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_kernel), backward_fn
+        )
+
     def max_pool1d(self, kernel_size, stride=None, padding=0):
         data = _require_nonempty_float_vector(self, "max_pool1d")
         if isinstance(kernel_size, bool) or not isinstance(kernel_size, int):
