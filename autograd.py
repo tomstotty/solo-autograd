@@ -2046,6 +2046,48 @@ def clip_grad_norm_(parameters, max_norm, eps=1e-12):
     return norm
 
 
+def _positive_int(value, name):
+    """Validate a non-bool positive int; TypeError on type, ValueError on range."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(name + " must be a positive int")
+    if value <= 0:
+        raise ValueError(name + " must be a positive int")
+    return value
+
+
+def xavier_uniform(length, fan_in, fan_out, seed=0, requires_grad=True):
+    """Return a 1D Tensor of `length` Xavier-uniform samples in [-limit, limit].
+
+    limit = sqrt(6 / (fan_in + fan_out)); values come from a local LCG so
+    identical arguments always produce identical data with no global state.
+    """
+    length = _positive_int(length, "length")
+    fan_in = _positive_int(fan_in, "fan_in")
+    fan_out = _positive_int(fan_out, "fan_out")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int in [0, 4294967295]")
+    if not 0 <= seed <= 4294967295:
+        raise ValueError("seed must be an int in [0, 4294967295]")
+    if not isinstance(requires_grad, bool):
+        raise TypeError("requires_grad must be a bool")
+    limit = math.sqrt(6.0 / (fan_in + fan_out))
+    if not math.isfinite(limit):
+        raise ValueError("xavier limit must be finite")
+    s = seed
+    data = []
+    for _ in range(length):
+        s = (1664525 * s + 1013904223) % 4294967296
+        u = s / 4294967296.0
+        v = 2.0 * u - 1.0
+        value = v * limit
+        if not (
+            math.isfinite(u) and math.isfinite(v) and math.isfinite(value)
+        ):
+            raise ValueError("xavier sample must be finite")
+        data.append(value)
+    return Tensor(data, requires_grad)
+
+
 _STATE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _STATE_NUMBER = re.compile(r"-?(?:0|[1-9][0-9]*)\.[0-9]{6}")
 
