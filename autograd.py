@@ -3278,6 +3278,171 @@ class Tensor:
             out_data, True, (parent_self, parent_kernel), backward_fn
         )
 
+    def conv2d_multi(self, kernel, channels, filters, height, width, size,
+                     stride=1, padding=0):
+        if not isinstance(kernel, Tensor):
+            raise TypeError("kernel must be a Tensor")
+        # Both operands must hold non-empty 1D finite float lists; data may
+        # have been mutated after construction, so re-validate at call time.
+        x_data = _require_nonempty_float_vector(self, "conv2d_multi")
+        w_data = _require_nonempty_float_vector(kernel, "conv2d_multi")
+        # channels, filters, height, width, size and stride must be non-bool
+        # positive ints, and padding a non-bool non-negative int.
+        for name, value in (
+            ("channels", channels),
+            ("filters", filters),
+            ("height", height),
+            ("width", width),
+            ("size", size),
+            ("stride", stride),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(name + " must be a positive int")
+            if value <= 0:
+                raise ValueError(name + " must be a positive int")
+        if isinstance(padding, bool) or not isinstance(padding, int):
+            raise TypeError("padding must be a non-negative int")
+        if padding < 0:
+            raise ValueError("padding must be a non-negative int")
+        C, O, H, W, K, S, P = (
+            channels, filters, height, width, size, stride, padding
+        )
+        # self stores C channels of H x W images and kernel O filters of
+        # C channels of K x K weights, all in row-major order.
+        if len(x_data) != C * H * W:
+            raise ValueError(
+                "conv2d_multi input length must equal "
+                "channels * height * width"
+            )
+        if len(w_data) != O * C * K * K:
+            raise ValueError(
+                "conv2d_multi kernel length must equal "
+                "filters * channels * size * size"
+            )
+        out_h = (H + 2 * P - K) // S + 1
+        out_w = (W + 2 * P - K) // S + 1
+        if out_h <= 0 or out_w <= 0:
+            raise ValueError("conv2d_multi output dimensions must be positive")
+        # Snapshot both operands at call time so later caller-side mutation
+        # or replacement of either input can change neither the forward
+        # result nor a pending backward pass.
+        snapshot_x = list(x_data)
+        snapshot_w = list(w_data)
+        # Batched multi-channel 2D cross-correlation: the kernel is never
+        # flipped. In ascending (o, or, oc, c, kr, kc) order, each output
+        # starts at 0.0 and accumulates
+        # y[(o*OH+or)*OW+oc] += x[(c*H+r)*W+q]
+        #                        * w[((o*C+c)*K+kr)*K+kc],
+        # with r = or*S+kr-P and q = oc*S+kc-P; out-of-range input
+        # positions from padding are skipped. A non-finite product or
+        # partial sum aborts before a result tensor exists, so no state can
+        # change.
+        out_len = O * out_h * out_w
+        out_data = [0.0] * out_len
+        for o in range(O):
+            for orow in range(out_h):
+                for ocol in range(out_w):
+                    oi = (o * out_h + orow) * out_w + ocol
+                    for c in range(C):
+                        for kr in range(K):
+                            r = orow * S + kr - P
+                            if not 0 <= r < H:
+                                continue
+                            for kc in range(K):
+                                q = ocol * S + kc - P
+                                if not 0 <= q < W:
+                                    continue
+                                xi = (c * H + r) * W + q
+                                wi = ((o * C + c) * K + kr) * K + kc
+                                product = snapshot_x[xi] * snapshot_w[wi]
+                                if not math.isfinite(product):
+                                    raise ValueError(
+                                        "conv2d_multi intermediate must be"
+                                        " finite"
+                                    )
+                                out_data[oi] = out_data[oi] + product
+                                if not math.isfinite(out_data[oi]):
+                                    raise ValueError(
+                                        "conv2d_multi intermediate must be"
+                                        " finite"
+                                    )
+        if not (self.requires_grad or kernel.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_kernel = self, kernel
+
+        def backward_fn(grad):
+            # dx[xi] += g*w[wi] and dw[wi] += g*x[xi], accumulated from
+            # 0.0 in the same ascending (o, or, oc, c, kr, kc) order as the
+            # forward pass, using the same padded r/q indexing and skipping
+            # out-of-range positions. A non-finite product or partial sum
+            # aborts the whole pass before any grad is written.
+            dx = [0.0] * (C * H * W)
+            dw = [0.0] * (O * C * K * K)
+            for o in range(O):
+                for orow in range(out_h):
+                    for ocol in range(out_w):
+                        g = grad[(o * out_h + orow) * out_w + ocol]
+                        for c in range(C):
+                            for kr in range(K):
+                                r = orow * S + kr - P
+                                if not 0 <= r < H:
+                                    continue
+                                for kc in range(K):
+                                    q = ocol * S + kc - P
+                                    if not 0 <= q < W:
+                                        continue
+                                    xi = (c * H + r) * W + q
+                                    wi = (
+                                        ((o * C + c) * K + kr) * K + kc
+                                    )
+                                    contrib_x = g * snapshot_w[wi]
+                                    if not math.isfinite(contrib_x):
+                                        raise ValueError(
+                                            "conv2d_multi backward "
+                                            "intermediate must be finite"
+                                        )
+                                    dx[xi] = dx[xi] + contrib_x
+                                    if not math.isfinite(dx[xi]):
+                                        raise ValueError(
+                                            "conv2d_multi backward "
+                                            "intermediate must be finite"
+                                        )
+                                    contrib_w = g * snapshot_x[xi]
+                                    if not math.isfinite(contrib_w):
+                                        raise ValueError(
+                                            "conv2d_multi backward "
+                                            "intermediate must be finite"
+                                        )
+                                    dw[wi] = dw[wi] + contrib_w
+                                    if not math.isfinite(dw[wi]):
+                                        raise ValueError(
+                                            "conv2d_multi backward "
+                                            "intermediate must be finite"
+                                        )
+            # The same object may play both roles; merge such roles into
+            # one contribution per tensor, and submit only parents that
+            # require grad.
+            merged = {}
+            roles = (
+                (parent_self, dx),
+                (parent_kernel, dw),
+            )
+            for parent, value in roles:
+                if not parent.requires_grad:
+                    continue
+                entry = merged.get(id(parent))
+                if entry is None:
+                    merged[id(parent)] = [parent, value]
+                else:
+                    combined = _merge_grad(entry[1], value)
+                    _ensure_finite_grad(combined)
+                    entry[1] = combined
+            return [(entry[0], entry[1]) for entry in merged.values()]
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_kernel), backward_fn
+        )
+
     def max_pool1d(self, kernel_size, stride=None, padding=0, dilation=1):
         data = _require_nonempty_float_vector(self, "max_pool1d")
         if isinstance(kernel_size, bool) or not isinstance(kernel_size, int):
