@@ -6047,6 +6047,188 @@ def load_rmsprop(optimizer, text):
     return None
 
 
+def _check_adagrad_state(optimizer):
+    """Validate an Adagrad optimizer's full mutable state for dump/load."""
+    parameters = optimizer.parameters
+    if not isinstance(parameters, list):
+        raise TypeError("parameters must be a non-empty list of Tensors")
+    if len(parameters) == 0:
+        raise ValueError("parameters must be non-empty")
+    for parameter in parameters:
+        if not isinstance(parameter, Tensor):
+            raise TypeError("parameters must contain only Tensors")
+    if len({id(parameter) for parameter in parameters}) != len(parameters):
+        raise ValueError("parameters must not contain duplicate Tensors")
+    for parameter in parameters:
+        if not isinstance(parameter.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        _validate_data(parameter.data)
+    sum_sq = optimizer.sum_sq
+    if not isinstance(sum_sq, list):
+        raise TypeError("sum_sq must be a list matching the parameters")
+    if len(sum_sq) != len(parameters):
+        raise ValueError("sum_sq must match the parameters in length")
+    for slot, parameter in zip(sum_sq, parameters):
+        Adagrad._check_slot(slot, parameter.data)
+
+
+def dump_adagrad(optimizer):
+    """Serialize an Adagrad optimizer's full state to a compact JSON string.
+
+    The output contains no whitespace and no trailing newline; top-level
+    keys are parameters, sum_sq in that order; each parameter entry has
+    data then requires_grad; sum_sq entries are a scalar or an array.
+    Floats are written with exactly six decimals and negative zero as
+    0.000000.
+    """
+    if not isinstance(optimizer, Adagrad):
+        raise TypeError("optimizer must be an Adagrad instance")
+    _check_adagrad_state(optimizer)
+    entries = []
+    for parameter in optimizer.parameters:
+        entries.append(
+            '{"data":'
+            + _json_value(parameter.data)
+            + ',"requires_grad":'
+            + ("true" if parameter.requires_grad else "false")
+            + "}"
+        )
+    slots = (
+        "["
+        + ",".join(_json_value(item) for item in optimizer.sum_sq)
+        + "]"
+    )
+    return (
+        '{"parameters":['
+        + ",".join(entries)
+        + '],"sum_sq":'
+        + slots
+        + "}"
+    )
+
+
+class _AdagradParser:
+    """Strict parser for the exact textual form produced by dump_adagrad."""
+
+    def __init__(self, text):
+        self._text = text
+        self._pos = 0
+
+    def _fail(self):
+        raise ValueError("text does not match the dump_adagrad format")
+
+    def _expect(self, literal):
+        if not self._text.startswith(literal, self._pos):
+            self._fail()
+        self._pos += len(literal)
+
+    def _parse_number(self):
+        match = _STATE_NUMBER.match(self._text, self._pos)
+        if match is None:
+            self._fail()
+        token = match.group(0)
+        self._pos = match.end()
+        value = float(token)
+        if not math.isfinite(value) or (value == 0.0 and token[0] == "-"):
+            self._fail()
+        return value
+
+    def _parse_data(self):
+        if not self._text.startswith("[", self._pos):
+            return self._parse_number()
+        self._pos += 1
+        values = [self._parse_number()]
+        while self._text.startswith(",", self._pos):
+            self._pos += 1
+            values.append(self._parse_number())
+        self._expect("]")
+        return values
+
+    def _parse_parameter(self):
+        self._expect('{"data":')
+        data = self._parse_data()
+        self._expect(',"requires_grad":')
+        if self._text.startswith("true", self._pos):
+            self._pos += 4
+            requires_grad = True
+        elif self._text.startswith("false", self._pos):
+            self._pos += 5
+            requires_grad = False
+        else:
+            self._fail()
+        self._expect("}")
+        return (data, requires_grad)
+
+    def _parse_slots(self):
+        self._expect("[")
+        items = [self._parse_data()]
+        while self._text.startswith(",", self._pos):
+            self._pos += 1
+            items.append(self._parse_data())
+        self._expect("]")
+        return items
+
+    def parse(self):
+        self._expect('{"parameters":[')
+        parameters = [self._parse_parameter()]
+        while self._text.startswith(",", self._pos):
+            self._pos += 1
+            parameters.append(self._parse_parameter())
+        self._expect('],"sum_sq":')
+        sum_sq = self._parse_slots()
+        self._expect("}")
+        if self._pos != len(self._text):
+            self._fail()
+        return parameters, sum_sq
+
+
+def load_adagrad(optimizer, text):
+    """Restore an Adagrad optimizer's full state from a dump_adagrad string.
+
+    On full validation success, atomically replace every parameter's data
+    and requires_grad, clear every grad, and replace sum_sq; lr, eps and
+    the parameter identities are left unchanged. On any failure no state
+    is touched.
+    """
+    if not isinstance(optimizer, Adagrad):
+        raise TypeError("optimizer must be an Adagrad instance")
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+    _check_adagrad_state(optimizer)
+    parameters, sum_sq = _AdagradParser(text).parse()
+    count = len(optimizer.parameters)
+    if len(parameters) != count:
+        raise ValueError("state must contain exactly one entry per parameter")
+    if len(sum_sq) != count:
+        raise ValueError("state sum_sq must match the parameters in length")
+    updates = []
+    for (data, requires_grad), parameter in zip(
+        parameters, optimizer.parameters
+    ):
+        current = parameter.data
+        if isinstance(current, list):
+            if not isinstance(data, list) or len(data) != len(current):
+                raise ValueError("state data shape must match parameter shape")
+        elif isinstance(data, list):
+            raise ValueError("state data shape must match parameter shape")
+        updates.append((parameter, data, requires_grad))
+    for slot, parameter in zip(sum_sq, optimizer.parameters):
+        current = parameter.data
+        if isinstance(current, list):
+            if not isinstance(slot, list) or len(slot) != len(current):
+                raise ValueError(
+                    "state sum_sq shape must match parameter shape"
+                )
+        elif isinstance(slot, list):
+            raise ValueError("state sum_sq shape must match parameter shape")
+    for parameter, data, requires_grad in updates:
+        parameter.data = data
+        parameter.requires_grad = requires_grad
+        parameter.grad = None
+    optimizer.sum_sq = sum_sq
+    return None
+
+
 def _format_float(value):
     if not math.isfinite(value):
         raise ValueError("cannot serialize a non-finite float")
