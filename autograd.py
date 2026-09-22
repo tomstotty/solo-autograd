@@ -5070,14 +5070,26 @@ class MomentumSGD:
         return 0.0
 
     def step(self):
-        # Revalidate every parameter, the velocity buffer, and every active
-        # grad first; compute all new values before mutating anything, so a
-        # failure leaves all data and velocity untouched.
+        # Revalidate the parameters list structurally (non-empty list of
+        # unique Tensors) before reading any element attribute, then every
+        # velocity slot and every active grad; compute all new values
+        # before mutating anything, so a failure leaves all data, grad and
+        # velocity untouched.
+        parameters = self.parameters
+        if not isinstance(parameters, list):
+            raise TypeError("parameters must be a non-empty list of Tensors")
+        if len(parameters) == 0:
+            raise ValueError("parameters must be non-empty")
+        for parameter in parameters:
+            if not isinstance(parameter, Tensor):
+                raise TypeError("parameters must contain only Tensors")
+        if len({id(parameter) for parameter in parameters}) != len(parameters):
+            raise ValueError("parameters must not contain duplicate Tensors")
         if not isinstance(self.velocity, list):
             raise TypeError("velocity must be a list")
-        if len(self.velocity) != len(self.parameters):
+        if len(self.velocity) != len(parameters):
             raise ValueError("velocity must match parameters")
-        for index, parameter in enumerate(self.parameters):
+        for index, parameter in enumerate(parameters):
             if not isinstance(parameter.requires_grad, bool):
                 raise TypeError("requires_grad must be a bool")
             data = _validate_data(parameter.data)
@@ -5086,7 +5098,7 @@ class MomentumSGD:
                 self._check_grad(parameter.grad, data)
         active = [
             index
-            for index, parameter in enumerate(self.parameters)
+            for index, parameter in enumerate(parameters)
             if parameter.requires_grad and parameter.grad is not None
         ]
         if not active:
@@ -5965,6 +5977,205 @@ def load_adagrad(optimizer, text):
         parameter.requires_grad = requires_grad
         parameter.grad = None
     optimizer.sum_sq = sum_sq
+    return None
+
+
+def _check_momentum_sgd_state(optimizer):
+    """Validate a MomentumSGD optimizer's full mutable state for dump/load."""
+    parameters = optimizer.parameters
+    if not isinstance(parameters, list):
+        raise TypeError("parameters must be a non-empty list of Tensors")
+    if len(parameters) == 0:
+        raise ValueError("parameters must be non-empty")
+    for parameter in parameters:
+        if not isinstance(parameter, Tensor):
+            raise TypeError("parameters must contain only Tensors")
+    if len({id(parameter) for parameter in parameters}) != len(parameters):
+        raise ValueError("parameters must not contain duplicate Tensors")
+    for parameter in parameters:
+        if not isinstance(parameter.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        _validate_data(parameter.data)
+    if isinstance(optimizer.lr, bool) or not isinstance(optimizer.lr, float):
+        raise TypeError("lr must be a positive finite float")
+    if not math.isfinite(optimizer.lr) or optimizer.lr <= 0.0:
+        raise ValueError("lr must be a positive finite float")
+    if (
+        isinstance(optimizer.momentum, bool)
+        or not isinstance(optimizer.momentum, float)
+    ):
+        raise TypeError("momentum must be a finite float in [0.0, 1.0)")
+    if (
+        not math.isfinite(optimizer.momentum)
+        or optimizer.momentum < 0.0
+        or optimizer.momentum >= 1.0
+    ):
+        raise ValueError("momentum must be a finite float in [0.0, 1.0)")
+    if not isinstance(optimizer.nesterov, bool):
+        raise TypeError("nesterov must be a bool")
+    velocity = optimizer.velocity
+    if not isinstance(velocity, list):
+        raise TypeError("velocity must be a list matching the parameters")
+    if len(velocity) != len(parameters):
+        raise ValueError("velocity must match the parameters in length")
+    for slot, parameter in zip(velocity, parameters):
+        MomentumSGD._check_buffer(slot, parameter.data, "velocity")
+
+
+def dump_momentum_sgd(optimizer):
+    """Serialize a MomentumSGD optimizer's full state to a compact JSON string.
+
+    The output contains no whitespace and no trailing newline; top-level
+    keys are parameters, velocity in that order; each parameter entry has
+    data then requires_grad; velocity entries are a scalar or an array.
+    Floats are written with exactly six decimals and negative zero as
+    0.000000. lr, momentum and nesterov are not serialized.
+    """
+    if not isinstance(optimizer, MomentumSGD):
+        raise TypeError("optimizer must be a MomentumSGD instance")
+    _check_momentum_sgd_state(optimizer)
+    entries = []
+    for parameter in optimizer.parameters:
+        entries.append(
+            '{"data":'
+            + _json_value(parameter.data)
+            + ',"requires_grad":'
+            + ("true" if parameter.requires_grad else "false")
+            + "}"
+        )
+    slots = (
+        "["
+        + ",".join(_json_value(item) for item in optimizer.velocity)
+        + "]"
+    )
+    return (
+        '{"parameters":['
+        + ",".join(entries)
+        + '],"velocity":'
+        + slots
+        + "}"
+    )
+
+
+class _MomentumSGDParser:
+    """Strict parser for the exact textual form produced by dump_momentum_sgd."""
+
+    def __init__(self, text):
+        self._text = text
+        self._pos = 0
+
+    def _fail(self):
+        raise ValueError("text does not match the dump_momentum_sgd format")
+
+    def _expect(self, literal):
+        if not self._text.startswith(literal, self._pos):
+            self._fail()
+        self._pos += len(literal)
+
+    def _parse_number(self):
+        match = _STATE_NUMBER.match(self._text, self._pos)
+        if match is None:
+            self._fail()
+        token = match.group(0)
+        self._pos = match.end()
+        value = float(token)
+        if not math.isfinite(value) or (value == 0.0 and token[0] == "-"):
+            self._fail()
+        return value
+
+    def _parse_data(self):
+        if not self._text.startswith("[", self._pos):
+            return self._parse_number()
+        self._pos += 1
+        values = [self._parse_number()]
+        while self._text.startswith(",", self._pos):
+            self._pos += 1
+            values.append(self._parse_number())
+        self._expect("]")
+        return values
+
+    def _parse_parameter(self):
+        self._expect('{"data":')
+        data = self._parse_data()
+        self._expect(',"requires_grad":')
+        if self._text.startswith("true", self._pos):
+            self._pos += 4
+            requires_grad = True
+        elif self._text.startswith("false", self._pos):
+            self._pos += 5
+            requires_grad = False
+        else:
+            self._fail()
+        self._expect("}")
+        return (data, requires_grad)
+
+    def _parse_slots(self):
+        self._expect("[")
+        items = [self._parse_data()]
+        while self._text.startswith(",", self._pos):
+            self._pos += 1
+            items.append(self._parse_data())
+        self._expect("]")
+        return items
+
+    def parse(self):
+        self._expect('{"parameters":[')
+        parameters = [self._parse_parameter()]
+        while self._text.startswith(",", self._pos):
+            self._pos += 1
+            parameters.append(self._parse_parameter())
+        self._expect('],"velocity":')
+        velocity = self._parse_slots()
+        self._expect("}")
+        if self._pos != len(self._text):
+            self._fail()
+        return parameters, velocity
+
+
+def load_momentum_sgd(optimizer, text):
+    """Restore a MomentumSGD optimizer's full state from a dump string.
+
+    On full validation success, atomically replace every parameter's data
+    and requires_grad, clear every grad, and replace velocity; lr,
+    momentum, nesterov and the parameter identities are left unchanged.
+    On any failure no state is touched.
+    """
+    if not isinstance(optimizer, MomentumSGD):
+        raise TypeError("optimizer must be a MomentumSGD instance")
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+    _check_momentum_sgd_state(optimizer)
+    parameters, velocity = _MomentumSGDParser(text).parse()
+    count = len(optimizer.parameters)
+    if len(parameters) != count:
+        raise ValueError("state must contain exactly one entry per parameter")
+    if len(velocity) != count:
+        raise ValueError("state velocity must match the parameters in length")
+    updates = []
+    for (data, requires_grad), parameter in zip(
+        parameters, optimizer.parameters
+    ):
+        current = parameter.data
+        if isinstance(current, list):
+            if not isinstance(data, list) or len(data) != len(current):
+                raise ValueError("state data shape must match parameter shape")
+        elif isinstance(data, list):
+            raise ValueError("state data shape must match parameter shape")
+        updates.append((parameter, data, requires_grad))
+    for slot, parameter in zip(velocity, optimizer.parameters):
+        current = parameter.data
+        if isinstance(current, list):
+            if not isinstance(slot, list) or len(slot) != len(current):
+                raise ValueError(
+                    "state velocity shape must match parameter shape"
+                )
+        elif isinstance(slot, list):
+            raise ValueError("state velocity shape must match parameter shape")
+    for parameter, data, requires_grad in updates:
+        parameter.data = data
+        parameter.requires_grad = requires_grad
+        parameter.grad = None
+    optimizer.velocity = velocity
     return None
 
 
