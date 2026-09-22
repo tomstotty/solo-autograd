@@ -283,6 +283,106 @@ class Tensor:
             out_data, True, (parent_self, parent_other), backward_fn
         )
 
+    def sub(self, other):
+        other = self._coerce(other)
+        a = _validate_data(self.data)
+        b = _validate_data(other.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        if not isinstance(other.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        a_vector = isinstance(a, list)
+        b_vector = isinstance(b, list)
+        if a_vector and b_vector and len(a) != len(b):
+            raise ValueError("vector lengths must match")
+        # Subtract element by element in ascending output-index order; a
+        # non-finite difference aborts before a result tensor exists, so no
+        # state can change on failure.
+        if a_vector and b_vector:
+            out_data = []
+            for i in range(len(a)):
+                difference = a[i] - b[i]
+                if not math.isfinite(difference):
+                    raise ValueError("sub result must be finite")
+                out_data.append(difference)
+        elif a_vector:
+            out_data = []
+            for i in range(len(a)):
+                difference = a[i] - b
+                if not math.isfinite(difference):
+                    raise ValueError("sub result must be finite")
+                out_data.append(difference)
+        elif b_vector:
+            out_data = []
+            for i in range(len(b)):
+                difference = a - b[i]
+                if not math.isfinite(difference):
+                    raise ValueError("sub result must be finite")
+                out_data.append(difference)
+        else:
+            out_data = a - b
+            if not math.isfinite(out_data):
+                raise ValueError("sub result must be finite")
+        if not (self.requires_grad or other.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_other = self, other
+        # Snapshot both operands so later caller-side mutation or
+        # replacement of either input cannot change what a pending
+        # backward pass uses.
+        snapshot_a = list(a) if a_vector else a
+        snapshot_b = list(b) if b_vector else b
+
+        def backward_fn(grad):
+            grad_values = grad if isinstance(grad, list) else [grad]
+            contributions = []
+            if parent_self.requires_grad:
+                if a_vector:
+                    da = []
+                    for i in range(len(snapshot_a)):
+                        value = grad_values[i]
+                        if not math.isfinite(value):
+                            raise ValueError(
+                                "sub backward intermediate must be finite"
+                            )
+                        da.append(value)
+                    contributions.append((parent_self, da))
+                else:
+                    # A broadcast scalar parent reduces by accumulating
+                    # from 0.0 in ascending output-index order.
+                    total = 0.0
+                    for i in range(len(grad_values)):
+                        total += grad_values[i]
+                        if not math.isfinite(total):
+                            raise ValueError(
+                                "sub backward intermediate must be finite"
+                            )
+                    contributions.append((parent_self, total))
+            if parent_other.requires_grad:
+                if b_vector:
+                    db = []
+                    for i in range(len(snapshot_b)):
+                        value = -grad_values[i]
+                        if not math.isfinite(value):
+                            raise ValueError(
+                                "sub backward intermediate must be finite"
+                            )
+                        db.append(value)
+                    contributions.append((parent_other, db))
+                else:
+                    total = 0.0
+                    for i in range(len(grad_values)):
+                        total += -grad_values[i]
+                        if not math.isfinite(total):
+                            raise ValueError(
+                                "sub backward intermediate must be finite"
+                            )
+                    contributions.append((parent_other, total))
+            return contributions
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_other), backward_fn
+        )
+
     def mul(self, other):
         other = self._coerce(other)
         out_data = _broadcast_apply(
