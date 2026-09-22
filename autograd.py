@@ -5202,6 +5202,170 @@ class RMSprop:
         return None
 
 
+class Adagrad:
+    """Adagrad optimizer over a fixed list of Tensors."""
+
+    def __init__(self, parameters, lr, eps=1e-8):
+        if not isinstance(parameters, list):
+            raise TypeError("parameters must be a non-empty list of Tensors")
+        if len(parameters) == 0:
+            raise ValueError("parameters must be non-empty")
+        for parameter in parameters:
+            if not isinstance(parameter, Tensor):
+                raise TypeError("parameters must contain only Tensors")
+        if len({id(parameter) for parameter in parameters}) != len(parameters):
+            raise ValueError("parameters must not contain duplicate Tensors")
+        for parameter in parameters:
+            if not isinstance(parameter.requires_grad, bool):
+                raise TypeError("requires_grad must be a bool")
+            _validate_data(parameter.data)
+        if isinstance(lr, bool) or not isinstance(lr, float):
+            raise TypeError("lr must be a positive finite float")
+        if not math.isfinite(lr) or lr <= 0.0:
+            raise ValueError("lr must be a positive finite float")
+        if isinstance(eps, bool) or not isinstance(eps, float):
+            raise TypeError("eps must be a positive finite float")
+        if not math.isfinite(eps) or eps <= 0.0:
+            raise ValueError("eps must be a positive finite float")
+        self.parameters = list(parameters)
+        self.lr = lr
+        self.eps = eps
+        self.sum_sq = [
+            self._zeros_like(parameter.data) for parameter in parameters
+        ]
+
+    @staticmethod
+    def _zeros_like(data):
+        if isinstance(data, list):
+            return [0.0 for _ in data]
+        return 0.0
+
+    def step(self):
+        # Revalidate every parameter and every sum_sq slot first; validate
+        # every active grad, then compute all new values before mutating
+        # anything, so a failure leaves all data, sum_sq, grad and
+        # requires_grad untouched.
+        if not isinstance(self.sum_sq, list):
+            raise TypeError("sum_sq must be a list of slots")
+        if len(self.sum_sq) != len(self.parameters):
+            raise ValueError("sum_sq shape must match parameter shape")
+        for index, parameter in enumerate(self.parameters):
+            if not isinstance(parameter.requires_grad, bool):
+                raise TypeError("requires_grad must be a bool")
+            data = _validate_data(parameter.data)
+            self._check_slot(self.sum_sq[index], data)
+            if parameter.requires_grad and parameter.grad is not None:
+                self._check_grad(parameter.grad, data)
+        updates = []
+        for index, parameter in enumerate(self.parameters):
+            if not parameter.requires_grad or parameter.grad is None:
+                continue
+            updates.append(
+                (
+                    index,
+                    self._updated(
+                        parameter.data,
+                        parameter.grad,
+                        self.sum_sq[index],
+                    ),
+                )
+            )
+        for index, (new_data, new_sum_sq) in updates:
+            self.parameters[index].data = new_data
+            self.sum_sq[index] = new_sum_sq
+        return None
+
+    @staticmethod
+    def _check_slot(slot, data):
+        """Type/shape/finiteness check for a sum_sq slot."""
+        if isinstance(data, list):
+            if not isinstance(slot, list):
+                if isinstance(slot, float) and not isinstance(slot, bool):
+                    raise ValueError(
+                        "sum_sq shape must match parameter shape"
+                    )
+                raise TypeError("sum_sq must be a list of floats")
+            if len(slot) != len(data):
+                raise ValueError("sum_sq shape must match parameter shape")
+            for value in slot:
+                if isinstance(value, bool) or not isinstance(value, float):
+                    raise TypeError("sum_sq elements must be floats")
+            for value in slot:
+                if not math.isfinite(value):
+                    raise ValueError("sum_sq must be finite")
+        else:
+            if isinstance(slot, list):
+                raise ValueError("sum_sq shape must match parameter shape")
+            if isinstance(slot, bool) or not isinstance(slot, float):
+                raise TypeError("sum_sq must be a float")
+            if not math.isfinite(slot):
+                raise ValueError("sum_sq must be finite")
+
+    @staticmethod
+    def _check_grad(grad, data):
+        """Type/shape/finiteness check for an active parameter's grad."""
+        if isinstance(data, list):
+            if not isinstance(grad, list):
+                if isinstance(grad, float) and not isinstance(grad, bool):
+                    raise ValueError("grad shape must match tensor shape")
+                raise TypeError("grad must be a list of floats")
+            if len(grad) != len(data):
+                raise ValueError("grad shape must match tensor shape")
+            for value in grad:
+                if isinstance(value, bool) or not isinstance(value, float):
+                    raise TypeError("grad elements must be floats")
+            for value in grad:
+                if not math.isfinite(value):
+                    raise ValueError("grad must be finite")
+        else:
+            if isinstance(grad, list):
+                raise ValueError("grad shape must match tensor shape")
+            if isinstance(grad, bool) or not isinstance(grad, float):
+                raise TypeError("grad must be a float")
+            if not math.isfinite(grad):
+                raise ValueError("grad must be finite")
+
+    def _updated(self, data, grad, sum_sq):
+        """Compute (new_data, new_sum_sq) for one active parameter."""
+        if isinstance(data, list):
+            new_sum_sq = []
+            new_data = []
+            for value, g, old in zip(data, grad, sum_sq):
+                next_sum = old + g * g
+                if not math.isfinite(next_sum):
+                    raise ValueError("sum_sq must be finite")
+                try:
+                    denominator = math.sqrt(next_sum) + self.eps
+                except (ValueError, OverflowError):
+                    raise ValueError("update denominator must be finite")
+                if not math.isfinite(denominator):
+                    raise ValueError("update denominator must be finite")
+                value_next = value - self.lr * g / denominator
+                if not math.isfinite(value_next):
+                    raise ValueError("updated data must be finite")
+                new_sum_sq.append(next_sum)
+                new_data.append(value_next)
+            return new_data, new_sum_sq
+        next_sum = sum_sq + grad * grad
+        if not math.isfinite(next_sum):
+            raise ValueError("sum_sq must be finite")
+        try:
+            denominator = math.sqrt(next_sum) + self.eps
+        except (ValueError, OverflowError):
+            raise ValueError("update denominator must be finite")
+        if not math.isfinite(denominator):
+            raise ValueError("update denominator must be finite")
+        value_next = data - self.lr * grad / denominator
+        if not math.isfinite(value_next):
+            raise ValueError("updated data must be finite")
+        return value_next, next_sum
+
+    def zero_grad(self):
+        for parameter in self.parameters:
+            parameter.grad = None
+        return None
+
+
 def gradcheck(fn, data, eps=1e-6, atol=1e-5):
     """Compare analytic gradients from backward() with central differences.
 
