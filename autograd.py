@@ -3654,6 +3654,179 @@ class Tensor:
             backward_fn,
         )
 
+    def group_norm(self, groups, eps=1e-5):
+        # data may have been mutated after construction, so re-validate at
+        # call time: a non-list/empty list is a ValueError, a non-float
+        # element (including bool) or a non-bool requires_grad is a
+        # TypeError, a non-finite element is a ValueError.
+        data = self.data
+        if not isinstance(data, list) or len(data) == 0:
+            raise ValueError("group_norm requires a non-empty 1D float list")
+        for value in data:
+            if isinstance(value, bool) or not isinstance(value, float):
+                raise TypeError("group_norm data elements must be floats")
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        for value in data:
+            if not math.isfinite(value):
+                raise ValueError("group_norm data elements must be finite")
+        n = len(data)
+        # groups must be a non-bool positive int that divides the length.
+        if isinstance(groups, bool) or not isinstance(groups, int):
+            raise TypeError(
+                "groups must be a positive int dividing the input length"
+            )
+        if groups <= 0 or n % groups != 0:
+            raise ValueError(
+                "groups must be a positive int dividing the input length"
+            )
+        if isinstance(eps, bool) or not isinstance(eps, float):
+            raise TypeError("eps must be a positive finite float")
+        if not math.isfinite(eps) or eps <= 0.0:
+            raise ValueError("eps must be a positive finite float")
+        # Snapshot the input so later caller-side mutation or replacement
+        # can change neither the forward result nor a pending backward pass.
+        x = list(data)
+        m = n // groups
+        # Normalize each of the equal-length groups independently. Within a
+        # group, accumulating from 0.0 in ascending index order:
+        # mu = sum(x)/m, c_i = x_i - mu, v = sum(c_i*c_i)/m,
+        # r = 1/sqrt(v+eps), y_i = c_i*r. A non-finite intermediate aborts
+        # before a result tensor exists, so no state can change on failure.
+        mus = []
+        rs = []
+        out_data = [0.0] * n
+        for group_index in range(groups):
+            base = group_index * m
+            total = 0.0
+            for j in range(m):
+                total += x[base + j]
+                if not math.isfinite(total):
+                    raise ValueError("group_norm intermediate must be finite")
+            mu = total / m
+            if not math.isfinite(mu):
+                raise ValueError("group_norm intermediate must be finite")
+            mus.append(mu)
+            var_sum = 0.0
+            for j in range(m):
+                c_j = x[base + j] - mu
+                if not math.isfinite(c_j):
+                    raise ValueError("group_norm intermediate must be finite")
+                square = c_j * c_j
+                if not math.isfinite(square):
+                    raise ValueError("group_norm intermediate must be finite")
+                var_sum += square
+                if not math.isfinite(var_sum):
+                    raise ValueError("group_norm intermediate must be finite")
+            var = var_sum / m
+            if not math.isfinite(var):
+                raise ValueError("group_norm intermediate must be finite")
+            denom = var + eps
+            if not math.isfinite(denom):
+                raise ValueError("group_norm intermediate must be finite")
+            r = 1.0 / math.sqrt(denom)
+            if not math.isfinite(r):
+                raise ValueError("group_norm intermediate must be finite")
+            rs.append(r)
+            for j in range(m):
+                c_j = x[base + j] - mu
+                y_j = c_j * r
+                if not math.isfinite(y_j):
+                    raise ValueError("group_norm intermediate must be finite")
+                out_data[base + j] = y_j
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # Save x, groups, mu and r with the graph so a pending backward
+        # pass is independent of any subsequent data mutation.
+        saved_x = x
+        saved_groups = groups
+        saved_mu = mus
+        saved_r = rs
+
+        def backward_fn(grad):
+            # Per group, first G = sum(g) and H = sum(g*c), each
+            # accumulated from 0.0 in ascending index order; then in
+            # ascending index order dx_i =
+            # (r/m)*(m*g_i - G - c_i*r*r*H). A non-finite intermediate
+            # aborts the whole pass before any grad is written.
+            dx = [0.0] * n
+            for group_index in range(saved_groups):
+                base = group_index * m
+                mu = saved_mu[group_index]
+                r = saved_r[group_index]
+                G = 0.0
+                for j in range(m):
+                    G += grad[base + j]
+                    if not math.isfinite(G):
+                        raise ValueError(
+                            "group_norm backward intermediate must be finite"
+                        )
+                H = 0.0
+                for j in range(m):
+                    c_j = saved_x[base + j] - mu
+                    product = grad[base + j] * c_j
+                    if not math.isfinite(product):
+                        raise ValueError(
+                            "group_norm backward intermediate must be finite"
+                        )
+                    H += product
+                    if not math.isfinite(H):
+                        raise ValueError(
+                            "group_norm backward intermediate must be finite"
+                        )
+                scale = r / m
+                if not math.isfinite(scale):
+                    raise ValueError(
+                        "group_norm backward intermediate must be finite"
+                    )
+                for j in range(m):
+                    c_j = saved_x[base + j] - mu
+                    if not math.isfinite(c_j):
+                        raise ValueError(
+                            "group_norm backward intermediate must be finite"
+                        )
+                    scaled = m * grad[base + j]
+                    if not math.isfinite(scaled):
+                        raise ValueError(
+                            "group_norm backward intermediate must be finite"
+                        )
+                    shifted = scaled - G
+                    if not math.isfinite(shifted):
+                        raise ValueError(
+                            "group_norm backward intermediate must be finite"
+                        )
+                    # Evaluate c*r*r*H strictly left to right as written.
+                    term_r = c_j * r
+                    if not math.isfinite(term_r):
+                        raise ValueError(
+                            "group_norm backward intermediate must be finite"
+                        )
+                    term_r2 = term_r * r
+                    if not math.isfinite(term_r2):
+                        raise ValueError(
+                            "group_norm backward intermediate must be finite"
+                        )
+                    correction = term_r2 * H
+                    if not math.isfinite(correction):
+                        raise ValueError(
+                            "group_norm backward intermediate must be finite"
+                        )
+                    bracket = shifted - correction
+                    if not math.isfinite(bracket):
+                        raise ValueError(
+                            "group_norm backward intermediate must be finite"
+                        )
+                    value = scale * bracket
+                    if not math.isfinite(value):
+                        raise ValueError(
+                            "group_norm backward intermediate must be finite"
+                        )
+                    dx[base + j] = value
+            return [(parent, dx)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def gather(self, indices):
         data = _require_nonempty_float_vector(self, "gather")
         if not isinstance(indices, list):
