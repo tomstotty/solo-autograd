@@ -2349,6 +2349,70 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def avg_pool1d(self, kernel_size, stride=None):
+        data = _require_nonempty_float_vector(self, "avg_pool1d")
+        if isinstance(kernel_size, bool) or not isinstance(kernel_size, int):
+            raise TypeError("kernel_size must be a positive int")
+        if kernel_size <= 0:
+            raise ValueError("kernel_size must be a positive int")
+        if stride is None:
+            stride = kernel_size
+        elif isinstance(stride, bool) or not isinstance(stride, int):
+            raise TypeError("stride must be a positive int")
+        elif stride <= 0:
+            raise ValueError("stride must be a positive int")
+        n = len(data)
+        k = kernel_size
+        s = stride
+        out_len = (n - k) // s + 1
+        if out_len <= 0:
+            raise ValueError("avg_pool1d output length must be positive")
+        # out[o] is the window mean accumulated from 0.0 over data[o*s+i]
+        # in ascending i order, then divided by k. A non-finite partial
+        # sum or quotient aborts before a result tensor exists, so no
+        # state can change on failure. Every window index is in range
+        # whenever out_len is positive.
+        out_data = []
+        for o in range(out_len):
+            acc = 0.0
+            base = o * s
+            for i in range(k):
+                acc += data[base + i]
+                if not math.isfinite(acc):
+                    raise ValueError("avg_pool1d intermediate must be finite")
+            mean = acc / k
+            if not math.isfinite(mean):
+                raise ValueError("avg_pool1d intermediate must be finite")
+            out_data.append(mean)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # The backward pass depends only on the saved input length, k and
+        # s, never on the input values, so later mutation or replacement
+        # of the input data cannot change a pending backward pass.
+        saved_n = n
+        saved_k = k
+        saved_s = s
+
+        def backward_fn(grad):
+            dx = [0.0] * saved_n
+            for o in range(out_len):
+                share = grad[o] / saved_k
+                if not math.isfinite(share):
+                    raise ValueError(
+                        "avg_pool1d backward intermediate must be finite"
+                    )
+                base = o * saved_s
+                for i in range(saved_k):
+                    dx[base + i] += share
+                    if not math.isfinite(dx[base + i]):
+                        raise ValueError(
+                            "avg_pool1d backward intermediate must be finite"
+                        )
+            return [(parent, dx)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def dropout(self, p=0.5, seed=0):
         data = _require_nonempty_float_vector(self, "dropout")
         if isinstance(p, bool) or not isinstance(p, float):
