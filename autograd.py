@@ -4768,6 +4768,42 @@ def xavier_uniform(length, fan_in, fan_out, seed=0, requires_grad=True):
     return Tensor(data, requires_grad)
 
 
+def kaiming_uniform(length, fan_in, seed=0, requires_grad=True):
+    """Return a Tensor of `length` Kaiming-uniform samples, drawn locally.
+
+    Uses bound = sqrt(6 / fan_in) and a local LCG seeded by `seed`; no
+    global random state is read or written. TypeError on bad argument
+    types, ValueError on out-of-range arguments or non-finite results.
+    """
+    for name, value in (("length", length), ("fan_in", fan_in)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(name + " must be a positive int")
+        if value <= 0:
+            raise ValueError(name + " must be a positive int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an int in [0, 4294967295]")
+    if seed < 0 or seed > 4294967295:
+        raise ValueError("seed must be in [0, 4294967295]")
+    if not isinstance(requires_grad, bool):
+        raise TypeError("requires_grad must be a bool")
+    try:
+        bound = math.sqrt(6.0 / fan_in)
+    except OverflowError:
+        raise ValueError("kaiming bound must be finite")
+    if not math.isfinite(bound):
+        raise ValueError("kaiming bound must be finite")
+    data = []
+    s = seed
+    for _ in range(length):
+        s = (1664525 * s + 1013904223) % 4294967296
+        u = s / 4294967296.0
+        value = (2.0 * u - 1.0) * bound
+        if not (math.isfinite(u) and math.isfinite(value)):
+            raise ValueError("kaiming_uniform values must be finite")
+        data.append(value)
+    return Tensor(data, requires_grad)
+
+
 def orthogonal(size, seed=0, gain=1.0, requires_grad=True):
     """Return a square orthogonal matrix as a row-major flattened leaf Tensor.
 
@@ -6484,8 +6520,9 @@ def jacobiancheck(fn, data, eps=1e-6, atol=1e-5):
     numerically from central differences with +/- eps perturbations.
 
     Returns (passed, max_abs_error) where passed is True only when every
-    per-element absolute error is at most atol.  ``data`` is never
-    modified.
+    per-element absolute error is at most atol; a pair that is exactly
+    0.0 on both sides always passes.  ``data`` is never modified and
+    exceptions raised by ``fn`` propagate unchanged.
     """
     if not callable(fn):
         raise TypeError("fn must be callable")
@@ -6498,6 +6535,9 @@ def jacobiancheck(fn, data, eps=1e-6, atol=1e-5):
         raise TypeError("atol must be a finite float")
     if not math.isfinite(atol) or atol < 0.0:
         raise ValueError("atol must be a non-negative finite float")
+    two_eps = 2.0 * eps
+    if not math.isfinite(two_eps) or two_eps <= 0.0:
+        raise ValueError("jacobiancheck step must be positive and finite")
 
     vector_input = isinstance(normalized, list)
     base = list(normalized) if vector_input else [normalized]
@@ -6521,12 +6561,17 @@ def jacobiancheck(fn, data, eps=1e-6, atol=1e-5):
     def check_input_grad(grad):
         if grad is None:
             raise ValueError("fn result is not connected to the input")
-        if isinstance(grad, bool) or (
-            not isinstance(grad, list) and not isinstance(grad, float)
-        ):
-            raise TypeError("input grad must be a float or a list of floats")
-        values = grad if isinstance(grad, list) else [grad]
-        return [_as_finite_float(value) for value in values]
+        if vector_input:
+            if not isinstance(grad, list):
+                raise TypeError("input grad must be a list of floats")
+            if len(grad) != n:
+                raise ValueError("input grad length must match the input")
+            return [_as_finite_float(value) for value in grad]
+        if isinstance(grad, bool) or not isinstance(grad, float):
+            raise TypeError("input grad must be a finite float")
+        if not math.isfinite(grad):
+            raise ValueError("input grad must be finite")
+        return [grad]
 
     def analytic_row(r, expected_length):
         values = list(base) if vector_input else base[0]
@@ -6552,7 +6597,6 @@ def jacobiancheck(fn, data, eps=1e-6, atol=1e-5):
 
     # Central differences fill the numeric Jacobian one input column at
     # a time, using requires_grad False Tensors.
-    two_eps = 2.0 * eps
     numeric = [[0.0] * n for _ in range(m)]
     for c in range(n):
         plus = list(base)
