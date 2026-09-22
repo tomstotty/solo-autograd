@@ -634,6 +634,125 @@ class Tensor:
             out_data, True, (parent_self, parent_other), backward_fn
         )
 
+    def linear(self, weight, bias):
+        if not isinstance(weight, Tensor):
+            raise TypeError("weight must be a Tensor")
+        if not isinstance(bias, Tensor):
+            raise TypeError("bias must be a Tensor")
+        x_data = _require_nonempty_float_vector(self, "linear")
+        w_data = _require_nonempty_float_vector(weight, "linear")
+        b_data = _require_nonempty_float_vector(bias, "linear")
+        n = len(x_data)
+        m = len(b_data)
+        # weight stores the m x n matrix in row-major order, one row per
+        # output.
+        if len(w_data) != m * n:
+            raise ValueError("linear weight length must equal m * n")
+        # Snapshot all three operands at call time so later caller-side
+        # mutation or replacement of any input can change neither the
+        # forward result nor a pending backward pass.
+        x = list(x_data)
+        w = list(w_data)
+        b = list(b_data)
+        # For each output o accumulate starting from b[o], adding
+        # x[i]*w[o*n+i] in ascending i order; a non-finite product or
+        # partial sum aborts before a result tensor exists, so no state
+        # can change on failure.
+        out_data = []
+        for o in range(m):
+            acc = b[o]
+            for i in range(n):
+                product = x[i] * w[o * n + i]
+                if not math.isfinite(product):
+                    raise ValueError("linear intermediate must be finite")
+                acc += product
+                if not math.isfinite(acc):
+                    raise ValueError("linear intermediate must be finite")
+            out_data.append(acc)
+        if not (
+            self.requires_grad
+            or weight.requires_grad
+            or bias.requires_grad
+        ):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_weight, parent_bias = self, weight, bias
+        saved_x, saved_w = x, w
+
+        def backward_fn(grad):
+            # dx[i] += g[o]*w[o*n+i], dw[o*n+i] = g[o]*x[i] and
+            # db[o] = g[o], iterating o then i in ascending order. Only
+            # roles whose tensor requires grad are computed; a non-finite
+            # product, sum or merged multi-role contribution aborts the
+            # whole pass before any grad is written.
+            need_dx = parent_self.requires_grad
+            need_dw = parent_weight.requires_grad
+            need_db = parent_bias.requires_grad
+            dx = [0.0] * n if need_dx else None
+            dw = [0.0] * (m * n) if need_dw else None
+            db = [0.0] * m if need_db else None
+            for o in range(m):
+                if db is not None:
+                    db[o] = grad[o]
+                for i in range(n):
+                    if dx is not None:
+                        term_x = grad[o] * saved_w[o * n + i]
+                        if not math.isfinite(term_x):
+                            raise ValueError(
+                                "linear backward intermediate must be finite"
+                            )
+                        dx[i] += term_x
+                        if not math.isfinite(dx[i]):
+                            raise ValueError(
+                                "linear backward intermediate must be finite"
+                            )
+                    if dw is not None:
+                        term_w = grad[o] * saved_x[i]
+                        if not math.isfinite(term_w):
+                            raise ValueError(
+                                "linear backward intermediate must be finite"
+                            )
+                        dw[o * n + i] = term_w
+            # Submit one entry per distinct parent tensor; when one object
+            # plays several roles its per-role contributions are summed.
+            grouped = {}
+            if dx is not None:
+                grouped[id(parent_self)] = [parent_self, [dx]]
+            if dw is not None:
+                entry = grouped.get(id(parent_weight))
+                if entry is None:
+                    grouped[id(parent_weight)] = [parent_weight, [dw]]
+                else:
+                    entry[1].append(dw)
+            if db is not None:
+                entry = grouped.get(id(parent_bias))
+                if entry is None:
+                    grouped[id(parent_bias)] = [parent_bias, [db]]
+                else:
+                    entry[1].append(db)
+            contributions = []
+            for parent, vectors in grouped.values():
+                if len(vectors) == 1:
+                    contributions.append((parent, vectors[0]))
+                else:
+                    merged = [0.0] * len(vectors[0])
+                    for vector in vectors:
+                        for idx, value in enumerate(vector):
+                            merged[idx] += value
+                            if not math.isfinite(merged[idx]):
+                                raise ValueError(
+                                    "linear backward intermediate must be"
+                                    " finite"
+                                )
+                    contributions.append((parent, merged))
+            return contributions
+
+        return Tensor._make(
+            out_data,
+            True,
+            (parent_self, parent_weight, parent_bias),
+            backward_fn,
+        )
+
     def mse_loss(self, target):
         if not isinstance(target, Tensor):
             raise TypeError("target must be a Tensor")
