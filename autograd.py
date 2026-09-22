@@ -2886,20 +2886,22 @@ class Tensor:
             out_data, True, (parent_self, parent_kernel), backward_fn
         )
 
-    def conv2d(self, kernel, height, width, kernel_size, stride=1, padding=0):
+    def conv2d(self, kernel, height, width, kernel_size, stride=1,
+               padding=0, dilation=1):
         if not isinstance(kernel, Tensor):
             raise TypeError("kernel must be a Tensor")
         # Both operands must hold non-empty 1D finite float lists; data may
         # have been mutated after construction, so re-validate at call time.
         x_data = _require_nonempty_float_vector(self, "conv2d")
         k_data = _require_nonempty_float_vector(kernel, "conv2d")
-        # H, W, kernel_size and stride must be non-bool positive ints, and
-        # padding a non-bool non-negative int.
+        # H, W, kernel_size, stride and dilation must be non-bool positive
+        # ints, and padding a non-bool non-negative int.
         for name, value in (
             ("height", height),
             ("width", width),
             ("kernel_size", kernel_size),
             ("stride", stride),
+            ("dilation", dilation),
         ):
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError(name + " must be a positive int")
@@ -2909,7 +2911,7 @@ class Tensor:
             raise TypeError("padding must be a non-negative int")
         if padding < 0:
             raise ValueError("padding must be a non-negative int")
-        H, W, K, S, P = height, width, kernel_size, stride, padding
+        H, W, K, S, P, D = height, width, kernel_size, stride, padding, dilation
         # self stores a H x W image and kernel a K x K filter, both in
         # row-major order.
         if len(x_data) != H * W:
@@ -2918,8 +2920,12 @@ class Tensor:
             raise ValueError(
                 "conv2d kernel length must equal kernel_size * kernel_size"
             )
-        out_h = (H + 2 * P - K) // S + 1
-        out_w = (W + 2 * P - K) // S + 1
+        # Effective receptive span: adjacent taps sit dilation positions
+        # apart, so the span is dilation*(K-1)+1. dilation=1 reduces to the
+        # ordinary K-wide window.
+        effective = D * (K - 1) + 1
+        out_h = (H + 2 * P - effective) // S + 1
+        out_w = (W + 2 * P - effective) // S + 1
         if out_h <= 0 or out_w <= 0:
             raise ValueError("conv2d output dimensions must be positive")
         # Snapshot both operands at call time so later caller-side mutation
@@ -2927,21 +2933,22 @@ class Tensor:
         # result nor a pending backward pass.
         snapshot_x = list(x_data)
         snapshot_k = list(k_data)
-        # 2D cross-correlation: the kernel is never flipped. In ascending
-        # (or, oc, ir, ic) order, y[or*OW+oc] += x[j] * k[ir*K+ic] with
-        # j = (or*S+ir-P)*W + (oc*S+ic-P); out-of-range input positions
-        # (from padding) are skipped. A non-finite product or partial sum
-        # aborts before a result tensor exists, so no state can change.
+        # Dilated 2D cross-correlation: the kernel is never flipped. In
+        # ascending (or, oc, ir, ic) order, y[or*OW+oc] += x[j] * k[q] with
+        # j = (or*S+ir*D-P)*W + (oc*S+ic*D-P) and q = ir*K+ic; out-of-range
+        # input positions (from padding) are skipped. A non-finite product or
+        # partial sum aborts before a result tensor exists, so no state can
+        # change.
         out_data = [0.0] * (out_h * out_w)
         for orow in range(out_h):
             for ocol in range(out_w):
                 o = orow * out_w + ocol
                 for ir in range(K):
-                    row = orow * S + ir - P
+                    row = orow * S + ir * D - P
                     if not 0 <= row < H:
                         continue
                     for ic in range(K):
-                        col = ocol * S + ic - P
+                        col = ocol * S + ic * D - P
                         if not 0 <= col < W:
                             continue
                         j = row * W + col
@@ -2963,20 +2970,20 @@ class Tensor:
         def backward_fn(grad):
             # dx[j] += g[o]*k[q] and dk[q] += g[o]*x[j], accumulated from
             # 0.0 in the same ascending (or, oc, ir, ic) order as the
-            # forward pass and skipping out-of-range positions. A non-finite
-            # product or partial sum aborts the whole pass before any grad
-            # is written.
+            # forward pass (dilation and bounds unchanged) and skipping
+            # out-of-range positions. A non-finite product or partial sum
+            # aborts the whole pass before any grad is written.
             dx = [0.0] * (H * W)
             dk = [0.0] * (K * K)
             for orow in range(out_h):
                 for ocol in range(out_w):
                     g = grad[orow * out_w + ocol]
                     for ir in range(K):
-                        row = orow * S + ir - P
+                        row = orow * S + ir * D - P
                         if not 0 <= row < H:
                             continue
                         for ic in range(K):
-                            col = ocol * S + ic - P
+                            col = ocol * S + ic * D - P
                             if not 0 <= col < W:
                                 continue
                             j = row * W + col
