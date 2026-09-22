@@ -734,6 +734,136 @@ class Tensor:
             backward_fn,
         )
 
+    def linear_batch(self, weight, bias, batch_size):
+        if not isinstance(weight, Tensor):
+            raise TypeError("weight must be a Tensor")
+        if not isinstance(bias, Tensor):
+            raise TypeError("bias must be a Tensor")
+        # All three operands must hold non-empty 1D finite float lists;
+        # data may have been mutated after construction, so re-validate at
+        # call time. x is a B x n row-major batch, w the m x n row-major
+        # matrix and b the length-m bias, so m = len(bias).
+        x_data = _require_nonempty_float_vector(self, "linear_batch")
+        w_data = _require_nonempty_float_vector(weight, "linear_batch")
+        b_data = _require_nonempty_float_vector(bias, "linear_batch")
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+            raise TypeError("batch_size must be a positive int")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be a positive int")
+        if len(x_data) % batch_size != 0:
+            raise ValueError("batch_size must divide the input length")
+        B = batch_size
+        n = len(x_data) // B
+        m = len(b_data)
+        # weight stores the m x n matrix in row-major order.
+        if len(w_data) != m * n:
+            raise ValueError("linear_batch weight length must equal m * n")
+        # Snapshot all three operands so later caller-side mutation or
+        # replacement of any input can change neither the forward result
+        # nor a pending backward pass.
+        snapshot_x = list(x_data)
+        snapshot_w = list(w_data)
+        snapshot_b = list(b_data)
+        # out[q*m+o] = b[o] + sum_i x[q*n+i] * w[o*n+i], accumulated
+        # starting from b[o] in ascending (q, o, i) order; a non-finite
+        # product or partial sum aborts before a result tensor exists, so
+        # no state changes.
+        out_data = []
+        for q in range(B):
+            for o in range(m):
+                acc = snapshot_b[o]
+                for i in range(n):
+                    product = snapshot_x[q * n + i] * snapshot_w[o * n + i]
+                    if not math.isfinite(product):
+                        raise ValueError(
+                            "linear_batch intermediate must be finite"
+                        )
+                    acc += product
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "linear_batch intermediate must be finite"
+                        )
+                out_data.append(acc)
+        if not (
+            self.requires_grad
+            or weight.requires_grad
+            or bias.requires_grad
+        ):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_weight, parent_bias = self, weight, bias
+
+        def backward_fn(grad):
+            # h = grad[q*m+o]; db[o] += h, dx[q*n+i] += h*w[o*n+i] and
+            # dw[o*n+i] += h*x[q*n+i], accumulated from 0.0 in ascending
+            # (q, o, i) order. A non-finite product or partial sum aborts
+            # the whole pass before any grad is written.
+            dx = [0.0] * (B * n)
+            dw = [0.0] * (m * n)
+            db = [0.0] * m
+            for q in range(B):
+                for o in range(m):
+                    h = grad[q * m + o]
+                    db[o] = db[o] + h
+                    if not math.isfinite(db[o]):
+                        raise ValueError(
+                            "linear_batch backward intermediate must be"
+                            " finite"
+                        )
+                    for i in range(n):
+                        j = q * n + i
+                        t = o * n + i
+                        term_x = h * snapshot_w[t]
+                        if not math.isfinite(term_x):
+                            raise ValueError(
+                                "linear_batch backward intermediate must be"
+                                " finite"
+                            )
+                        dx[j] = dx[j] + term_x
+                        if not math.isfinite(dx[j]):
+                            raise ValueError(
+                                "linear_batch backward intermediate must be"
+                                " finite"
+                            )
+                        term_w = h * snapshot_x[j]
+                        if not math.isfinite(term_w):
+                            raise ValueError(
+                                "linear_batch backward intermediate must be"
+                                " finite"
+                            )
+                        dw[t] = dw[t] + term_w
+                        if not math.isfinite(dw[t]):
+                            raise ValueError(
+                                "linear_batch backward intermediate must be"
+                                " finite"
+                            )
+            # One object may play several roles (e.g. weight is also
+            # bias); merge such roles into one contribution per tensor,
+            # and submit only parents that require grad.
+            merged = {}
+            roles = (
+                (parent_self, dx),
+                (parent_weight, dw),
+                (parent_bias, db),
+            )
+            for parent, value in roles:
+                if not parent.requires_grad:
+                    continue
+                entry = merged.get(id(parent))
+                if entry is None:
+                    merged[id(parent)] = [parent, value]
+                else:
+                    combined = _merge_grad(entry[1], value)
+                    _ensure_finite_grad(combined)
+                    entry[1] = combined
+            return [(entry[0], entry[1]) for entry in merged.values()]
+
+        return Tensor._make(
+            out_data,
+            True,
+            (parent_self, parent_weight, parent_bias),
+            backward_fn,
+        )
+
     def mse_loss(self, target):
         if not isinstance(target, Tensor):
             raise TypeError("target must be a Tensor")
