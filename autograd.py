@@ -2074,6 +2074,69 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def relu(self):
+        # Re-validate at call time since the data may have been mutated
+        # after construction: a finite float scalar or a non-empty 1D
+        # float list. bools, ints, nested lists and other types are a
+        # TypeError; an empty list or any non-finite value is a ValueError.
+        data = _validate_data(self.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+
+        # Elementwise y = x for x >= 0.0 and 0.0 for x < 0.0, evaluated in
+        # ascending output-index order. A non-finite result aborts before a
+        # result tensor exists, so the input and every other state stays
+        # untouched on failure.
+        if isinstance(data, list):
+            out_data = []
+            for x in data:
+                y = x if x >= 0.0 else 0.0
+                if not math.isfinite(y):
+                    raise ValueError("relu result must be finite")
+                out_data.append(y)
+        else:
+            out_data = data if data >= 0.0 else 0.0
+            if not math.isfinite(out_data):
+                raise ValueError("relu result must be finite")
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # Snapshot the shape and the forward branch decision so later
+        # caller-side mutation or replacement of the input cannot change
+        # which branch a pending backward pass applies. x >= 0.0 (x == 0.0
+        # included) passes the gradient through; x < 0.0 blocks it.
+        if isinstance(data, list):
+            snapshot_shape = len(data)
+            snapshot_branch = [x >= 0.0 for x in data]
+        else:
+            snapshot_shape = ()
+            snapshot_branch = data >= 0.0
+
+        def backward_fn(grad):
+            # Elementwise dx = g on the x >= 0.0 branch and 0.0 on the
+            # x < 0.0 branch, in ascending index order; each intermediate
+            # is checked as it is produced, and the generic engine validates
+            # the contribution itself and every merge into an existing grad.
+            if isinstance(grad, list):
+                contribution = []
+                for i in range(snapshot_shape):
+                    value = grad[i] if snapshot_branch[i] else 0.0
+                    if not math.isfinite(value):
+                        raise ValueError(
+                            "relu backward intermediate must be finite"
+                        )
+                    contribution.append(value)
+            else:
+                value = grad if snapshot_branch else 0.0
+                if not math.isfinite(value):
+                    raise ValueError(
+                        "relu backward intermediate must be finite"
+                    )
+                contribution = value
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def tanh(self):
         out_data = _map_unary(self.data, math.tanh)
         _ensure_finite_data(out_data)
