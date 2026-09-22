@@ -634,6 +634,99 @@ class Tensor:
             out_data, True, (parent_self, parent_other), backward_fn
         )
 
+    def matmul(self, other, size):
+        if not isinstance(other, Tensor):
+            raise TypeError("other must be a Tensor")
+        if isinstance(size, bool) or not isinstance(size, int):
+            raise TypeError("size must be a positive int")
+        if size <= 0:
+            raise ValueError("size must be a positive int")
+        # Both operands must hold non-empty 1D finite float lists storing
+        # size x size matrices in row-major order; data may have been
+        # mutated after construction, so re-validate at call time.
+        a = _require_nonempty_float_vector(self, "matmul")
+        b = _require_nonempty_float_vector(other, "matmul")
+        expected = size * size
+        if len(a) != expected or len(b) != expected:
+            raise ValueError("matmul data length must equal size * size")
+        # Snapshot both operands so later caller-side mutation of either
+        # input list can change neither the result nor a pending backward.
+        snapshot_a = list(a)
+        snapshot_b = list(b)
+        # out[r*size+c] = sum_k a[r*size+k] * b[k*size+c], accumulated in
+        # ascending (r, c, k) order starting from 0.0; a non-finite product
+        # or partial sum aborts before a result tensor exists.
+        out_data = []
+        for r in range(size):
+            for c in range(size):
+                acc = 0.0
+                for k in range(size):
+                    product = (
+                        snapshot_a[r * size + k] * snapshot_b[k * size + c]
+                    )
+                    if not math.isfinite(product):
+                        raise ValueError("matmul intermediate must be finite")
+                    acc += product
+                    if not math.isfinite(acc):
+                        raise ValueError("matmul intermediate must be finite")
+                out_data.append(acc)
+        if not (self.requires_grad or other.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_other = self, other
+
+        def backward_fn(grad):
+            # da[r*size+k] += g[r*size+c] * b[k*size+c],
+            # db[k*size+c] += g[r*size+c] * a[r*size+k],
+            # accumulated from 0.0 in ascending (r, c, k) order. A
+            # non-finite product or partial sum aborts the whole pass
+            # before any grad is written.
+            da = [0.0] * expected
+            db = [0.0] * expected
+            for r in range(size):
+                for c in range(size):
+                    g_rc = grad[r * size + c]
+                    for k in range(size):
+                        term_a = g_rc * snapshot_b[k * size + c]
+                        if not math.isfinite(term_a):
+                            raise ValueError(
+                                "matmul backward intermediate must be finite"
+                            )
+                        da[r * size + k] = da[r * size + k] + term_a
+                        if not math.isfinite(da[r * size + k]):
+                            raise ValueError(
+                                "matmul backward intermediate must be finite"
+                            )
+                        term_b = g_rc * snapshot_a[r * size + k]
+                        if not math.isfinite(term_b):
+                            raise ValueError(
+                                "matmul backward intermediate must be finite"
+                            )
+                        db[k * size + c] = db[k * size + c] + term_b
+                        if not math.isfinite(db[k * size + c]):
+                            raise ValueError(
+                                "matmul backward intermediate must be finite"
+                            )
+            # One object may be both operands; merge the two roles into one
+            # contribution per tensor, and submit only parents that
+            # require grad.
+            merged = {}
+            roles = ((parent_self, da), (parent_other, db))
+            for parent, value in roles:
+                if not parent.requires_grad:
+                    continue
+                entry = merged.get(id(parent))
+                if entry is None:
+                    merged[id(parent)] = [parent, value]
+                else:
+                    combined = _merge_grad(entry[1], value)
+                    _ensure_finite_grad(combined)
+                    entry[1] = combined
+            return [(entry[0], entry[1]) for entry in merged.values()]
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_other), backward_fn
+        )
+
     def linear(self, weight, bias):
         if not isinstance(weight, Tensor):
             raise TypeError("weight must be a Tensor")
