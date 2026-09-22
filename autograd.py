@@ -3147,6 +3147,263 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def layer_norm_affine(self, weight, bias, eps=1e-5):
+        if not isinstance(weight, Tensor):
+            raise TypeError("weight must be a Tensor")
+        if not isinstance(bias, Tensor):
+            raise TypeError("bias must be a Tensor")
+        x_data = self.data
+        w_data = weight.data
+        b_data = bias.data
+        # All three operands must hold non-empty 1D float lists of equal
+        # length. data may have been mutated after construction, so every
+        # precondition is re-checked at call time; structural errors are
+        # ValueErrors and element-type errors TypeErrors.
+        for name, data in (
+            ("layer_norm_affine", x_data),
+            ("weight", w_data),
+            ("bias", b_data),
+        ):
+            if not isinstance(data, list) or len(data) == 0:
+                raise ValueError(
+                    name + " data must be a non-empty 1D float list"
+                )
+        n = len(x_data)
+        if len(w_data) != n or len(b_data) != n:
+            raise ValueError(
+                "layer_norm_affine data lists must all have equal length"
+            )
+        for name, tensor in (
+            ("layer_norm_affine", self),
+            ("weight", weight),
+            ("bias", bias),
+        ):
+            for value in tensor.data:
+                if isinstance(value, bool) or not isinstance(value, float):
+                    raise TypeError(name + " data elements must be floats")
+            if not isinstance(tensor.requires_grad, bool):
+                raise TypeError("requires_grad must be a bool")
+        for name, data in (
+            ("layer_norm_affine", x_data),
+            ("weight", w_data),
+            ("bias", b_data),
+        ):
+            for value in data:
+                if not math.isfinite(value):
+                    raise ValueError(name + " data elements must be finite")
+        if isinstance(eps, bool) or not isinstance(eps, float):
+            raise TypeError("eps must be a positive finite float")
+        if not math.isfinite(eps) or eps <= 0.0:
+            raise ValueError("eps must be a positive finite float")
+        # Snapshot all three operands so later caller-side mutation or
+        # replacement can change neither the forward result nor a pending
+        # backward pass.
+        x = list(x_data)
+        w = list(w_data)
+        b = list(b_data)
+        # Accumulate from 0.0 in ascending index order: mu = sum(x)/n,
+        # c_i = x_i - mu, v = sum(c_i*c_i)/n, r = 1/sqrt(v+eps),
+        # h_i = c_i*r, y_i = w_i*h_i + b_i. A non-finite intermediate
+        # aborts before a result tensor exists, so no state changes.
+        total = 0.0
+        for i in range(n):
+            total += x[i]
+            if not math.isfinite(total):
+                raise ValueError(
+                    "layer_norm_affine intermediate must be finite"
+                )
+        mu = total / n
+        if not math.isfinite(mu):
+            raise ValueError("layer_norm_affine intermediate must be finite")
+        centered = []
+        for i in range(n):
+            c_i = x[i] - mu
+            if not math.isfinite(c_i):
+                raise ValueError(
+                    "layer_norm_affine intermediate must be finite"
+                )
+            centered.append(c_i)
+        var_sum = 0.0
+        for i in range(n):
+            square = centered[i] * centered[i]
+            if not math.isfinite(square):
+                raise ValueError(
+                    "layer_norm_affine intermediate must be finite"
+                )
+            var_sum += square
+            if not math.isfinite(var_sum):
+                raise ValueError(
+                    "layer_norm_affine intermediate must be finite"
+                )
+        v = var_sum / n
+        if not math.isfinite(v):
+            raise ValueError("layer_norm_affine intermediate must be finite")
+        denom = v + eps
+        if not math.isfinite(denom):
+            raise ValueError("layer_norm_affine intermediate must be finite")
+        root = math.sqrt(denom)
+        if not math.isfinite(root):
+            raise ValueError("layer_norm_affine intermediate must be finite")
+        r = 1.0 / root
+        if not math.isfinite(r):
+            raise ValueError("layer_norm_affine intermediate must be finite")
+        normalized = []
+        for i in range(n):
+            h_i = centered[i] * r
+            if not math.isfinite(h_i):
+                raise ValueError(
+                    "layer_norm_affine intermediate must be finite"
+                )
+            normalized.append(h_i)
+        out_data = []
+        for i in range(n):
+            product = w[i] * normalized[i]
+            if not math.isfinite(product):
+                raise ValueError(
+                    "layer_norm_affine intermediate must be finite"
+                )
+            y_i = product + b[i]
+            if not math.isfinite(y_i):
+                raise ValueError(
+                    "layer_norm_affine intermediate must be finite"
+                )
+            out_data.append(y_i)
+        if not (
+            self.requires_grad
+            or weight.requires_grad
+            or bias.requires_grad
+        ):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_weight, parent_bias = self, weight, bias
+        # Save w, r and the normalized values with the graph so a pending
+        # backward pass is independent of any subsequent data mutation.
+        saved_w = w
+        saved_r = r
+        saved_h = normalized
+
+        def backward_fn(grad):
+            # u_i = g_i*w_i, U = sum(u_i), H = sum(u_i*h_i), accumulated
+            # from 0.0 in ascending index order; they feed
+            # dx_i = (r/n)*(n*u_i - U - h_i*H), dw_i = g_i*h_i, db_i = g_i.
+            # Only the sides that require grad are computed and submitted;
+            # a non-finite intermediate aborts the whole pass before any
+            # grad is written.
+            merged = {}
+            if parent_self.requires_grad:
+                u = []
+                U = 0.0
+                H = 0.0
+                for i in range(n):
+                    u_i = grad[i] * saved_w[i]
+                    if not math.isfinite(u_i):
+                        raise ValueError(
+                            "layer_norm_affine backward intermediate"
+                            " must be finite"
+                        )
+                    u.append(u_i)
+                    U += u_i
+                    if not math.isfinite(U):
+                        raise ValueError(
+                            "layer_norm_affine backward intermediate"
+                            " must be finite"
+                        )
+                    projection = u_i * saved_h[i]
+                    if not math.isfinite(projection):
+                        raise ValueError(
+                            "layer_norm_affine backward intermediate"
+                            " must be finite"
+                        )
+                    H += projection
+                    if not math.isfinite(H):
+                        raise ValueError(
+                            "layer_norm_affine backward intermediate"
+                            " must be finite"
+                        )
+                rn = saved_r / n
+                if not math.isfinite(rn):
+                    raise ValueError(
+                        "layer_norm_affine backward intermediate must"
+                        " be finite"
+                    )
+                dx = []
+                for i in range(n):
+                    scaled = n * u[i]
+                    if not math.isfinite(scaled):
+                        raise ValueError(
+                            "layer_norm_affine backward intermediate"
+                            " must be finite"
+                        )
+                    shifted = scaled - U
+                    if not math.isfinite(shifted):
+                        raise ValueError(
+                            "layer_norm_affine backward intermediate"
+                            " must be finite"
+                        )
+                    correction = saved_h[i] * H
+                    if not math.isfinite(correction):
+                        raise ValueError(
+                            "layer_norm_affine backward intermediate"
+                            " must be finite"
+                        )
+                    bracket = shifted - correction
+                    if not math.isfinite(bracket):
+                        raise ValueError(
+                            "layer_norm_affine backward intermediate"
+                            " must be finite"
+                        )
+                    dx_i = rn * bracket
+                    if not math.isfinite(dx_i):
+                        raise ValueError(
+                            "layer_norm_affine backward intermediate"
+                            " must be finite"
+                        )
+                    dx.append(dx_i)
+                merged[id(parent_self)] = [parent_self, dx]
+            if parent_weight.requires_grad:
+                dw = []
+                for i in range(n):
+                    dw_i = grad[i] * saved_h[i]
+                    if not math.isfinite(dw_i):
+                        raise ValueError(
+                            "layer_norm_affine backward intermediate"
+                            " must be finite"
+                        )
+                    dw.append(dw_i)
+                entry = merged.get(id(parent_weight))
+                if entry is None:
+                    merged[id(parent_weight)] = [parent_weight, dw]
+                else:
+                    combined = _merge_grad(entry[1], dw)
+                    _ensure_finite_grad(combined)
+                    entry[1] = combined
+            if parent_bias.requires_grad:
+                db = []
+                for i in range(n):
+                    db_i = grad[i]
+                    if not math.isfinite(db_i):
+                        raise ValueError(
+                            "layer_norm_affine backward intermediate"
+                            " must be finite"
+                        )
+                    db.append(db_i)
+                entry = merged.get(id(parent_bias))
+                if entry is None:
+                    merged[id(parent_bias)] = [parent_bias, db]
+                else:
+                    # One object playing several roles (e.g. weight is also
+                    # bias) receives one elementwise-merged contribution.
+                    combined = _merge_grad(entry[1], db)
+                    _ensure_finite_grad(combined)
+                    entry[1] = combined
+            return [(entry[0], entry[1]) for entry in merged.values()]
+
+        return Tensor._make(
+            out_data,
+            True,
+            (parent_self, parent_weight, parent_bias),
+            backward_fn,
+        )
+
     def l2_normalize(self, eps=1e-12):
         data = _require_nonempty_float_vector(self, "l2_normalize")
         if isinstance(eps, bool) or not isinstance(eps, float):
