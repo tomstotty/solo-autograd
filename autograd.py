@@ -2521,6 +2521,90 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def l2_normalize(self, eps=1e-12):
+        data = _require_nonempty_float_vector(self, "l2_normalize")
+        if isinstance(eps, bool) or not isinstance(eps, float):
+            raise TypeError("eps must be a positive finite float")
+        if not math.isfinite(eps) or eps <= 0.0:
+            raise ValueError("eps must be a positive finite float")
+        # Snapshot the input so later caller-side mutation or replacement
+        # can change neither the forward result nor a pending backward.
+        x = list(data)
+        # Accumulate the squared norm from 0.0 in ascending index order;
+        # a non-finite square or partial sum aborts before a result tensor
+        # exists, so no state can change on failure.
+        A = 0.0
+        for i in range(len(x)):
+            square = x[i] * x[i]
+            if not math.isfinite(square):
+                raise ValueError("l2_normalize intermediate must be finite")
+            A += square
+            if not math.isfinite(A):
+                raise ValueError("l2_normalize intermediate must be finite")
+        total = A + eps
+        if not math.isfinite(total):
+            raise ValueError("l2_normalize intermediate must be finite")
+        root = math.sqrt(total)
+        if not math.isfinite(root):
+            raise ValueError("l2_normalize intermediate must be finite")
+        r = 1.0 / root
+        if not math.isfinite(r):
+            raise ValueError("l2_normalize intermediate must be finite")
+        y = []
+        for i in range(len(x)):
+            y_i = x[i] * r
+            if not math.isfinite(y_i):
+                raise ValueError("l2_normalize intermediate must be finite")
+            y.append(y_i)
+        if not self.requires_grad:
+            return Tensor._make(y, False, (), None)
+        parent = self
+        # Save only the forward outputs r and y; both are freshly computed
+        # values, so mutating the input afterwards cannot change a pending
+        # backward pass.
+        saved_r = r
+        saved_y = y
+
+        def backward_fn(grad):
+            # C = sum_i grad_i * y_i accumulated from 0.0 in ascending
+            # index order; each intermediate is checked as it is produced.
+            C = 0.0
+            for i in range(len(saved_y)):
+                product = grad[i] * saved_y[i]
+                if not math.isfinite(product):
+                    raise ValueError(
+                        "l2_normalize backward intermediate must be finite"
+                    )
+                C += product
+                if not math.isfinite(C):
+                    raise ValueError(
+                        "l2_normalize backward intermediate must be finite"
+                    )
+            # dx_i = r * (grad_i - y_i * C): each term is checked in turn,
+            # and the generic engine validates the contribution itself and
+            # every merge into an existing grad.
+            contribution = []
+            for i in range(len(saved_y)):
+                projection = saved_y[i] * C
+                if not math.isfinite(projection):
+                    raise ValueError(
+                        "l2_normalize backward intermediate must be finite"
+                    )
+                diff = grad[i] - projection
+                if not math.isfinite(diff):
+                    raise ValueError(
+                        "l2_normalize backward intermediate must be finite"
+                    )
+                dx_i = saved_r * diff
+                if not math.isfinite(dx_i):
+                    raise ValueError(
+                        "l2_normalize backward intermediate must be finite"
+                    )
+                contribution.append(dx_i)
+            return [(parent, contribution)]
+
+        return Tensor._make(y, True, (parent,), backward_fn)
+
     def batch_norm(self, weight, bias, eps=1e-5):
         if not isinstance(weight, Tensor):
             raise TypeError("weight must be a Tensor")
