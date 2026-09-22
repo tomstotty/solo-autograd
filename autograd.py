@@ -5024,6 +5024,183 @@ class Adam:
         return None
 
 
+class MomentumSGD:
+    """Momentum SGD (optionally Nesterov) over a fixed list of Tensors."""
+
+    def __init__(self, parameters, lr, momentum=0.9, nesterov=False):
+        if not isinstance(parameters, list):
+            raise TypeError("parameters must be a non-empty list of Tensors")
+        if len(parameters) == 0:
+            raise ValueError("parameters must be non-empty")
+        for parameter in parameters:
+            if not isinstance(parameter, Tensor):
+                raise TypeError("parameters must contain only Tensors")
+        if len({id(parameter) for parameter in parameters}) != len(parameters):
+            raise ValueError("parameters must not contain duplicate Tensors")
+        for parameter in parameters:
+            if not isinstance(parameter.requires_grad, bool):
+                raise TypeError("requires_grad must be a bool")
+            _validate_data(parameter.data)
+        if isinstance(lr, bool) or not isinstance(lr, float):
+            raise TypeError("lr must be a positive finite float")
+        if not math.isfinite(lr) or lr <= 0.0:
+            raise ValueError("lr must be a positive finite float")
+        if isinstance(momentum, bool) or not isinstance(momentum, float):
+            raise TypeError(
+                "momentum must be a finite float in [0.0, 1.0)"
+            )
+        if not math.isfinite(momentum) or momentum < 0.0 or momentum >= 1.0:
+            raise ValueError(
+                "momentum must be a finite float in [0.0, 1.0)"
+            )
+        if not isinstance(nesterov, bool):
+            raise TypeError("nesterov must be a bool")
+        self.parameters = list(parameters)
+        self.lr = lr
+        self.momentum = momentum
+        self.nesterov = nesterov
+        self.velocity = [
+            self._zeros_like(parameter.data) for parameter in parameters
+        ]
+
+    @staticmethod
+    def _zeros_like(data):
+        if isinstance(data, list):
+            return [0.0 for _ in data]
+        return 0.0
+
+    def step(self):
+        # Revalidate every parameter and velocity slot plus every active
+        # grad first; compute all new values before mutating anything, so a
+        # failure leaves all data and velocity untouched.
+        if not isinstance(self.velocity, list):
+            raise TypeError("velocity must be a list of buffers")
+        if len(self.velocity) != len(self.parameters):
+            raise ValueError("velocity must have one buffer per parameter")
+        for index, parameter in enumerate(self.parameters):
+            if not isinstance(parameter.requires_grad, bool):
+                raise TypeError("requires_grad must be a bool")
+            data = _validate_data(parameter.data)
+            velocity = self.velocity[index]
+            self._check_buffer(velocity, data, "velocity")
+            if parameter.requires_grad and parameter.grad is not None:
+                self._check_grad(parameter.grad, data)
+        active = [
+            index
+            for index, parameter in enumerate(self.parameters)
+            if parameter.requires_grad and parameter.grad is not None
+        ]
+        if not active:
+            return None
+        updates = []
+        for index in active:
+            parameter = self.parameters[index]
+            updates.append(
+                (
+                    index,
+                    self._updated(
+                        parameter.data,
+                        parameter.grad,
+                        self.velocity[index],
+                    ),
+                )
+            )
+        for index, (new_data, new_velocity) in updates:
+            self.parameters[index].data = new_data
+            self.velocity[index] = new_velocity
+        return None
+
+    @staticmethod
+    def _check_buffer(buffer, data, name):
+        """Type/shape/finiteness check for a velocity buffer."""
+        if isinstance(data, list):
+            if not isinstance(buffer, list):
+                if isinstance(buffer, float) and not isinstance(buffer, bool):
+                    raise ValueError(
+                        name + " shape must match parameter shape"
+                    )
+                raise TypeError(name + " must be a list of floats")
+            if len(buffer) != len(data):
+                raise ValueError(name + " shape must match parameter shape")
+            for value in buffer:
+                if isinstance(value, bool) or not isinstance(value, float):
+                    raise TypeError(name + " elements must be floats")
+            for value in buffer:
+                if not math.isfinite(value):
+                    raise ValueError(name + " must be finite")
+        else:
+            if isinstance(buffer, list):
+                raise ValueError(name + " shape must match parameter shape")
+            if isinstance(buffer, bool) or not isinstance(buffer, float):
+                raise TypeError(name + " must be a float")
+            if not math.isfinite(buffer):
+                raise ValueError(name + " must be finite")
+
+    @staticmethod
+    def _check_grad(grad, data):
+        """Type/shape/finiteness check for an active parameter's grad."""
+        if isinstance(data, list):
+            if not isinstance(grad, list):
+                if isinstance(grad, float) and not isinstance(grad, bool):
+                    raise ValueError("grad shape must match tensor shape")
+                raise TypeError("grad must be a list of floats")
+            if len(grad) != len(data):
+                raise ValueError("grad shape must match tensor shape")
+            for value in grad:
+                if isinstance(value, bool) or not isinstance(value, float):
+                    raise TypeError("grad elements must be floats")
+            for value in grad:
+                if not math.isfinite(value):
+                    raise ValueError("grad must be finite")
+        else:
+            if isinstance(grad, list):
+                raise ValueError("grad shape must match tensor shape")
+            if isinstance(grad, bool) or not isinstance(grad, float):
+                raise TypeError("grad must be a float")
+            if not math.isfinite(grad):
+                raise ValueError("grad must be finite")
+
+    def _updated(self, data, grad, velocity):
+        """Compute (new_data, new_velocity) for one active parameter."""
+        if isinstance(data, list):
+            new_velocity = []
+            new_data = []
+            for value, g, v_value in zip(data, grad, velocity):
+                v_next = self.momentum * v_value + g
+                if not math.isfinite(v_next):
+                    raise ValueError("velocity buffer must be finite")
+                if self.nesterov:
+                    direction = g + self.momentum * v_next
+                else:
+                    direction = v_next
+                if not math.isfinite(direction):
+                    raise ValueError("update direction must be finite")
+                value_next = value - self.lr * direction
+                if not math.isfinite(value_next):
+                    raise ValueError("updated data must be finite")
+                new_velocity.append(v_next)
+                new_data.append(value_next)
+            return new_data, new_velocity
+        v_next = self.momentum * velocity + grad
+        if not math.isfinite(v_next):
+            raise ValueError("velocity buffer must be finite")
+        if self.nesterov:
+            direction = grad + self.momentum * v_next
+        else:
+            direction = v_next
+        if not math.isfinite(direction):
+            raise ValueError("update direction must be finite")
+        value_next = data - self.lr * direction
+        if not math.isfinite(value_next):
+            raise ValueError("updated data must be finite")
+        return value_next, v_next
+
+    def zero_grad(self):
+        for parameter in self.parameters:
+            parameter.grad = None
+        return None
+
+
 class AdamW:
     """AdamW optimizer over a fixed list of Tensors."""
 
