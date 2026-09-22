@@ -6474,6 +6474,121 @@ def gradcheck(fn, data, eps=1e-6, atol=1e-5):
     return (passed, max_abs_error)
 
 
+def jacobiancheck(fn, data, eps=1e-6, atol=1e-5):
+    """Compare analytic vector-Jacobian rows with central differences.
+
+    ``fn`` maps a finite float scalar or a non-empty 1D float-list
+    Tensor to a non-empty 1D float-list Tensor.  Each output row r is
+    obtained analytically by backpropagating a length-m one-hot float
+    list whose only 1.0 is at index r; each input column c is obtained
+    numerically from central differences with +/- eps perturbations.
+
+    Returns (passed, max_abs_error) where passed is True only when every
+    per-element absolute error is at most atol.  ``data`` is never
+    modified.
+    """
+    if not callable(fn):
+        raise TypeError("fn must be callable")
+    normalized = _validate_data(data)
+    if isinstance(eps, bool) or not isinstance(eps, float):
+        raise TypeError("eps must be a finite float")
+    if not math.isfinite(eps) or eps <= 0.0:
+        raise ValueError("eps must be a positive finite float")
+    if isinstance(atol, bool) or not isinstance(atol, float):
+        raise TypeError("atol must be a finite float")
+    if not math.isfinite(atol) or atol < 0.0:
+        raise ValueError("atol must be a non-negative finite float")
+
+    vector_input = isinstance(normalized, list)
+    base = list(normalized) if vector_input else [normalized]
+    n = len(base)
+
+    def check_output(result, expected_length):
+        if not isinstance(result, Tensor):
+            raise TypeError("fn must return a Tensor")
+        output = result.data
+        if not isinstance(output, list) or len(output) == 0:
+            raise ValueError("fn must return a non-empty 1D float list")
+        for value in output:
+            if isinstance(value, bool) or not isinstance(value, float):
+                raise TypeError("fn output elements must be floats")
+        if not all(math.isfinite(v) for v in output):
+            raise ValueError("fn output must be finite")
+        if expected_length is not None and len(output) != expected_length:
+            raise ValueError("fn output length must stay fixed")
+        return output
+
+    def check_input_grad(grad):
+        if grad is None:
+            raise ValueError("fn result is not connected to the input")
+        if isinstance(grad, bool) or (
+            not isinstance(grad, list) and not isinstance(grad, float)
+        ):
+            raise TypeError("input grad must be a float or a list of floats")
+        values = grad if isinstance(grad, list) else [grad]
+        return [_as_finite_float(value) for value in values]
+
+    def analytic_row(r, expected_length):
+        values = list(base) if vector_input else base[0]
+        tensor = Tensor(values, True)
+        result = fn(tensor)
+        output = check_output(result, expected_length)
+        if not result._parents:
+            raise ValueError("fn result must be part of a graph")
+        one_hot = [0.0] * len(output)
+        one_hot[r] = 1.0
+        result.backward(one_hot)
+        row = check_input_grad(tensor.grad)
+        if len(row) != n:
+            raise ValueError("input grad shape must match the input")
+        return row, len(output)
+
+    # The first call fixes the output length m and supplies row 0; each
+    # remaining row rebuilds the graph from a fresh input Tensor.
+    row0, m = analytic_row(0, None)
+    analytic = [row0]
+    for r in range(1, m):
+        analytic.append(analytic_row(r, m)[0])
+
+    # Central differences fill the numeric Jacobian one input column at
+    # a time, using requires_grad False Tensors.
+    two_eps = 2.0 * eps
+    numeric = [[0.0] * n for _ in range(m)]
+    for c in range(n):
+        plus = list(base)
+        minus = list(base)
+        plus[c] = base[c] + eps
+        minus[c] = base[c] - eps
+        if not math.isfinite(plus[c]) or not math.isfinite(minus[c]):
+            raise ValueError("jacobiancheck intermediate must be finite")
+        plus_arg = plus if vector_input else plus[0]
+        minus_arg = minus if vector_input else minus[0]
+        out_plus = check_output(fn(Tensor(plus_arg, False)), m)
+        out_minus = check_output(fn(Tensor(minus_arg, False)), m)
+        for r in range(m):
+            difference = out_plus[r] - out_minus[r]
+            if not math.isfinite(difference):
+                raise ValueError("jacobiancheck intermediate must be finite")
+            value = difference / two_eps
+            if not math.isfinite(value):
+                raise ValueError("jacobiancheck intermediate must be finite")
+            numeric[r][c] = value
+
+    # Compare in row-major order so the reported maximum is deterministic.
+    max_abs_error = 0.0
+    passed = True
+    for r in range(m):
+        for c in range(n):
+            error = abs(analytic[r][c] - numeric[r][c])
+            if not math.isfinite(error):
+                raise ValueError("jacobiancheck intermediate must be finite")
+            if error > max_abs_error:
+                max_abs_error = error
+            if error > atol:
+                passed = False
+    return (passed, max_abs_error)
+
+
 def clip_grad_norm_(parameters, max_norm, eps=1e-12):
     """Clip the total gradient norm of a list of Tensors in place.
 
