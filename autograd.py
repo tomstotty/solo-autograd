@@ -2592,6 +2592,44 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def topk(self, k):
+        data = _require_nonempty_float_vector(self, "topk")
+        if isinstance(k, bool) or not isinstance(k, int):
+            raise TypeError("k must be a non-bool int")
+        n = len(data)
+        if k < 1 or k > n:
+            raise ValueError("k must satisfy 1 <= k <= len(data)")
+        # Rank every index by value descending, breaking ties by ascending
+        # original index, and keep the first k.
+        selected = sorted(range(n), key=lambda i: (-data[i], i))[:k]
+        # The values tensor holds copies of the selected values; indices is
+        # a fresh list the caller may mutate freely.
+        out_data = [data[i] for i in selected]
+        indices = list(selected)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None), indices
+        parent = self
+        # Snapshot the original length and the selected indices so later
+        # caller-side mutation of self.data or of the returned indices
+        # cannot change what a pending backward pass will scatter.
+        snapshot_n = n
+        snapshot_indices = list(selected)
+
+        def backward_fn(grad):
+            # Scatter grad onto a zero list of the original length in
+            # ascending output-index order; a non-finite accumulation
+            # aborts the whole pass before any grad is written.
+            dx = [0.0] * snapshot_n
+            for o in range(len(snapshot_indices)):
+                dx[snapshot_indices[o]] += grad[o]
+                if not math.isfinite(dx[snapshot_indices[o]]):
+                    raise ValueError(
+                        "topk backward intermediate must be finite"
+                    )
+            return [(parent, dx)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn), indices
+
     def zero_grad(self):
         self.grad = None
         return None
