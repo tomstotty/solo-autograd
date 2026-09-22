@@ -1288,6 +1288,88 @@ class Tensor:
             out_data, True, (parent_self, parent_other), backward_fn
         )
 
+    def l2_normalize(self, eps=1e-12):
+        data = _require_nonempty_float_vector(self, "l2_normalize")
+        if isinstance(eps, bool) or not isinstance(eps, float):
+            raise TypeError("eps must be a positive finite float")
+        if not math.isfinite(eps) or eps <= 0.0:
+            raise ValueError("eps must be a positive finite float")
+        # Accumulate the squared norm A from 0.0 in ascending index order,
+        # multiplying before adding at each index, then scale by
+        # r = 1.0/sqrt(A + eps). A non-finite square, partial sum, scale
+        # or output aborts before a result tensor exists, so no state can
+        # change on failure.
+        A = 0.0
+        for i in range(len(data)):
+            square = data[i] * data[i]
+            if not math.isfinite(square):
+                raise ValueError("l2_normalize intermediate must be finite")
+            A += square
+            if not math.isfinite(A):
+                raise ValueError("l2_normalize intermediate must be finite")
+        denom = A + eps
+        if not math.isfinite(denom):
+            raise ValueError("l2_normalize intermediate must be finite")
+        root = math.sqrt(denom)
+        if not math.isfinite(root):
+            raise ValueError("l2_normalize intermediate must be finite")
+        r = 1.0 / root
+        if not math.isfinite(r):
+            raise ValueError("l2_normalize intermediate must be finite")
+        out_data = []
+        for i in range(len(data)):
+            y_i = data[i] * r
+            if not math.isfinite(y_i):
+                raise ValueError("l2_normalize intermediate must be finite")
+            out_data.append(y_i)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # Save r and the forward output with the graph so later caller-side
+        # mutation or replacement of the input cannot change a pending
+        # backward pass.
+        saved_r = r
+        snapshot_y = list(out_data)
+
+        def backward_fn(grad):
+            # C = sum_i grad[i]*y[i], accumulated from 0.0 in ascending
+            # index order; dx[i] = r*(grad[i] - y[i]*C). A non-finite
+            # intermediate aborts the whole pass before any grad is
+            # written.
+            C = 0.0
+            for i in range(len(snapshot_y)):
+                product = grad[i] * snapshot_y[i]
+                if not math.isfinite(product):
+                    raise ValueError(
+                        "l2_normalize backward intermediate must be finite"
+                    )
+                C += product
+                if not math.isfinite(C):
+                    raise ValueError(
+                        "l2_normalize backward intermediate must be finite"
+                    )
+            contribution = []
+            for i in range(len(snapshot_y)):
+                scaled = snapshot_y[i] * C
+                if not math.isfinite(scaled):
+                    raise ValueError(
+                        "l2_normalize backward intermediate must be finite"
+                    )
+                diff = grad[i] - scaled
+                if not math.isfinite(diff):
+                    raise ValueError(
+                        "l2_normalize backward intermediate must be finite"
+                    )
+                dx_i = saved_r * diff
+                if not math.isfinite(dx_i):
+                    raise ValueError(
+                        "l2_normalize backward intermediate must be finite"
+                    )
+                contribution.append(dx_i)
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def sigmoid(self):
         # Re-validate at call time since the data may have been mutated
         # after construction: a finite float scalar or a non-empty 1D
