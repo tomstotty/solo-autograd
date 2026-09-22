@@ -4768,6 +4768,81 @@ def xavier_uniform(length, fan_in, fan_out, seed=0, requires_grad=True):
     return Tensor(data, requires_grad)
 
 
+def orthogonal(size, seed=0, gain=1.0, requires_grad=True):
+    """Return a leaf Tensor holding a deterministic orthogonal square matrix.
+
+    A `size` x `size` matrix of uniform samples in [-1.0, 1.0) is drawn from
+    a local LCG seeded by `seed` (no global random state is touched) and then
+    orthogonalized with modified Gram-Schmidt. The result is flattened in
+    row-major order and scaled by `gain`. TypeError on bad argument types,
+    ValueError on out-of-range arguments, a zero norm during orthogonalization,
+    or a non-finite intermediate.
+    """
+    if isinstance(size, bool) or not isinstance(size, int):
+        raise TypeError("size must be a positive int")
+    if size <= 0:
+        raise ValueError("size must be a positive int")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise TypeError("seed must be an integer between 0 and 4294967295")
+    if seed < 0 or seed > 4294967295:
+        raise ValueError("seed must be an integer between 0 and 4294967295")
+    if isinstance(gain, bool) or not isinstance(gain, float):
+        raise TypeError("gain must be a positive finite float")
+    if not math.isfinite(gain) or gain <= 0.0:
+        raise ValueError("gain must be a positive finite float")
+    if not isinstance(requires_grad, bool):
+        raise TypeError("requires_grad must be a bool")
+    # Fill A in ascending (r, c) order from a local LCG stream.
+    raw = [[0.0] * size for _ in range(size)]
+    s = seed
+    for r in range(size):
+        for c in range(size):
+            s = (1664525 * s + 1013904223) % 4294967296
+            u = s / 4294967296.0
+            value = 2.0 * u - 1.0
+            if not (math.isfinite(u) and math.isfinite(value)):
+                raise ValueError("orthogonal intermediate must be finite")
+            raw[r][c] = value
+    # Modified Gram-Schmidt over columns in ascending c order.
+    q = [[0.0] * size for _ in range(size)]
+    for c in range(size):
+        v = [raw[r][c] for r in range(size)]
+        for j in range(c):
+            d = 0.0
+            for r in range(size):
+                d += q[r][j] * v[r]
+                if not math.isfinite(d):
+                    raise ValueError("orthogonal intermediate must be finite")
+            for r in range(size):
+                v[r] -= d * q[r][j]
+                if not math.isfinite(v[r]):
+                    raise ValueError("orthogonal intermediate must be finite")
+        h = 0.0
+        for r in range(size):
+            h += v[r] * v[r]
+            if not math.isfinite(h):
+                raise ValueError("orthogonal intermediate must be finite")
+        n = math.sqrt(h)
+        if not math.isfinite(n):
+            raise ValueError("orthogonal intermediate must be finite")
+        if n == 0.0:
+            raise ValueError("orthogonal orthogonalization produced a zero vector")
+        for r in range(size):
+            normalized = v[r] / n
+            if not math.isfinite(normalized):
+                raise ValueError("orthogonal intermediate must be finite")
+            q[r][c] = normalized
+    # Flatten in row-major order while applying the gain.
+    data = []
+    for r in range(size):
+        for c in range(size):
+            value = gain * q[r][c]
+            if not math.isfinite(value):
+                raise ValueError("orthogonal result must be finite")
+            data.append(value)
+    return Tensor(data, requires_grad)
+
+
 class SGD:
     """Stochastic gradient descent over a fixed list of Tensors."""
 
