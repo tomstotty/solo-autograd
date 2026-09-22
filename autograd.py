@@ -2349,7 +2349,7 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
-    def avg_pool1d(self, kernel_size, stride=None):
+    def avg_pool1d(self, kernel_size, stride=None, padding=0, dilation=1):
         data = _require_nonempty_float_vector(self, "avg_pool1d")
         if isinstance(kernel_size, bool) or not isinstance(kernel_size, int):
             raise TypeError("kernel_size must be a positive int")
@@ -2361,19 +2361,35 @@ class Tensor:
             raise TypeError("stride must be a positive int")
         elif stride <= 0:
             raise ValueError("stride must be a positive int")
+        if isinstance(padding, bool) or not isinstance(padding, int):
+            raise TypeError("padding must be a non-negative int")
+        if padding < 0:
+            raise ValueError("padding must be a non-negative int")
+        if isinstance(dilation, bool) or not isinstance(dilation, int):
+            raise TypeError("dilation must be a positive int")
+        if dilation <= 0:
+            raise ValueError("dilation must be a positive int")
         n = len(data)
         k = kernel_size
         s = stride
-        out_len = (n - k) // s + 1
+        p = padding
+        d = dilation
+        out_len = (n + 2 * p - d * (k - 1) - 1) // s + 1
         if out_len <= 0:
             raise ValueError("avg_pool1d output length must be positive")
+        # Out-of-range input positions (from padding) contribute 0.0 to the
+        # sum but still count toward the fixed denominator k.
         out_data = []
         for o in range(out_len):
             acc = 0.0
             for i in range(k):
-                acc += data[o * s + i]
-                if not math.isfinite(acc):
-                    raise ValueError("avg_pool1d intermediate must be finite")
+                j = o * s + i * d - p
+                if 0 <= j < n:
+                    acc += data[j]
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "avg_pool1d intermediate must be finite"
+                        )
             mean = acc / k
             if not math.isfinite(mean):
                 raise ValueError("avg_pool1d intermediate must be finite")
@@ -2388,16 +2404,20 @@ class Tensor:
             dx = [0.0] * n
             for o in range(out_len):
                 for i in range(k):
-                    share = grad[o] / k
-                    if not math.isfinite(share):
-                        raise ValueError(
-                            "avg_pool1d backward intermediate must be finite"
-                        )
-                    dx[o * s + i] += share
-                    if not math.isfinite(dx[o * s + i]):
-                        raise ValueError(
-                            "avg_pool1d backward intermediate must be finite"
-                        )
+                    j = o * s + i * d - p
+                    if 0 <= j < n:
+                        share = grad[o] / k
+                        if not math.isfinite(share):
+                            raise ValueError(
+                                "avg_pool1d backward intermediate "
+                                "must be finite"
+                            )
+                        dx[j] += share
+                        if not math.isfinite(dx[j]):
+                            raise ValueError(
+                                "avg_pool1d backward intermediate "
+                                "must be finite"
+                            )
             return [(parent, dx)]
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
