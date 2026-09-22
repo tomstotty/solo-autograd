@@ -634,6 +634,106 @@ class Tensor:
             out_data, True, (parent_self, parent_other), backward_fn
         )
 
+    def linear(self, weight, bias):
+        if not isinstance(weight, Tensor):
+            raise TypeError("weight must be a Tensor")
+        if not isinstance(bias, Tensor):
+            raise TypeError("bias must be a Tensor")
+        # All three operands must hold non-empty 1D finite float lists;
+        # data may have been mutated after construction, so re-validate at
+        # call time. bias doubles as the output descriptor: m = len(bias).
+        x_data = _require_nonempty_float_vector(self, "linear")
+        w_data = _require_nonempty_float_vector(weight, "linear")
+        b_data = _require_nonempty_float_vector(bias, "linear")
+        n = len(x_data)
+        m = len(b_data)
+        # weight stores the m x n matrix in row-major order.
+        if len(w_data) != m * n:
+            raise ValueError("linear weight length must equal m * n")
+        # Snapshot all three operands so later caller-side mutation or
+        # replacement of any input can change neither the forward result
+        # nor a pending backward pass.
+        snapshot_x = list(x_data)
+        snapshot_w = list(w_data)
+        snapshot_b = list(b_data)
+        # out[o] = b[o] + sum_i x[i] * w[o*n+i], accumulated starting from
+        # b[o] in ascending (o, i) order; a non-finite product or partial
+        # sum aborts before a result tensor exists, so no state changes.
+        out_data = []
+        for o in range(m):
+            acc = snapshot_b[o]
+            for i in range(n):
+                product = snapshot_x[i] * snapshot_w[o * n + i]
+                if not math.isfinite(product):
+                    raise ValueError("linear intermediate must be finite")
+                acc += product
+                if not math.isfinite(acc):
+                    raise ValueError("linear intermediate must be finite")
+            out_data.append(acc)
+        if not (
+            self.requires_grad
+            or weight.requires_grad
+            or bias.requires_grad
+        ):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_weight, parent_bias = self, weight, bias
+
+        def backward_fn(grad):
+            # dx[i] += g[o]*w[o*n+i], dw[o*n+i] = g[o]*x[i], db[o] = g[o],
+            # evaluated in ascending (o, i) order. A non-finite product or
+            # partial sum aborts the whole pass before any grad is written.
+            dx = [0.0] * n
+            dw = [0.0] * (m * n)
+            db = [0.0] * m
+            for o in range(m):
+                go = grad[o]
+                db[o] = go
+                for i in range(n):
+                    term_x = go * snapshot_w[o * n + i]
+                    if not math.isfinite(term_x):
+                        raise ValueError(
+                            "linear backward intermediate must be finite"
+                        )
+                    dx[i] = dx[i] + term_x
+                    if not math.isfinite(dx[i]):
+                        raise ValueError(
+                            "linear backward intermediate must be finite"
+                        )
+                    term_w = go * snapshot_x[i]
+                    if not math.isfinite(term_w):
+                        raise ValueError(
+                            "linear backward intermediate must be finite"
+                        )
+                    dw[o * n + i] = term_w
+            # One object may play several roles (e.g. weight is also bias);
+            # merge such roles into one contribution per tensor, and submit
+            # only parents that require grad. Role shapes agree whenever
+            # the objects coincide, since len(w) = m*n then equals n or m.
+            merged = {}
+            roles = (
+                (parent_self, dx),
+                (parent_weight, dw),
+                (parent_bias, db),
+            )
+            for parent, value in roles:
+                if not parent.requires_grad:
+                    continue
+                entry = merged.get(id(parent))
+                if entry is None:
+                    merged[id(parent)] = [parent, value]
+                else:
+                    combined = _merge_grad(entry[1], value)
+                    _ensure_finite_grad(combined)
+                    entry[1] = combined
+            return [(entry[0], entry[1]) for entry in merged.values()]
+
+        return Tensor._make(
+            out_data,
+            True,
+            (parent_self, parent_weight, parent_bias),
+            backward_fn,
+        )
+
     def mse_loss(self, target):
         if not isinstance(target, Tensor):
             raise TypeError("target must be a Tensor")
