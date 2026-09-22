@@ -3376,6 +3376,63 @@ class Tensor:
         out = Tensor._make(out_data, True, (parent,), backward_fn)
         return out, indices
 
+    def embedding(self, indices, dim):
+        """Differentiable embedding-table lookup.
+
+        ``self.data`` is a flattened table of ``len(data) // dim`` rows, each
+        holding ``dim`` floats. The result concatenates the rows selected by
+        ``indices`` in order, giving a list of ``len(indices) * dim`` values.
+        When self requires grad, a single-parent graph is built with private
+        snapshots of the indices, ``dim`` and the original table length, so
+        later mutation of the indices list or of self.data cannot change a
+        pending backward pass.
+        """
+        data = _require_nonempty_float_vector(self, "embedding")
+        if isinstance(dim, bool) or not isinstance(dim, int):
+            raise TypeError("dim must be a non-bool positive int")
+        if dim < 1:
+            raise ValueError("dim must be a positive int")
+        n = len(data)
+        if n % dim != 0:
+            raise ValueError("len(data) must be divisible by dim")
+        if not isinstance(indices, list):
+            raise TypeError("indices must be a list of non-bool ints")
+        for index in indices:
+            if isinstance(index, bool) or not isinstance(index, int):
+                raise TypeError("indices elements must be non-bool ints")
+        if len(indices) == 0:
+            raise ValueError("indices must be non-empty")
+        rows = n // dim
+        for index in indices:
+            if index < 0 or index >= rows:
+                raise ValueError("embedding index out of range")
+        # Snapshot indices so later caller-side mutation of the list cannot
+        # change a pending backward pass.
+        snapshot = list(indices)
+        out_data = []
+        for index in snapshot:
+            start = index * dim
+            out_data.extend(data[start:start + dim])
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        length = n
+
+        def backward_fn(grad):
+            dx = [0.0] * length
+            for o in range(len(snapshot)):
+                base = snapshot[o] * dim
+                for d in range(dim):
+                    pos = base + d
+                    dx[pos] += grad[o * dim + d]
+                    if not math.isfinite(dx[pos]):
+                        raise ValueError(
+                            "embedding backward intermediate must be finite"
+                        )
+            return [(parent, dx)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def zero_grad(self):
         self.grad = None
         return None
