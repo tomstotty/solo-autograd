@@ -3376,6 +3376,61 @@ class Tensor:
         out = Tensor._make(out_data, True, (parent,), backward_fn)
         return out, indices
 
+    def embedding(self, indices, dim):
+        data = _require_nonempty_float_vector(self, "embedding")
+        if isinstance(dim, bool) or not isinstance(dim, int):
+            raise TypeError("dim must be a positive int")
+        if dim <= 0:
+            raise ValueError("dim must be a positive int")
+        # data stores the embedding table as len(data) // dim rows of dim
+        # values each, laid out row by row.
+        if len(data) % dim != 0:
+            raise ValueError("embedding data length must be a multiple of dim")
+        if not isinstance(indices, list):
+            raise TypeError("indices must be a list of non-bool ints")
+        for index in indices:
+            if isinstance(index, bool) or not isinstance(index, int):
+                raise TypeError("indices elements must be non-bool ints")
+        if len(indices) == 0:
+            raise ValueError("indices must be non-empty")
+        rows = len(data) // dim
+        for index in indices:
+            if index < 0 or index >= rows:
+                raise ValueError("embedding index out of range")
+        # Snapshot the indices, dim and the original data length so later
+        # caller-side mutation of the indices list or of self.data cannot
+        # change what a pending backward pass will scatter.
+        snapshot = list(indices)
+        length = len(data)
+        # Concatenate the dim values of row indices[o] for each output row
+        # o in ascending (o, d) order.
+        out_data = []
+        for index in snapshot:
+            base = index * dim
+            for d in range(dim):
+                out_data.append(data[base + d])
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+
+        def backward_fn(grad):
+            # dx[indices[o]*dim+d] += grad[o*dim+d], accumulated from 0.0
+            # in ascending (o, d) order; repeated indices accumulate. A
+            # non-finite partial sum aborts the whole pass before any grad
+            # is written.
+            dx = [0.0] * length
+            for o in range(len(snapshot)):
+                base = snapshot[o] * dim
+                for d in range(dim):
+                    dx[base + d] += grad[o * dim + d]
+                    if not math.isfinite(dx[base + d]):
+                        raise ValueError(
+                            "embedding backward intermediate must be finite"
+                        )
+            return [(parent, dx)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def zero_grad(self):
         self.grad = None
         return None
