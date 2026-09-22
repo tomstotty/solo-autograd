@@ -2801,6 +2801,130 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def cross_entropy_batch(self, targets, classes):
+        data = _require_nonempty_float_vector(
+            self, "cross_entropy_batch"
+        )
+        if isinstance(classes, bool) or not isinstance(classes, int):
+            raise TypeError("classes must be a positive int")
+        if classes <= 0:
+            raise ValueError("classes must be a positive int")
+        n = len(data)
+        if n % classes != 0:
+            raise ValueError(
+                "data length must be divisible by classes"
+            )
+        batch = n // classes
+        if not isinstance(targets, list):
+            raise TypeError("targets must be a list of non-bool ints")
+        if len(targets) != batch:
+            raise ValueError("targets length must equal the batch size")
+        for target in targets:
+            if isinstance(target, bool) or not isinstance(target, int):
+                raise TypeError("targets must contain only non-bool ints")
+        for target in targets:
+            if target < 0 or target >= classes:
+                raise ValueError("target indices must lie in [0, classes)")
+        # Snapshot the input and targets at call time so later caller-side
+        # mutation or replacement can change neither the forward result nor
+        # a pending backward pass.
+        x = list(data)
+        snapshot_targets = list(targets)
+        # Per-row stable log-softmax in ascending index order: for each row
+        # m = max(x), z_i = exp(x_i - m), s = sum(z),
+        # l_i = x_i - m - log(s). exp is only ever evaluated on values in
+        # (-inf, 0]. A non-finite intermediate aborts before a result
+        # tensor exists, so no state can change on failure.
+        l = []
+        for b in range(batch):
+            start = b * classes
+            row = x[start:start + classes]
+            m = max(row)
+            s = 0.0
+            row_l = []
+            for x_i in row:
+                diff = x_i - m
+                if not math.isfinite(diff):
+                    raise ValueError(
+                        "cross_entropy_batch intermediate must be finite"
+                    )
+                z_i = math.exp(diff)
+                if not math.isfinite(z_i):
+                    raise ValueError(
+                        "cross_entropy_batch intermediate must be finite"
+                    )
+                s += z_i
+                if not math.isfinite(s):
+                    raise ValueError(
+                        "cross_entropy_batch intermediate must be finite"
+                    )
+            log_s = math.log(s)
+            if not math.isfinite(log_s):
+                raise ValueError(
+                    "cross_entropy_batch intermediate must be finite"
+                )
+            for x_i in row:
+                l_i = x_i - m - log_s
+                if not math.isfinite(l_i):
+                    raise ValueError(
+                        "cross_entropy_batch intermediate must be finite"
+                    )
+                row_l.append(l_i)
+            l.extend(row_l)
+        # Mean loss = (1/B) * sum_b -l_{b, target_b}, accumulating
+        # -l_target into a running total starting at 0.0 in row order.
+        total = 0.0
+        for b in range(batch):
+            contribution = -l[b * classes + snapshot_targets[b]]
+            total += contribution
+            if not math.isfinite(total):
+                raise ValueError(
+                    "cross_entropy_batch intermediate must be finite"
+                )
+        out_data = total / batch
+        if not math.isfinite(out_data):
+            raise ValueError(
+                "cross_entropy_batch intermediate must be finite"
+            )
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        snapshot_l = l
+
+        def backward_fn(grad):
+            # dx_i = g * (exp(l_i) - 1[i is the row target]) / B; exp is
+            # only evaluated on l_i <= 0. Each intermediate is checked as
+            # it is produced, and the generic engine validates the
+            # contribution itself and every merge into an existing grad.
+            dx = []
+            for i in range(n):
+                b = i // classes
+                e_i = math.exp(snapshot_l[i])
+                if not math.isfinite(e_i):
+                    raise ValueError(
+                        "cross_entropy_batch backward intermediate"
+                        " must be finite"
+                    )
+                indicator = (
+                    1.0 if i % classes == snapshot_targets[b] else 0.0
+                )
+                difference = e_i - indicator
+                if not math.isfinite(difference):
+                    raise ValueError(
+                        "cross_entropy_batch backward intermediate"
+                        " must be finite"
+                    )
+                value = grad * difference / batch
+                if not math.isfinite(value):
+                    raise ValueError(
+                        "cross_entropy_batch backward intermediate"
+                        " must be finite"
+                    )
+                dx.append(value)
+            return [(parent, dx)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def soft_cross_entropy(self, target):
         if not isinstance(target, Tensor):
             raise TypeError("target must be a Tensor")
@@ -6590,7 +6714,7 @@ def jacobiancheck(fn, data, eps=1e-6, atol=1e-5):
 
     def check_input_grad(grad):
         if grad is None:
-            raise ValueError("fn result is not connected to the input")
+            raise TypeError("fn result is not connected to the input")
         if vector_input:
             if not isinstance(grad, list):
                 raise TypeError("input grad must be a list of floats")
