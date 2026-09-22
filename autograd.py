@@ -634,6 +634,52 @@ class Tensor:
             out_data, True, (parent_self, parent_other), backward_fn
         )
 
+    def concat(self, other):
+        if not isinstance(other, Tensor):
+            raise TypeError("other must be a Tensor")
+        a = _require_nonempty_float_vector(self, "concat")
+        b = _require_nonempty_float_vector(other, "concat")
+        # Copy both operands at call time in call order so later
+        # caller-side mutation or replacement of either input can change
+        # neither the forward result nor a pending backward pass.
+        snapshot_a = list(a)
+        snapshot_b = list(b)
+        len_a = len(snapshot_a)
+        len_b = len(snapshot_b)
+        out_data = snapshot_a + snapshot_b
+        if not (self.requires_grad or other.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_other = self, other
+
+        def backward_fn(grad):
+            # Outputs 0..len_a-1 came from self and len_a..len_a+len_b-1
+            # from other; split the upstream gradient at that boundary in
+            # ascending output-index order. grad was already validated
+            # finite, so each slice is finite; only merging the two roles
+            # of one shared tensor can produce a non-finite value.
+            roles = []
+            if parent_self.requires_grad:
+                roles.append((parent_self, list(grad[:len_a])))
+            if parent_other.requires_grad:
+                roles.append((parent_other, list(grad[len_a:])))
+            # The same object may play both roles; merge such roles into
+            # one contribution per tensor, and submit only parents that
+            # require grad.
+            merged = {}
+            for parent, value in roles:
+                entry = merged.get(id(parent))
+                if entry is None:
+                    merged[id(parent)] = [parent, value]
+                else:
+                    combined = _merge_grad(entry[1], value)
+                    _ensure_finite_grad(combined)
+                    entry[1] = combined
+            return [(entry[0], entry[1]) for entry in merged.values()]
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_other), backward_fn
+        )
+
     def matmul(self, other, size):
         if not isinstance(other, Tensor):
             raise TypeError("other must be a Tensor")
