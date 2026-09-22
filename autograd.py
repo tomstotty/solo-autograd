@@ -634,6 +634,50 @@ class Tensor:
             out_data, True, (parent_self, parent_other), backward_fn
         )
 
+    def concat(self, other):
+        if not isinstance(other, Tensor):
+            raise TypeError("other must be a Tensor")
+        a = _require_nonempty_float_vector(self, "concat")
+        b = _require_nonempty_float_vector(other, "concat")
+        # Copy both operands at call time in argument order so later
+        # caller-side mutation or replacement of either input can change
+        # neither the forward result nor a pending backward pass.
+        snapshot_a = list(a)
+        snapshot_b = list(b)
+        len_a = len(snapshot_a)
+        len_b = len(snapshot_b)
+        out_data = snapshot_a + snapshot_b
+        if not (self.requires_grad or other.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_other = self, other
+
+        def backward_fn(grad):
+            # Split the incoming gradient by ascending output index: the
+            # first len_a entries are the self contribution, the remaining
+            # len_b entries the other contribution. Only sides that require
+            # grad are submitted; the same object playing both roles merges
+            # into one contribution added element by element.
+            merged = {}
+            roles = (
+                (parent_self, grad[:len_a]),
+                (parent_other, grad[len_a:]),
+            )
+            for parent, value in roles:
+                if not parent.requires_grad:
+                    continue
+                entry = merged.get(id(parent))
+                if entry is None:
+                    merged[id(parent)] = [parent, value]
+                else:
+                    combined = _merge_grad(entry[1], value)
+                    _ensure_finite_grad(combined)
+                    entry[1] = combined
+            return [(entry[0], entry[1]) for entry in merged.values()]
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_other), backward_fn
+        )
+
     def matmul(self, other, size):
         if not isinstance(other, Tensor):
             raise TypeError("other must be a Tensor")
