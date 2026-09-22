@@ -2437,6 +2437,115 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def norm(self, p=2.0):
+        data = _require_nonempty_float_vector(self, "norm")
+        # p is a finite float strictly greater than zero; bools, ints and
+        # any other type are a TypeError, a non-finite or non-positive
+        # float is a ValueError.
+        if isinstance(p, bool) or not isinstance(p, float):
+            raise TypeError("p must be a positive finite float")
+        if not math.isfinite(p) or p <= 0.0:
+            raise ValueError("p must be a positive finite float")
+        # Snapshot the input at call time so later caller-side mutation or
+        # replacement can change neither the forward result nor a pending
+        # backward pass.
+        x = list(data)
+        # n = (sum_i abs(x_i)**p)**(1/p). Accumulate S from 0.0 in
+        # ascending index order, taking abs before each power; a non-finite
+        # power, partial sum, reciprocal or result aborts before a result
+        # tensor exists, so the input and every other state stays
+        # untouched on failure.
+        S = 0.0
+        for i in range(len(x)):
+            a_i = abs(x[i])
+            power = _finite_power(
+                a_i, p, "norm intermediate must be finite"
+            )
+            S += power
+            if not math.isfinite(S):
+                raise ValueError("norm intermediate must be finite")
+        reciprocal = 1.0 / p
+        if not math.isfinite(reciprocal):
+            raise ValueError("norm intermediate must be finite")
+        n = _finite_power(
+            S, reciprocal, "norm intermediate must be finite"
+        )
+        if not self.requires_grad:
+            return Tensor._make(n, False, (), None)
+        parent = self
+        # Save x, p and the forward result n with the graph so a pending
+        # backward pass is independent of any subsequent data mutation.
+        saved_x = x
+        saved_p = p
+        saved_n = n
+
+        def backward_fn(grad):
+            # n == 0 means every x_i == 0; for p < 1 the derivative is
+            # unbounded there, so that case is a ValueError before any
+            # gradient is written.
+            if saved_n == 0.0 and saved_p < 1.0:
+                raise ValueError("norm backward intermediate must be finite")
+            # d_i = sign(x_i) * abs(x_i)**(p-1) / n**(p-1), evaluated in
+            # ascending index order; x_i == 0 with p >= 1 has derivative 0.
+            # Every power, quotient and the contribution g * d_i is
+            # checked as it is produced, and the generic engine validates
+            # the contribution itself and every merge into an existing
+            # grad, so a non-finite value aborts the whole pass before any
+            # grad changes.
+            contribution = []
+            for i in range(len(saved_x)):
+                x_i = saved_x[i]
+                if x_i == 0.0 and saved_p >= 1.0:
+                    d_i = 0.0
+                else:
+                    exponent = saved_p - 1.0
+                    if not math.isfinite(exponent):
+                        raise ValueError(
+                            "norm backward intermediate must be finite"
+                        )
+                    try:
+                        numerator = abs(x_i) ** exponent
+                    except (OverflowError, ZeroDivisionError):
+                        raise ValueError(
+                            "norm backward intermediate must be finite"
+                        )
+                    if not math.isfinite(numerator):
+                        raise ValueError(
+                            "norm backward intermediate must be finite"
+                        )
+                    try:
+                        denominator = saved_n ** exponent
+                    except (OverflowError, ZeroDivisionError):
+                        raise ValueError(
+                            "norm backward intermediate must be finite"
+                        )
+                    if not math.isfinite(denominator):
+                        raise ValueError(
+                            "norm backward intermediate must be finite"
+                        )
+                    ratio = numerator / denominator
+                    if not math.isfinite(ratio):
+                        raise ValueError(
+                            "norm backward intermediate must be finite"
+                        )
+                    sign = 0.0 if x_i == 0.0 else (
+                        1.0 if x_i > 0.0 else -1.0
+                    )
+                    d_i = sign * ratio
+                    if not math.isfinite(d_i):
+                        raise ValueError(
+                            "norm backward intermediate must be finite"
+                        )
+                term = grad * d_i
+                if not math.isfinite(term):
+                    raise ValueError(
+                        "norm backward intermediate must be finite"
+                    )
+                contribution.append(term)
+            return [(parent, contribution)]
+
+        return Tensor._make(n, True, (parent,), backward_fn)
+
     def sum(self):
         if isinstance(self.data, list):
             out_data = sum(self.data)
