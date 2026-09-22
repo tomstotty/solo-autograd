@@ -2801,6 +2801,120 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def cross_entropy_batch(self, targets, classes):
+        data = _require_nonempty_float_vector(self, "cross_entropy_batch")
+        if isinstance(classes, bool) or not isinstance(classes, int):
+            raise TypeError("classes must be a positive int")
+        if classes <= 0:
+            raise ValueError("classes must be a positive int")
+        total = len(data)
+        if total % classes != 0:
+            raise ValueError("data length must be divisible by classes")
+        B = total // classes
+        if not isinstance(targets, list):
+            raise TypeError("targets must be a list of non-bool ints")
+        if len(targets) != B:
+            raise ValueError("targets length must equal the batch size")
+        for target in targets:
+            if isinstance(target, bool) or not isinstance(target, int):
+                raise TypeError("targets elements must be non-bool ints")
+        for target in targets:
+            if target < 0 or target >= classes:
+                raise ValueError("targets entries must lie in [0, classes)")
+        # Snapshot the inputs at call time so later caller-side mutation or
+        # replacement of data or targets can change neither the forward
+        # result nor a pending backward pass.
+        x = list(data)
+        snapshot_targets = list(targets)
+        # Per-row stable log-softmax in ascending order: m = max(row),
+        # z_i = exp(x_i - m), s = sum(z), l_i = x_i - m - log(s). exp is
+        # only ever evaluated on values in (-inf, 0]. L accumulates
+        # -l_target from 0.0 over rows in ascending order, then is divided
+        # by B. A non-finite intermediate aborts before a result tensor
+        # exists, so no state can change on failure.
+        l = []
+        out_data = 0.0
+        for q in range(B):
+            base = q * classes
+            row = x[base:base + classes]
+            m = max(row)
+            s = 0.0
+            for x_i in row:
+                diff = x_i - m
+                if not math.isfinite(diff):
+                    raise ValueError(
+                        "cross_entropy_batch intermediate must be finite"
+                    )
+                z_i = math.exp(diff)
+                if not math.isfinite(z_i):
+                    raise ValueError(
+                        "cross_entropy_batch intermediate must be finite"
+                    )
+                s += z_i
+                if not math.isfinite(s):
+                    raise ValueError(
+                        "cross_entropy_batch intermediate must be finite"
+                    )
+            log_s = math.log(s)
+            if not math.isfinite(log_s):
+                raise ValueError(
+                    "cross_entropy_batch intermediate must be finite"
+                )
+            for x_i in row:
+                l_i = x_i - m - log_s
+                if not math.isfinite(l_i):
+                    raise ValueError(
+                        "cross_entropy_batch intermediate must be finite"
+                    )
+                l.append(l_i)
+            out_data -= l[base + snapshot_targets[q]]
+            if not math.isfinite(out_data):
+                raise ValueError(
+                    "cross_entropy_batch intermediate must be finite"
+                )
+        out_data = out_data / B
+        if not math.isfinite(out_data):
+            raise ValueError("cross_entropy_batch result must be finite")
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # Save l and targets with the graph so a pending backward pass is
+        # independent of any subsequent input mutation.
+        snapshot_l = l
+
+        def backward_fn(grad):
+            # dx_i = g * (exp(l_i) - 1[i is the row target]) / B; exp is
+            # only evaluated on l_i <= 0. Each intermediate is checked as
+            # it is produced, and the generic engine validates the
+            # contribution itself and every merge into an existing grad.
+            dx = []
+            for q in range(B):
+                base = q * classes
+                target = snapshot_targets[q]
+                for i in range(classes):
+                    e_i = math.exp(snapshot_l[base + i])
+                    if not math.isfinite(e_i):
+                        raise ValueError(
+                            "cross_entropy_batch backward intermediate"
+                            " must be finite"
+                        )
+                    difference = e_i - (1.0 if i == target else 0.0)
+                    if not math.isfinite(difference):
+                        raise ValueError(
+                            "cross_entropy_batch backward intermediate"
+                            " must be finite"
+                        )
+                    value = grad * difference / B
+                    if not math.isfinite(value):
+                        raise ValueError(
+                            "cross_entropy_batch backward intermediate"
+                            " must be finite"
+                        )
+                    dx.append(value)
+            return [(parent, dx)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def soft_cross_entropy(self, target):
         if not isinstance(target, Tensor):
             raise TypeError("target must be a Tensor")
@@ -6523,8 +6637,8 @@ def jacobiancheck(fn, data, eps=1e-6, atol=1e-5):
 
     A scalar input must receive a finite float analytic gradient; a
     vector input must receive a finite float list of the same length.
-    Bad container or element types raise TypeError; wrong lengths or
-    non-finite values raise ValueError.
+    A missing (None) analytic gradient, bad container or element types
+    raise TypeError; wrong lengths or non-finite values raise ValueError.
 
     Returns (passed, max_abs_error) where passed is True only when every
     per-element absolute error is at most atol (a pair of exact zeros
@@ -6590,7 +6704,7 @@ def jacobiancheck(fn, data, eps=1e-6, atol=1e-5):
 
     def check_input_grad(grad):
         if grad is None:
-            raise ValueError("fn result is not connected to the input")
+            raise TypeError("fn result is not connected to the input")
         if vector_input:
             if not isinstance(grad, list):
                 raise TypeError("input grad must be a list of floats")
