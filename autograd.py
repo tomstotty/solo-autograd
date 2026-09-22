@@ -3862,6 +3862,131 @@ class Adam:
         return None
 
 
+class RMSprop:
+    """RMSprop optimizer over a fixed list of Tensors."""
+
+    def __init__(self, parameters, lr, alpha=0.99, eps=1e-8):
+        if not isinstance(parameters, list):
+            raise TypeError("parameters must be a non-empty list of Tensors")
+        if len(parameters) == 0:
+            raise ValueError("parameters must be non-empty")
+        for parameter in parameters:
+            if not isinstance(parameter, Tensor):
+                raise TypeError("parameters must contain only Tensors")
+        if len({id(parameter) for parameter in parameters}) != len(parameters):
+            raise ValueError("parameters must not contain duplicate Tensors")
+        for parameter in parameters:
+            if not isinstance(parameter.requires_grad, bool):
+                raise TypeError("requires_grad must be a bool")
+            _validate_data(parameter.data)
+        if isinstance(lr, bool) or not isinstance(lr, float):
+            raise TypeError("lr must be a positive finite float")
+        if not math.isfinite(lr) or lr <= 0.0:
+            raise ValueError("lr must be a positive finite float")
+        if isinstance(alpha, bool) or not isinstance(alpha, float):
+            raise TypeError("alpha must be a finite float in [0.0, 1.0)")
+        if not math.isfinite(alpha) or alpha < 0.0 or alpha >= 1.0:
+            raise ValueError("alpha must be a finite float in [0.0, 1.0)")
+        if isinstance(eps, bool) or not isinstance(eps, float):
+            raise TypeError("eps must be a positive finite float")
+        if not math.isfinite(eps) or eps <= 0.0:
+            raise ValueError("eps must be a positive finite float")
+        self.parameters = list(parameters)
+        self.lr = lr
+        self.alpha = alpha
+        self.eps = eps
+        self.square_avg = [
+            self._zeros_like(parameter.data) for parameter in parameters
+        ]
+
+    @staticmethod
+    def _zeros_like(data):
+        if isinstance(data, list):
+            return [0.0 for _ in data]
+        return 0.0
+
+    def step(self):
+        # Revalidate every parameter and validate every active grad first;
+        # compute all new values before mutating anything, so a failure leaves
+        # all data and square_avg slots untouched.
+        if not isinstance(self.square_avg, list):
+            raise TypeError("square_avg must be a list of buffers")
+        if len(self.square_avg) != len(self.parameters):
+            raise ValueError("square_avg must have one buffer per parameter")
+        for index, parameter in enumerate(self.parameters):
+            if not isinstance(parameter.requires_grad, bool):
+                raise TypeError("requires_grad must be a bool")
+            data = _validate_data(parameter.data)
+            Adam._check_buffer(self.square_avg[index], data, "square_avg")
+            if parameter.requires_grad and parameter.grad is not None:
+                Adam._check_grad(parameter.grad, data)
+        active = [
+            index
+            for index, parameter in enumerate(self.parameters)
+            if parameter.requires_grad and parameter.grad is not None
+        ]
+        if not active:
+            return None
+        updates = []
+        for index in active:
+            parameter = self.parameters[index]
+            updates.append(
+                (
+                    index,
+                    self._updated(
+                        parameter.data,
+                        parameter.grad,
+                        self.square_avg[index],
+                    ),
+                )
+            )
+        for index, (new_data, new_square_avg) in updates:
+            self.parameters[index].data = new_data
+            self.square_avg[index] = new_square_avg
+        return None
+
+    def _updated(self, data, grad, square_avg):
+        """Compute (new_data, new_square_avg) for one active parameter."""
+        one_minus_alpha = 1.0 - self.alpha
+        if isinstance(data, list):
+            new_square_avg = []
+            new_data = []
+            for value, g, s_value in zip(data, grad, square_avg):
+                s_next = self.alpha * s_value + one_minus_alpha * g * g
+                if not math.isfinite(s_next):
+                    raise ValueError("square_avg must be finite")
+                try:
+                    denominator = math.sqrt(s_next) + self.eps
+                except (ValueError, OverflowError):
+                    raise ValueError("update denominator must be finite")
+                if not math.isfinite(denominator):
+                    raise ValueError("update denominator must be finite")
+                value_next = value - self.lr * g / denominator
+                if not math.isfinite(value_next):
+                    raise ValueError("updated data must be finite")
+                new_square_avg.append(s_next)
+                new_data.append(value_next)
+            return new_data, new_square_avg
+        s_next = self.alpha * square_avg + one_minus_alpha * grad * grad
+        if not math.isfinite(s_next):
+            raise ValueError("square_avg must be finite")
+        try:
+            denominator = math.sqrt(s_next) + self.eps
+        except (ValueError, OverflowError):
+            raise ValueError("update denominator must be finite")
+        if not math.isfinite(denominator):
+            raise ValueError("update denominator must be finite")
+        value_next = data - self.lr * grad / denominator
+        if not math.isfinite(value_next):
+            raise ValueError("updated data must be finite")
+        return value_next, s_next
+
+    def zero_grad(self):
+        for parameter in self.parameters:
+            parameter.grad = None
+        return None
+
+
 def gradcheck(fn, data, eps=1e-6, atol=1e-5):
     """Compare analytic gradients from backward() with central differences.
 
