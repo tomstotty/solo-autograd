@@ -3771,6 +3771,110 @@ class Tensor:
             backward_fn,
         )
 
+    def norm(self, p=2.0):
+        data = _require_nonempty_float_vector(self, "norm")
+        if isinstance(p, bool) or not isinstance(p, float):
+            raise TypeError("p must be a finite positive float")
+        if not math.isfinite(p) or p <= 0.0:
+            raise ValueError("p must be a finite positive float")
+        # Snapshot the input so later caller-side mutation or replacement
+        # can change neither the forward result nor a pending backward.
+        x = list(data)
+        # a_i = |x_i| in ascending index order and S = sum a_i**p
+        # accumulated from 0.0, then n = S**(1.0/p); a non-finite power,
+        # partial sum, reciprocal or result aborts before a result tensor
+        # exists, so no state can change on failure. 0.0 raised to a
+        # negative exponent raises ZeroDivisionError, which maps to
+        # ValueError just like an overflow.
+        S = 0.0
+        for i in range(len(x)):
+            a_i = abs(x[i])
+            try:
+                power = a_i ** p
+            except (OverflowError, ZeroDivisionError):
+                raise ValueError("norm power result must be finite")
+            if not math.isfinite(power):
+                raise ValueError("norm power result must be finite")
+            S += power
+            if not math.isfinite(S):
+                raise ValueError("norm partial sum must be finite")
+        inv_p = 1.0 / p
+        if not math.isfinite(inv_p):
+            raise ValueError("norm reciprocal must be finite")
+        try:
+            n = S ** inv_p
+        except OverflowError:
+            raise ValueError("norm result must be finite")
+        if not math.isfinite(n):
+            raise ValueError("norm result must be finite")
+        if not self.requires_grad:
+            return Tensor._make(n, False, (), None)
+        parent = self
+        # Save the snapshot x, p and n with the graph so a pending backward
+        # pass is independent of any subsequent data mutation.
+        saved_x = x
+        saved_p = p
+        saved_n = n
+
+        def backward_fn(grad):
+            # d_i = sign(x_i) * |x_i|**(p-1) / n**(p-1); n == 0 with p < 1
+            # has no finite derivative, and an individual x_i == 0 with
+            # p < 1 is non-differentiable even when n > 0. With p >= 1 the
+            # derivative at a zero entry is 0. Each intermediate is checked
+            # in turn, and the generic engine validates the contribution
+            # itself and every merge into an existing grad.
+            if saved_n == 0.0 and saved_p < 1.0:
+                raise ValueError(
+                    "norm is not differentiable at zero for p < 1"
+                )
+            exponent = saved_p - 1.0
+            if not math.isfinite(exponent):
+                raise ValueError(
+                    "norm backward intermediate must be finite"
+                )
+            denom = _finite_power(
+                saved_n,
+                exponent,
+                "norm backward intermediate must be finite",
+            )
+            contribution = []
+            for i in range(len(saved_x)):
+                x_i = saved_x[i]
+                if x_i == 0.0:
+                    if saved_p >= 1.0:
+                        d_i = 0.0
+                    else:
+                        raise ValueError(
+                            "norm is not differentiable at zero for p < 1"
+                        )
+                else:
+                    a_i = abs(x_i)
+                    power = _finite_power(
+                        a_i,
+                        exponent,
+                        "norm backward intermediate must be finite",
+                    )
+                    sign = 1.0 if x_i > 0.0 else -1.0
+                    numerator = sign * power
+                    if not math.isfinite(numerator):
+                        raise ValueError(
+                            "norm backward intermediate must be finite"
+                        )
+                    d_i = numerator / denom
+                    if not math.isfinite(d_i):
+                        raise ValueError(
+                            "norm backward intermediate must be finite"
+                        )
+                value = grad * d_i
+                if not math.isfinite(value):
+                    raise ValueError(
+                        "norm backward intermediate must be finite"
+                    )
+                contribution.append(value)
+            return [(parent, contribution)]
+
+        return Tensor._make(n, True, (parent,), backward_fn)
+
     def l2_normalize(self, eps=1e-12):
         data = _require_nonempty_float_vector(self, "l2_normalize")
         if isinstance(eps, bool) or not isinstance(eps, float):
