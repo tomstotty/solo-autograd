@@ -2592,6 +2592,48 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def topk(self, k):
+        """Return the k largest entries as (values, indices).
+
+        Values are ordered by descending value, ties by ascending original
+        index. ``values`` is a Tensor holding fresh copies of the selected
+        values; ``indices`` is a brand-new list[int] of original indices.
+        When self requires grad, a single-parent graph is built with private
+        snapshots of the original length and the index list, so later
+        mutation of self.data (or the returned indices) cannot change a
+        pending backward pass.
+        """
+        data = _require_nonempty_float_vector(self, "topk")
+        if isinstance(k, bool) or not isinstance(k, int):
+            raise TypeError("k must be a non-bool int")
+        n = len(data)
+        if k < 1 or k > n:
+            raise ValueError("k must satisfy 1 <= k <= len(data)")
+        # Sort by descending value, then ascending original index for ties.
+        # All data is finite at this point, so negation cannot produce NaN.
+        order = sorted(range(n), key=lambda i: (-data[i], i))[:k]
+        out_data = [data[i] for i in order]
+        indices = list(order)
+        if not self.requires_grad:
+            out = Tensor._make(out_data, False, (), None)
+            return out, indices
+        parent = self
+        length = n
+        snapshot = list(order)
+
+        def backward_fn(grad):
+            dx = [0.0] * length
+            for o in range(k):
+                dx[snapshot[o]] += grad[o]
+                if not math.isfinite(dx[snapshot[o]]):
+                    raise ValueError(
+                        "topk backward intermediate must be finite"
+                    )
+            return [(parent, dx)]
+
+        out = Tensor._make(out_data, True, (parent,), backward_fn)
+        return out, indices
+
     def zero_grad(self):
         self.grad = None
         return None
