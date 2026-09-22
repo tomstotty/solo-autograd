@@ -1953,6 +1953,91 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def leaky_relu(self, negative_slope=0.01):
+        # Re-validate at call time since the data may have been mutated
+        # after construction: a finite float scalar or a non-empty 1D
+        # float list. bools, ints and other types are a TypeError; an
+        # empty list or any non-finite value is a ValueError.
+        data = _validate_data(self.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        # negative_slope is a plain float: bools, ints and anything else
+        # are a TypeError; a non-finite or negative value is a ValueError.
+        if isinstance(negative_slope, bool) or not isinstance(
+            negative_slope, float
+        ):
+            raise TypeError(
+                "negative_slope must be a non-negative finite float"
+            )
+        if not math.isfinite(negative_slope) or negative_slope < 0.0:
+            raise ValueError(
+                "negative_slope must be a non-negative finite float"
+            )
+
+        def forward_value(x):
+            # y = x on the non-negative branch and y = negative_slope * x
+            # on the negative branch; the product is checked as it is
+            # produced.
+            if x >= 0.0:
+                return x, False
+            y = negative_slope * x
+            if not math.isfinite(y):
+                raise ValueError("leaky_relu intermediate must be finite")
+            return y, True
+
+        # Elementwise evaluation in ascending index order; a non-finite
+        # intermediate aborts before a result tensor exists, so no state
+        # can change on failure.
+        if isinstance(data, list):
+            out_data = []
+            snapshot_negative = []
+            for x in data:
+                y, negative = forward_value(x)
+                out_data.append(y)
+                snapshot_negative.append(negative)
+        else:
+            out_data, negative_flag = forward_value(data)
+            snapshot_negative = negative_flag
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # Snapshot the shape and the per-element branch choice so later
+        # caller-side mutation or replacement of the input cannot change
+        # a pending backward pass.
+        negative_flags = snapshot_negative
+        vector = isinstance(out_data, list)
+
+        def backward_fn(grad):
+            # The non-negative branch (x >= 0, so x == 0 has derivative
+            # 1.0) contributes g; the negative branch contributes
+            # g * negative_slope. Each intermediate is checked as it is
+            # produced, and the generic engine validates the contribution
+            # itself and every merge into an existing grad.
+            if vector:
+                contribution = []
+                for i in range(len(negative_flags)):
+                    if negative_flags[i]:
+                        value = grad[i] * negative_slope
+                        if not math.isfinite(value):
+                            raise ValueError(
+                                "leaky_relu backward intermediate must be"
+                                " finite"
+                            )
+                    else:
+                        value = grad[i]
+                    contribution.append(value)
+            elif negative_flags:
+                contribution = grad * negative_slope
+                if not math.isfinite(contribution):
+                    raise ValueError(
+                        "leaky_relu backward intermediate must be finite"
+                    )
+            else:
+                contribution = grad
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def tanh(self):
         out_data = _map_unary(self.data, math.tanh)
         _ensure_finite_data(out_data)
