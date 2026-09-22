@@ -2349,6 +2349,59 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def avg_pool1d(self, kernel_size, stride=None):
+        data = _require_nonempty_float_vector(self, "avg_pool1d")
+        if isinstance(kernel_size, bool) or not isinstance(kernel_size, int):
+            raise TypeError("kernel_size must be a positive int")
+        if kernel_size <= 0:
+            raise ValueError("kernel_size must be a positive int")
+        if stride is None:
+            stride = kernel_size
+        elif isinstance(stride, bool) or not isinstance(stride, int):
+            raise TypeError("stride must be a positive int")
+        elif stride <= 0:
+            raise ValueError("stride must be a positive int")
+        n = len(data)
+        k = kernel_size
+        s = stride
+        out_len = (n - k) // s + 1
+        if out_len <= 0:
+            raise ValueError("avg_pool1d output length must be positive")
+        out_data = []
+        for o in range(out_len):
+            acc = 0.0
+            for i in range(k):
+                acc += data[o * s + i]
+                if not math.isfinite(acc):
+                    raise ValueError("avg_pool1d intermediate must be finite")
+            mean = acc / k
+            if not math.isfinite(mean):
+                raise ValueError("avg_pool1d intermediate must be finite")
+            out_data.append(mean)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        # Only the input length and window parameters are captured; mutating
+        # the parent's data after the forward pass cannot change backward.
+        parent = self
+
+        def backward_fn(grad):
+            dx = [0.0] * n
+            for o in range(out_len):
+                for i in range(k):
+                    share = grad[o] / k
+                    if not math.isfinite(share):
+                        raise ValueError(
+                            "avg_pool1d backward intermediate must be finite"
+                        )
+                    dx[o * s + i] += share
+                    if not math.isfinite(dx[o * s + i]):
+                        raise ValueError(
+                            "avg_pool1d backward intermediate must be finite"
+                        )
+            return [(parent, dx)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def dropout(self, p=0.5, seed=0):
         data = _require_nonempty_float_vector(self, "dropout")
         if isinstance(p, bool) or not isinstance(p, float):
