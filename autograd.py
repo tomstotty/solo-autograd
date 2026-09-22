@@ -6194,6 +6194,211 @@ class Adagrad:
         return None
 
 
+class Adadelta:
+    """Adadelta optimizer over a fixed list of Tensors."""
+
+    def __init__(self, parameters, rho=0.9, eps=1e-6):
+        if not isinstance(parameters, list):
+            raise TypeError("parameters must be a non-empty list of Tensors")
+        if len(parameters) == 0:
+            raise ValueError("parameters must be non-empty")
+        for parameter in parameters:
+            if not isinstance(parameter, Tensor):
+                raise TypeError("parameters must contain only Tensors")
+        if len({id(parameter) for parameter in parameters}) != len(parameters):
+            raise ValueError("parameters must not contain duplicate Tensors")
+        for parameter in parameters:
+            if not isinstance(parameter.requires_grad, bool):
+                raise TypeError("requires_grad must be a bool")
+            _validate_data(parameter.data)
+        if isinstance(rho, bool) or not isinstance(rho, float):
+            raise TypeError("rho must be a finite float in [0.0, 1.0)")
+        if not math.isfinite(rho) or rho < 0.0 or rho >= 1.0:
+            raise ValueError("rho must be a finite float in [0.0, 1.0)")
+        if isinstance(eps, bool) or not isinstance(eps, float):
+            raise TypeError("eps must be a positive finite float")
+        if not math.isfinite(eps) or eps <= 0.0:
+            raise ValueError("eps must be a positive finite float")
+        self.parameters = list(parameters)
+        self.rho = rho
+        self.eps = eps
+        self.square_avg = [
+            self._zeros_like(parameter.data) for parameter in parameters
+        ]
+        self.acc_delta = [
+            self._zeros_like(parameter.data) for parameter in parameters
+        ]
+
+    @staticmethod
+    def _zeros_like(data):
+        if isinstance(data, list):
+            return [0.0 for _ in data]
+        return 0.0
+
+    @staticmethod
+    def _check_parameters(parameters):
+        if not isinstance(parameters, list):
+            raise TypeError("parameters must be a non-empty list of Tensors")
+        if len(parameters) == 0:
+            raise ValueError("parameters must be non-empty")
+        for parameter in parameters:
+            if not isinstance(parameter, Tensor):
+                raise TypeError("parameters must contain only Tensors")
+        if len({id(parameter) for parameter in parameters}) != len(parameters):
+            raise ValueError("parameters must not contain duplicate Tensors")
+        for parameter in parameters:
+            if not isinstance(parameter.requires_grad, bool):
+                raise TypeError("requires_grad must be a bool")
+            _validate_data(parameter.data)
+
+    def step(self):
+        # Revalidate every parameter, rho, eps and both slot lists first;
+        # validate every active grad, then compute all new values before
+        # mutating anything, so a failure leaves all data, square_avg,
+        # acc_delta, grad and requires_grad untouched.
+        self._check_parameters(self.parameters)
+        if isinstance(self.rho, bool) or not isinstance(self.rho, float):
+            raise TypeError("rho must be a finite float in [0.0, 1.0)")
+        if not math.isfinite(self.rho) or self.rho < 0.0 or self.rho >= 1.0:
+            raise ValueError("rho must be a finite float in [0.0, 1.0)")
+        if isinstance(self.eps, bool) or not isinstance(self.eps, float):
+            raise TypeError("eps must be a positive finite float")
+        if not math.isfinite(self.eps) or self.eps <= 0.0:
+            raise ValueError("eps must be a positive finite float")
+        if not isinstance(self.square_avg, list):
+            raise TypeError("square_avg must be a list of slots")
+        if len(self.square_avg) != len(self.parameters):
+            raise ValueError("square_avg shape must match parameter shape")
+        if not isinstance(self.acc_delta, list):
+            raise TypeError("acc_delta must be a list of slots")
+        if len(self.acc_delta) != len(self.parameters):
+            raise ValueError("acc_delta shape must match parameter shape")
+        for index, parameter in enumerate(self.parameters):
+            data = _validate_data(parameter.data)
+            self._check_slot(self.square_avg[index], data, "square_avg")
+            self._check_slot(self.acc_delta[index], data, "acc_delta")
+            if parameter.requires_grad and parameter.grad is not None:
+                self._check_grad(parameter.grad, data)
+        updates = []
+        for index, parameter in enumerate(self.parameters):
+            if not parameter.requires_grad or parameter.grad is None:
+                continue
+            updates.append(
+                (
+                    index,
+                    self._updated(
+                        parameter.data,
+                        parameter.grad,
+                        self.square_avg[index],
+                        self.acc_delta[index],
+                    ),
+                )
+            )
+        for index, (new_data, new_square_avg, new_acc_delta) in updates:
+            self.parameters[index].data = new_data
+            self.square_avg[index] = new_square_avg
+            self.acc_delta[index] = new_acc_delta
+        return None
+
+    @staticmethod
+    def _check_slot(slot, data, name):
+        """Type/shape/non-negativity/finiteness check for one slot."""
+        if isinstance(data, list):
+            if not isinstance(slot, list):
+                if isinstance(slot, float) and not isinstance(slot, bool):
+                    raise ValueError(
+                        name + " shape must match parameter shape"
+                    )
+                raise TypeError(name + " must be a list of floats")
+            if len(slot) != len(data):
+                raise ValueError(name + " shape must match parameter shape")
+            for value in slot:
+                if isinstance(value, bool) or not isinstance(value, float):
+                    raise TypeError(name + " elements must be floats")
+            for value in slot:
+                if not math.isfinite(value):
+                    raise ValueError(name + " must be finite")
+                if value < 0.0:
+                    raise ValueError(name + " must be non-negative")
+        else:
+            if isinstance(slot, list):
+                raise ValueError(name + " shape must match parameter shape")
+            if isinstance(slot, bool) or not isinstance(slot, float):
+                raise TypeError(name + " must be a float")
+            if not math.isfinite(slot):
+                raise ValueError(name + " must be finite")
+            if slot < 0.0:
+                raise ValueError(name + " must be non-negative")
+
+    @staticmethod
+    def _check_grad(grad, data):
+        """Type/shape/finiteness check for an active parameter's grad."""
+        if isinstance(data, list):
+            if not isinstance(grad, list):
+                if isinstance(grad, float) and not isinstance(grad, bool):
+                    raise ValueError("grad shape must match tensor shape")
+                raise TypeError("grad must be a list of floats")
+            if len(grad) != len(data):
+                raise ValueError("grad shape must match tensor shape")
+            for value in grad:
+                if isinstance(value, bool) or not isinstance(value, float):
+                    raise TypeError("grad elements must be floats")
+            for value in grad:
+                if not math.isfinite(value):
+                    raise ValueError("grad must be finite")
+        else:
+            if isinstance(grad, list):
+                raise ValueError("grad shape must match tensor shape")
+            if isinstance(grad, bool) or not isinstance(grad, float):
+                raise TypeError("grad must be a float")
+            if not math.isfinite(grad):
+                raise ValueError("grad must be finite")
+
+    def _updated(self, data, grad, square_avg, acc_delta):
+        """Compute (new_data, new_square_avg, new_acc_delta) for one active."""
+        if isinstance(data, list):
+            new_square_avg = []
+            new_acc_delta = []
+            new_data = []
+            for value, g, s, a in zip(data, grad, square_avg, acc_delta):
+                value_next, s_next, a_next = self._updated_value(value, g, s, a)
+                new_data.append(value_next)
+                new_square_avg.append(s_next)
+                new_acc_delta.append(a_next)
+            return new_data, new_square_avg, new_acc_delta
+        return self._updated_value(data, grad, square_avg, acc_delta)
+
+    def _updated_value(self, value, g, s, a):
+        q = 1.0 - self.rho
+        s1 = self.rho * s + q * g * g
+        if not math.isfinite(s1):
+            raise ValueError("square_avg must be finite")
+        ratio = (a + self.eps) / (s1 + self.eps)
+        if not math.isfinite(ratio) or ratio < 0.0:
+            raise ValueError("update ratio must be finite")
+        try:
+            d = math.sqrt(ratio) * g
+        except (ValueError, OverflowError):
+            raise ValueError("update delta must be finite")
+        if not math.isfinite(d):
+            raise ValueError("update delta must be finite")
+        a1 = self.rho * a + q * d * d
+        if not math.isfinite(a1):
+            raise ValueError("acc_delta must be finite")
+        value_next = value - d
+        if not math.isfinite(value_next):
+            raise ValueError("updated data must be finite")
+        return value_next, s1, a1
+
+    def zero_grad(self):
+        # Validate the full parameter list first, then clear every grad,
+        # so a failure leaves every grad and all other state untouched.
+        self._check_parameters(self.parameters)
+        for parameter in self.parameters:
+            parameter.grad = None
+        return None
+
+
 def _check_adagrad_state(optimizer):
     """Validate an Adagrad optimizer's full mutable state for dump/load."""
     parameters = optimizer.parameters
