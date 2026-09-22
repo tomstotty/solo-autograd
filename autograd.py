@@ -850,6 +850,133 @@ class Tensor:
             out_data, True, (parent_self, parent_other), backward_fn
         )
 
+    def bmm(self, other, batch, rows, inner, cols):
+        if not isinstance(other, Tensor):
+            raise TypeError("other must be a Tensor")
+        # The four dimensions must be non-bool positive ints.
+        for name, value in (
+            ("batch", batch),
+            ("rows", rows),
+            ("inner", inner),
+            ("cols", cols),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(name + " must be a positive int")
+            if value <= 0:
+                raise ValueError(name + " must be a positive int")
+        # Both operands must hold non-empty 1D finite float lists; data may
+        # have been mutated after construction, so re-validate at call time.
+        a_data = _require_nonempty_float_vector(self, "bmm")
+        b_data = _require_nonempty_float_vector(other, "bmm")
+        # self stores batch matrices of rows x inner and other batch
+        # matrices of inner x cols, each batch in row-major order.
+        if len(a_data) != batch * rows * inner:
+            raise ValueError(
+                "bmm left length must equal batch * rows * inner"
+            )
+        if len(b_data) != batch * inner * cols:
+            raise ValueError(
+                "bmm right length must equal batch * inner * cols"
+            )
+        # Snapshot both operands so later caller-side mutation of either
+        # input list cannot change what a pending backward pass uses.
+        snapshot_a = list(a_data)
+        snapshot_b = list(b_data)
+        # out[q*rows*cols + r*cols + c] =
+        #     sum_k a[q*rows*inner + r*inner + k]
+        #         * b[q*inner*cols + k*cols + c],
+        # accumulated from 0.0 in ascending (q, r, c, k) order; a
+        # non-finite product or partial sum aborts before a result tensor
+        # exists, so no state changes.
+        out_data = []
+        for q in range(batch):
+            for r in range(rows):
+                for c in range(cols):
+                    acc = 0.0
+                    for k in range(inner):
+                        product = (
+                            snapshot_a[q * rows * inner + r * inner + k]
+                            * snapshot_b[q * inner * cols + k * cols + c]
+                        )
+                        if not math.isfinite(product):
+                            raise ValueError(
+                                "bmm intermediate must be finite"
+                            )
+                        acc += product
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "bmm intermediate must be finite"
+                            )
+                    out_data.append(acc)
+        if not (self.requires_grad or other.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_other = self, other
+
+        def backward_fn(grad):
+            # da[q,r,k] += g[q,r,c] * b[q,k,c] and
+            # db[q,k,c] += g[q,r,c] * a[q,r,k] with the flat row-major
+            # indexing of the forward pass, accumulated from 0.0 in
+            # ascending (q, r, c, k) order. A non-finite product or
+            # partial sum aborts the whole pass before any grad is written.
+            count_a = batch * rows * inner
+            count_b = batch * inner * cols
+            da = [0.0] * count_a
+            db = [0.0] * count_b
+            for q in range(batch):
+                for r in range(rows):
+                    for c in range(cols):
+                        g_rc = grad[q * rows * cols + r * cols + c]
+                        for k in range(inner):
+                            a_index = q * rows * inner + r * inner + k
+                            b_index = q * inner * cols + k * cols + c
+                            term_a = g_rc * snapshot_b[b_index]
+                            if not math.isfinite(term_a):
+                                raise ValueError(
+                                    "bmm backward intermediate"
+                                    " must be finite"
+                                )
+                            da[a_index] = da[a_index] + term_a
+                            if not math.isfinite(da[a_index]):
+                                raise ValueError(
+                                    "bmm backward intermediate"
+                                    " must be finite"
+                                )
+                            term_b = g_rc * snapshot_a[a_index]
+                            if not math.isfinite(term_b):
+                                raise ValueError(
+                                    "bmm backward intermediate"
+                                    " must be finite"
+                                )
+                            db[b_index] = db[b_index] + term_b
+                            if not math.isfinite(db[b_index]):
+                                raise ValueError(
+                                    "bmm backward intermediate"
+                                    " must be finite"
+                                )
+            # The same object may play both roles; merge such roles into
+            # one contribution per tensor, and submit only parents that
+            # require grad.
+            merged = {}
+            roles = (
+                (parent_self, da),
+                (parent_other, db),
+            )
+            for parent, value in roles:
+                if not parent.requires_grad:
+                    continue
+                entry = merged.get(id(parent))
+                if entry is None:
+                    merged[id(parent)] = [parent, value]
+                else:
+                    combined = _merge_grad(entry[1], value)
+                    _ensure_finite_grad(combined)
+                    entry[1] = combined
+            return [(entry[0], entry[1]) for entry in merged.values()]
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_other), backward_fn
+        )
+
     def linear(self, weight, bias):
         if not isinstance(weight, Tensor):
             raise TypeError("weight must be a Tensor")
