@@ -5024,6 +5024,230 @@ class Adam:
         return None
 
 
+class AdamW:
+    """AdamW optimizer over a fixed list of Tensors."""
+
+    def __init__(
+        self, parameters, lr, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.01
+    ):
+        if not isinstance(parameters, list):
+            raise TypeError("parameters must be a non-empty list of Tensors")
+        if len(parameters) == 0:
+            raise ValueError("parameters must be non-empty")
+        for parameter in parameters:
+            if not isinstance(parameter, Tensor):
+                raise TypeError("parameters must contain only Tensors")
+        if len({id(parameter) for parameter in parameters}) != len(parameters):
+            raise ValueError("parameters must not contain duplicate Tensors")
+        for parameter in parameters:
+            if not isinstance(parameter.requires_grad, bool):
+                raise TypeError("requires_grad must be a bool")
+            _validate_data(parameter.data)
+        if isinstance(lr, bool) or not isinstance(lr, float):
+            raise TypeError("lr must be a positive finite float")
+        if not math.isfinite(lr) or lr <= 0.0:
+            raise ValueError("lr must be a positive finite float")
+        for name, beta in (("beta1", beta1), ("beta2", beta2)):
+            if isinstance(beta, bool) or not isinstance(beta, float):
+                raise TypeError(
+                    name
+                    + " must be a finite float in [0.0, 1.0)"
+                )
+            if not math.isfinite(beta) or beta < 0.0 or beta >= 1.0:
+                raise ValueError(
+                    name
+                    + " must be a finite float in [0.0, 1.0)"
+                )
+        if isinstance(eps, bool) or not isinstance(eps, float):
+            raise TypeError("eps must be a positive finite float")
+        if not math.isfinite(eps) or eps <= 0.0:
+            raise ValueError("eps must be a positive finite float")
+        if isinstance(weight_decay, bool) or not isinstance(weight_decay, float):
+            raise TypeError("weight_decay must be a non-negative finite float")
+        if not math.isfinite(weight_decay) or weight_decay < 0.0:
+            raise ValueError("weight_decay must be a non-negative finite float")
+        self.parameters = list(parameters)
+        self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.weight_decay = weight_decay
+        self.m = [self._zeros_like(parameter.data) for parameter in parameters]
+        self.v = [self._zeros_like(parameter.data) for parameter in parameters]
+        self.t = 0
+
+    @staticmethod
+    def _zeros_like(data):
+        if isinstance(data, list):
+            return [0.0 for _ in data]
+        return 0.0
+
+    def step(self):
+        # Revalidate every parameter and validate every active grad first;
+        # compute all new values before mutating anything, so a failure leaves
+        # all data, m, v and t untouched.
+        for index, parameter in enumerate(self.parameters):
+            if not isinstance(parameter.requires_grad, bool):
+                raise TypeError("requires_grad must be a bool")
+            data = _validate_data(parameter.data)
+            moment = self.m[index]
+            velocity = self.v[index]
+            self._check_buffer(moment, data, "m")
+            self._check_buffer(velocity, data, "v")
+            if parameter.requires_grad and parameter.grad is not None:
+                self._check_grad(parameter.grad, data)
+        active = [
+            index
+            for index, parameter in enumerate(self.parameters)
+            if parameter.requires_grad and parameter.grad is not None
+        ]
+        if not active:
+            return None
+        k = self.t + 1
+        bias1 = 1.0 - _finite_power(
+            self.beta1, k, "bias correction must be finite"
+        )
+        bias2 = 1.0 - _finite_power(
+            self.beta2, k, "bias correction must be finite"
+        )
+        if not math.isfinite(bias1) or not math.isfinite(bias2):
+            raise ValueError("bias correction must be finite")
+        updates = []
+        for index in active:
+            parameter = self.parameters[index]
+            updates.append(
+                (
+                    index,
+                    self._updated(
+                        parameter.data,
+                        parameter.grad,
+                        self.m[index],
+                        self.v[index],
+                        bias1,
+                        bias2,
+                    ),
+                )
+            )
+        for index, (new_data, new_m, new_v) in updates:
+            self.parameters[index].data = new_data
+            self.m[index] = new_m
+            self.v[index] = new_v
+        self.t = k
+        return None
+
+    @staticmethod
+    def _check_buffer(buffer, data, name):
+        """Type/shape/finiteness check for an m or v moment buffer."""
+        if isinstance(data, list):
+            if not isinstance(buffer, list):
+                if isinstance(buffer, float) and not isinstance(buffer, bool):
+                    raise ValueError(
+                        name + " shape must match parameter shape"
+                    )
+                raise TypeError(name + " must be a list of floats")
+            if len(buffer) != len(data):
+                raise ValueError(name + " shape must match parameter shape")
+            for value in buffer:
+                if isinstance(value, bool) or not isinstance(value, float):
+                    raise TypeError(name + " elements must be floats")
+            for value in buffer:
+                if not math.isfinite(value):
+                    raise ValueError(name + " must be finite")
+        else:
+            if isinstance(buffer, list):
+                raise ValueError(name + " shape must match parameter shape")
+            if isinstance(buffer, bool) or not isinstance(buffer, float):
+                raise TypeError(name + " must be a float")
+            if not math.isfinite(buffer):
+                raise ValueError(name + " must be finite")
+
+    @staticmethod
+    def _check_grad(grad, data):
+        """Type/shape/finiteness check for an active parameter's grad."""
+        if isinstance(data, list):
+            if not isinstance(grad, list):
+                if isinstance(grad, float) and not isinstance(grad, bool):
+                    raise ValueError("grad shape must match tensor shape")
+                raise TypeError("grad must be a list of floats")
+            if len(grad) != len(data):
+                raise ValueError("grad shape must match tensor shape")
+            for value in grad:
+                if isinstance(value, bool) or not isinstance(value, float):
+                    raise TypeError("grad elements must be floats")
+            for value in grad:
+                if not math.isfinite(value):
+                    raise ValueError("grad must be finite")
+        else:
+            if isinstance(grad, list):
+                raise ValueError("grad shape must match tensor shape")
+            if isinstance(grad, bool) or not isinstance(grad, float):
+                raise TypeError("grad must be a float")
+            if not math.isfinite(grad):
+                raise ValueError("grad must be finite")
+
+    def _updated(self, data, grad, moment, velocity, bias1, bias2):
+        """Compute (new_data, new_m, new_v) for one active parameter."""
+        one_minus_b1 = 1.0 - self.beta1
+        one_minus_b2 = 1.0 - self.beta2
+        if isinstance(data, list):
+            new_m = []
+            new_v = []
+            new_data = []
+            for value, g, m_value, v_value in zip(
+                data, grad, moment, velocity
+            ):
+                m_next = self.beta1 * m_value + one_minus_b1 * g
+                v_next = self.beta2 * v_value + one_minus_b2 * g * g
+                if not math.isfinite(m_next) or not math.isfinite(v_next):
+                    raise ValueError("adam buffers must be finite")
+                m_hat = m_next / bias1
+                v_hat = v_next / bias2
+                if not math.isfinite(m_hat) or not math.isfinite(v_hat):
+                    raise ValueError("bias-corrected moments must be finite")
+                decayed = value - self.lr * self.weight_decay * value
+                if not math.isfinite(decayed):
+                    raise ValueError("weight decay result must be finite")
+                try:
+                    denominator = math.sqrt(v_hat) + self.eps
+                except (ValueError, OverflowError):
+                    raise ValueError("update denominator must be finite")
+                if not math.isfinite(denominator):
+                    raise ValueError("update denominator must be finite")
+                value_next = decayed - self.lr * m_hat / denominator
+                if not math.isfinite(value_next):
+                    raise ValueError("updated data must be finite")
+                new_m.append(m_next)
+                new_v.append(v_next)
+                new_data.append(value_next)
+            return new_data, new_m, new_v
+        m_next = self.beta1 * moment + one_minus_b1 * grad
+        v_next = self.beta2 * velocity + one_minus_b2 * grad * grad
+        if not math.isfinite(m_next) or not math.isfinite(v_next):
+            raise ValueError("adam buffers must be finite")
+        m_hat = m_next / bias1
+        v_hat = v_next / bias2
+        if not math.isfinite(m_hat) or not math.isfinite(v_hat):
+            raise ValueError("bias-corrected moments must be finite")
+        decayed = data - self.lr * self.weight_decay * data
+        if not math.isfinite(decayed):
+            raise ValueError("weight decay result must be finite")
+        try:
+            denominator = math.sqrt(v_hat) + self.eps
+        except (ValueError, OverflowError):
+            raise ValueError("update denominator must be finite")
+        if not math.isfinite(denominator):
+            raise ValueError("update denominator must be finite")
+        value_next = decayed - self.lr * m_hat / denominator
+        if not math.isfinite(value_next):
+            raise ValueError("updated data must be finite")
+        return value_next, m_next, v_next
+
+    def zero_grad(self):
+        for parameter in self.parameters:
+            parameter.grad = None
+        return None
+
+
 class RMSprop:
     """RMSprop optimizer over a fixed list of Tensors."""
 
