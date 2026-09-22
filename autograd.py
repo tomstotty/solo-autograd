@@ -2349,7 +2349,7 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
-    def avg_pool1d(self, kernel_size, stride=None):
+    def avg_pool1d(self, kernel_size, stride=None, padding=0, dilation=1):
         data = _require_nonempty_float_vector(self, "avg_pool1d")
         if isinstance(kernel_size, bool) or not isinstance(kernel_size, int):
             raise TypeError("kernel_size must be a positive int")
@@ -2361,43 +2361,77 @@ class Tensor:
             raise TypeError("stride must be a positive int")
         elif stride <= 0:
             raise ValueError("stride must be a positive int")
+        if isinstance(padding, bool) or not isinstance(padding, int):
+            raise TypeError("padding must be a non-negative int")
+        if padding < 0:
+            raise ValueError("padding must be a non-negative int")
+        if isinstance(dilation, bool) or not isinstance(dilation, int):
+            raise TypeError("dilation must be a positive int")
+        if dilation <= 0:
+            raise ValueError("dilation must be a positive int")
         n = len(data)
         k = kernel_size
         s = stride
-        out_len = (n - k) // s + 1
+        p = padding
+        d = dilation
+        out_len = (n + 2 * p - d * (k - 1) - 1) // s + 1
         if out_len <= 0:
             raise ValueError("avg_pool1d output length must be positive")
+        # Each window averages over a fixed denominator of k taps; taps
+        # landing outside [0, n) (from padding) count as 0.0. Only valid
+        # positions are accumulated, from 0.0 in ascending tap order, then
+        # the sum is divided by k; a fully out-of-range window yields 0.0.
+        # A non-finite partial sum or quotient aborts before a result
+        # tensor exists, so no state can change on failure.
         out_data = []
         for o in range(out_len):
             acc = 0.0
             for i in range(k):
-                acc += data[o * s + i]
-                if not math.isfinite(acc):
-                    raise ValueError("avg_pool1d intermediate must be finite")
+                j = o * s + i * d - p
+                if 0 <= j < n:
+                    acc += data[j]
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "avg_pool1d intermediate must be finite"
+                        )
             mean = acc / k
             if not math.isfinite(mean):
                 raise ValueError("avg_pool1d intermediate must be finite")
             out_data.append(mean)
         if not self.requires_grad:
             return Tensor._make(out_data, False, (), None)
-        # Only the input length and window parameters are captured; mutating
-        # the parent's data after the forward pass cannot change backward.
+        # Snapshot the input length and window parameters with the graph;
+        # mutating the parent's data after the forward pass cannot change
+        # what a pending backward pass uses.
         parent = self
+        snapshot_n = n
+        snapshot_k = k
+        snapshot_s = s
+        snapshot_p = p
+        snapshot_d = d
 
         def backward_fn(grad):
-            dx = [0.0] * n
+            # dx[j] += grad[o] / k for every in-range tap, accumulated in
+            # the same ascending (o, i) order as the forward pass; a
+            # non-finite division or partial sum aborts the whole pass
+            # before any grad is written.
+            dx = [0.0] * snapshot_n
             for o in range(out_len):
-                for i in range(k):
-                    share = grad[o] / k
-                    if not math.isfinite(share):
-                        raise ValueError(
-                            "avg_pool1d backward intermediate must be finite"
-                        )
-                    dx[o * s + i] += share
-                    if not math.isfinite(dx[o * s + i]):
-                        raise ValueError(
-                            "avg_pool1d backward intermediate must be finite"
-                        )
+                for i in range(snapshot_k):
+                    j = o * snapshot_s + i * snapshot_d - snapshot_p
+                    if 0 <= j < snapshot_n:
+                        share = grad[o] / snapshot_k
+                        if not math.isfinite(share):
+                            raise ValueError(
+                                "avg_pool1d backward intermediate must be"
+                                " finite"
+                            )
+                        dx[j] += share
+                        if not math.isfinite(dx[j]):
+                            raise ValueError(
+                                "avg_pool1d backward intermediate must be"
+                                " finite"
+                            )
             return [(parent, dx)]
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
