@@ -2257,6 +2257,76 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def sqrt(self):
+        # Re-validate at call time since the data may have been mutated
+        # after construction: a finite float scalar or a non-empty 1D
+        # float list. bools, ints, nested lists and other types are a
+        # TypeError; an empty list or any non-finite value is a ValueError.
+        data = _validate_data(self.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        # Elementwise y = math.sqrt(x) in ascending index order; every
+        # input must be non-negative, and a non-finite result aborts before
+        # a result tensor exists, so the input and every other state stays
+        # untouched on failure.
+        if isinstance(data, list):
+            out_data = []
+            for x in data:
+                if x < 0.0:
+                    raise ValueError("sqrt input must be non-negative")
+                y = math.sqrt(x)
+                if not math.isfinite(y):
+                    raise ValueError("sqrt result must be finite")
+                out_data.append(y)
+        else:
+            if data < 0.0:
+                raise ValueError("sqrt input must be non-negative")
+            out_data = math.sqrt(data)
+            if not math.isfinite(out_data):
+                raise ValueError("sqrt result must be finite")
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # Snapshot both the forward input and output so later caller-side
+        # mutation or replacement of the input cannot change a pending
+        # backward pass.
+        snapshot_x = list(data) if isinstance(data, list) else data
+        snapshot_y = (
+            list(out_data) if isinstance(out_data, list) else out_data
+        )
+
+        def backward_fn(grad):
+            # Elementwise dx = g/(2*y) in ascending index order; x == 0.0
+            # (i.e. y == 0.0) is a ValueError. Each intermediate is
+            # checked as it is produced, and the generic engine validates
+            # the contribution itself and every merge into an existing
+            # grad.
+            if isinstance(grad, list):
+                contribution = []
+                for i in range(len(snapshot_y)):
+                    if snapshot_x[i] == 0.0:
+                        raise ValueError(
+                            "sqrt backward is undefined at zero"
+                        )
+                    value = grad[i] / (2.0 * snapshot_y[i])
+                    if not math.isfinite(value):
+                        raise ValueError(
+                            "sqrt backward intermediate must be finite"
+                        )
+                    contribution.append(value)
+            else:
+                if snapshot_x == 0.0:
+                    raise ValueError("sqrt backward is undefined at zero")
+                value = grad / (2.0 * snapshot_y)
+                if not math.isfinite(value):
+                    raise ValueError(
+                        "sqrt backward intermediate must be finite"
+                    )
+                contribution = value
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def sum(self):
         if isinstance(self.data, list):
             out_data = sum(self.data)
