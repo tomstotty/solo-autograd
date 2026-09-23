@@ -3850,6 +3850,77 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def max_pool2d(self, height, width, kernel_size, stride=None):
+        data = _require_nonempty_float_vector(self, "max_pool2d")
+        # height, width, kernel_size and a non-None stride must be
+        # non-bool positive ints; stride=None falls back to kernel_size.
+        for name, value in (
+            ("height", height),
+            ("width", width),
+            ("kernel_size", kernel_size),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(name + " must be a positive int")
+            if value <= 0:
+                raise ValueError(name + " must be a positive int")
+        if stride is None:
+            stride = kernel_size
+        elif isinstance(stride, bool) or not isinstance(stride, int):
+            raise TypeError("stride must be a positive int")
+        elif stride <= 0:
+            raise ValueError("stride must be a positive int")
+        H, W, K, S = height, width, kernel_size, stride
+        # self stores a single-channel H x W image in row-major order.
+        if len(data) != H * W:
+            raise ValueError(
+                "max_pool2d input length must equal height * width"
+            )
+        out_h = (H - K) // S + 1
+        out_w = (W - K) // S + 1
+        if out_h <= 0 or out_w <= 0:
+            raise ValueError("max_pool2d output dimensions must be positive")
+        # Scan positions in ascending (or, oc, kr, kc) order; the window
+        # tap sits at row or*S+kr, column oc*S+kc. On ties the earliest
+        # tap in scan order wins the gradient.
+        out_data = []
+        argmax_indices = []
+        for orow in range(out_h):
+            for ocol in range(out_w):
+                best = None
+                best_j = None
+                for kr in range(K):
+                    row = orow * S + kr
+                    for kc in range(K):
+                        j = row * W + (ocol * S + kc)
+                        if best is None or data[j] > best:
+                            best = data[j]
+                            best_j = j
+                out_data.append(best)
+                argmax_indices.append(best_j)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        # Snapshot the input length and winning indices with the graph;
+        # mutating the parent's data after the forward pass cannot change
+        # what a pending backward pass uses.
+        parent = self
+        n = H * W
+
+        def backward_fn(grad):
+            # dx[j] += grad[o] for the winning tap of each output,
+            # accumulated from 0.0 in ascending output order; a non-finite
+            # partial sum aborts the whole pass before any grad is written.
+            dx = [0.0] * n
+            for o in range(out_h * out_w):
+                j = argmax_indices[o]
+                dx[j] = dx[j] + grad[o]
+                if not math.isfinite(dx[j]):
+                    raise ValueError(
+                        "max_pool2d backward intermediate must be finite"
+                    )
+            return [(parent, dx)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def dropout(self, p=0.5, seed=0):
         data = _require_nonempty_float_vector(self, "dropout")
         if isinstance(p, bool) or not isinstance(p, float):
