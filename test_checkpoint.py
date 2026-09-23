@@ -795,7 +795,7 @@ class MomentumSGDDumpFormatTests(unittest.TestCase):
     def test_rejects_unsupported_optimizer(self):
         w = Tensor([0.1], True)
         with self.assertRaises(TypeError):
-            dump_checkpoint({"w": w}, Adagrad([w], 0.01))
+            dump_checkpoint({"w": w}, RMSprop([w], 0.01))
         with self.assertRaises(TypeError):
             dump_checkpoint({"w": w}, object())
 
@@ -896,7 +896,7 @@ class MomentumSGDLoadValidationTests(unittest.TestCase):
         w = Tensor([0.1], True)
         with self.assertRaises(TypeError):
             load_checkpoint(
-                {"w": w}, Adagrad([w], 0.01), self.text
+                {"w": w}, RMSprop([w], 0.01), self.text
             )
         with self.assertRaises(TypeError):
             load_checkpoint({"w": w}, object(), self.text)
