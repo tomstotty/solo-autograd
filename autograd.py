@@ -3393,7 +3393,8 @@ class Tensor:
             out_data, True, (parent_self, parent_kernel), backward_fn
         )
 
-    def conv_transpose2d(self, kernel, size, kernel_size):
+    def conv_transpose2d(self, kernel, size, kernel_size, stride=1,
+                         padding=0, dilation=1):
         if not isinstance(kernel, Tensor):
             raise TypeError("kernel must be a Tensor")
         # Both operands must hold non-empty 1D finite float lists; data may
@@ -3406,7 +3407,18 @@ class Tensor:
                 raise TypeError(name + " must be a positive int")
             if value <= 0:
                 raise ValueError(name + " must be a positive int")
-        N, K = size, kernel_size
+        # stride and dilation must be non-bool positive ints, and padding a
+        # non-bool non-negative int.
+        for name, value in (("stride", stride), ("dilation", dilation)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(name + " must be a positive int")
+            if value <= 0:
+                raise ValueError(name + " must be a positive int")
+        if isinstance(padding, bool) or not isinstance(padding, int):
+            raise TypeError("padding must be a non-negative int")
+        if padding < 0:
+            raise ValueError("padding must be a non-negative int")
+        N, K, S, P, D = size, kernel_size, stride, padding, dilation
         # self stores an N x N image and kernel a K x K filter, both in
         # row-major order; the transposed correlation emits an O x O output.
         if len(x_data) != N * N:
@@ -3416,7 +3428,9 @@ class Tensor:
                 "conv_transpose2d kernel length must equal "
                 "kernel_size * kernel_size"
             )
-        O = N + K - 1
+        O = (N - 1) * S - 2 * P + D * (K - 1) + 1
+        if O <= 0:
+            raise ValueError("conv_transpose2d output dimensions must be positive")
         # Snapshot both operands at call time so later caller-side mutation
         # or replacement of either input can change neither the forward
         # result nor a pending backward pass.
@@ -3425,17 +3439,25 @@ class Tensor:
         # Square 2D transposed cross-correlation: the kernel is never
         # flipped. Each input element scatters a scaled copy of the kernel
         # onto the output; in ascending (r, c, kr, kc) order,
-        # i = r*N+c, q = kr*K+kc and out[(r+kr)*O+(c+kc)] += a[i]*b[q],
-        # accumulated from 0.0. A non-finite product or partial sum aborts
-        # before a result tensor exists, so no state can change.
+        # i = r*N+c, q = kr*K+kc, y = r*S-P+kr*D and x = c*S-P+kc*D, so
+        # out[y*O+x] += a[i]*b[q], accumulated from 0.0. Output positions
+        # falling outside [0, O) (from padding or dilation/stride gaps) are
+        # skipped. A non-finite product or partial sum aborts before a
+        # result tensor exists, so no state can change.
         out_data = [0.0] * (O * O)
         for r in range(N):
             for c in range(N):
                 i = r * N + c
                 for kr in range(K):
+                    y = r * S - P + kr * D
+                    if not 0 <= y < O:
+                        continue
                     for kc in range(K):
                         q = kr * K + kc
-                        o = (r + kr) * O + (c + kc)
+                        x = c * S - P + kc * D
+                        if not 0 <= x < O:
+                            continue
+                        o = y * O + x
                         product = snapshot_x[i] * snapshot_k[q]
                         if not math.isfinite(product):
                             raise ValueError(
@@ -3453,17 +3475,24 @@ class Tensor:
         def backward_fn(grad):
             # dx[i] += g[o]*k[q] and dk[q] += g[o]*a[i], accumulated from
             # 0.0 in the same ascending (r, c, kr, kc) order as the forward
-            # pass. A non-finite product or partial sum aborts the whole
-            # pass before any grad is written.
+            # pass, using the same y/x indexing and skipping out-of-range
+            # positions. A non-finite product or partial sum aborts the
+            # whole pass before any grad is written.
             dx = [0.0] * (N * N)
             dk = [0.0] * (K * K)
             for r in range(N):
                 for c in range(N):
                     i = r * N + c
                     for kr in range(K):
+                        y = r * S - P + kr * D
+                        if not 0 <= y < O:
+                            continue
                         for kc in range(K):
                             q = kr * K + kc
-                            o = (r + kr) * O + (c + kc)
+                            x = c * S - P + kc * D
+                            if not 0 <= x < O:
+                                continue
+                            o = y * O + x
                             g = grad[o]
                             contrib_x = g * snapshot_k[q]
                             if not math.isfinite(contrib_x):
