@@ -9043,6 +9043,138 @@ def load_amsgrad(optimizer, text):
     return None
 
 
+_CHECKPOINT_INTEGER = re.compile(r"(?:0|[1-9][0-9]*)")
+
+
+def dump_checkpoint(parameters, optimizer):
+    """Serialize named parameters and an AMSGrad optimizer to JSON.
+
+    Only AMSGrad is supported. The parameters mapping is validated with
+    the dump_state contract and its values must be the optimizer's
+    parameters itemwise in the same order. The output contains no
+    whitespace and no trailing newline; top-level keys are version,
+    names and amsgrad in that order; version is the integer 1, names is
+    the parameter-name array and amsgrad is exactly the object produced
+    by dump_amsgrad, keeping its six-decimal byte-level format.
+    """
+    if not isinstance(optimizer, AMSGrad):
+        raise TypeError("optimizer must be an AMSGrad instance")
+    _check_state_parameters(parameters)
+    optimizer_parameters = optimizer.parameters
+    if len(parameters) != len(optimizer_parameters):
+        raise ValueError("parameters must match the optimizer parameters")
+    for (_, tensor), parameter in zip(
+        parameters.items(), optimizer_parameters
+    ):
+        if tensor is not parameter:
+            raise ValueError(
+                "parameter values must be the optimizer parameters in order"
+            )
+    amsgrad_text = dump_amsgrad(optimizer)
+    names = (
+        "["
+        + ",".join('"' + name + '"' for name, _ in parameters.items())
+        + "]"
+    )
+    return (
+        '{"version":1,"names":'
+        + names
+        + ',"amsgrad":'
+        + amsgrad_text
+        + "}"
+    )
+
+
+class _CheckpointParser:
+    """Strict parser for the exact textual form produced by dump_checkpoint."""
+
+    def __init__(self, text):
+        self._text = text
+        self._pos = 0
+
+    def _fail(self):
+        raise ValueError("text does not match the dump_checkpoint format")
+
+    def _expect(self, literal):
+        if not self._text.startswith(literal, self._pos):
+            self._fail()
+        self._pos += len(literal)
+
+    def _parse_name(self):
+        match = _STATE_NAME.match(self._text, self._pos)
+        if match is None:
+            self._fail()
+        name = match.group(0)
+        self._pos = match.end()
+        return name
+
+    def parse(self):
+        self._expect('{"version":')
+        match = _CHECKPOINT_INTEGER.match(self._text, self._pos)
+        if match is None:
+            self._fail()
+        self._pos = match.end()
+        version = int(match.group(0))
+        self._expect(',"names":[')
+        names = []
+        if not self._text.startswith("]", self._pos):
+            self._expect('"')
+            names.append(self._parse_name())
+            self._expect('"')
+            while self._text.startswith(",", self._pos):
+                self._pos += 1
+                self._expect('"')
+                names.append(self._parse_name())
+                self._expect('"')
+        self._expect('],"amsgrad":')
+        # The amsgrad object is the final value, immediately followed by
+        # the checkpoint's own single closing brace. Delegate its exact
+        # format (including duplicate/missing/extra/reordered inner keys)
+        # to the amsgrad parser, which rejects malformed or trailing bytes.
+        if not self._text.endswith("}"):
+            self._fail()
+        start = self._pos
+        amsgrad_text = self._text[start:-1]
+        _AMSGradParser(amsgrad_text).parse()
+        if version != 1:
+            raise ValueError("unsupported checkpoint version")
+        if not names:
+            raise ValueError("checkpoint names must be non-empty")
+        return names, amsgrad_text
+
+
+def load_checkpoint(parameters, optimizer, text):
+    """Restore named parameters and an AMSGrad optimizer from a checkpoint.
+
+    The parameters mapping is validated with the dump_state contract and
+    its values must be the optimizer's parameters itemwise in the same
+    order. On full validation success, behave exactly like load_amsgrad
+    for the embedded state: atomically replace data, requires_grad, m, v,
+    v_max and t, clear every grad, and keep object identities and
+    hyperparameters; return None. On any failure no state is touched.
+    """
+    if not isinstance(optimizer, AMSGrad):
+        raise TypeError("optimizer must be an AMSGrad instance")
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+    _check_state_parameters(parameters)
+    optimizer_parameters = optimizer.parameters
+    if len(parameters) != len(optimizer_parameters):
+        raise ValueError("parameters must match the optimizer parameters")
+    for (_, tensor), parameter in zip(
+        parameters.items(), optimizer_parameters
+    ):
+        if tensor is not parameter:
+            raise ValueError(
+                "parameter values must be the optimizer parameters in order"
+            )
+    names, amsgrad_text = _CheckpointParser(text).parse()
+    if names != list(parameters.keys()):
+        raise ValueError("checkpoint names must match parameters in order")
+    load_amsgrad(optimizer, amsgrad_text)
+    return None
+
+
 def _format_float(value):
     if not math.isfinite(value):
         raise ValueError("cannot serialize a non-finite float")
