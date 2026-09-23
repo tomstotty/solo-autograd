@@ -75,10 +75,10 @@ class DumpAdamaxTests(unittest.TestCase):
 
     def test_rejects_other_optimizer(self):
         a = Tensor(1.0, requires_grad=True)
-        for opt in (ag.SGD([a], lr=0.1), ag.Adam([a], lr=0.1)):
-            parameters = {"a": a}
-            with self.assertRaises(TypeError):
-                ag.dump_training_state(parameters, opt, 0, 0)
+        other = ag.SGD([a], lr=0.1)
+        parameters = {"a": a}
+        with self.assertRaises(TypeError):
+            ag.dump_training_state(parameters, other, 0, 0)
 
     def test_loop_value_types_and_ranges(self):
         parameters, opt = make_adamax()
@@ -228,9 +228,14 @@ class LoadValidationTests(unittest.TestCase):
 
     def test_rejects_other_optimizer(self):
         a = Tensor(1.0, requires_grad=True)
-        other = ag.Adam([a], lr=0.1)
+        other = ag.SGD([a], lr=0.1)
         with self.assertRaises(TypeError):
             ag.load_training_state({"a": a}, other, self.text)
+        # Adam is a supported optimizer, but a v2 text is an Adamax
+        # checkpoint, so the mismatch surfaces as ValueError.
+        adam = ag.Adam([a], lr=0.1)
+        with self.assertRaises(ValueError):
+            ag.load_training_state({"a": a}, adam, self.text)
 
     def test_cross_version_mismatch(self):
         rp, ropt = make_rmsprop()
