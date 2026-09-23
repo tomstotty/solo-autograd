@@ -9049,10 +9049,11 @@ _CHECKPOINT_INTEGER = re.compile(r"(?:0|[1-9][0-9]*)")
 def dump_checkpoint(parameters, optimizer):
     """Serialize named parameters and a supported optimizer.
 
-    Adam, AdamW, Adamax, AMSGrad, MomentumSGD and SGD are supported. The
-    parameters mapping is validated with the dump_state contract and its
-    values must be the optimizer's parameters itemwise in the same order.
-    The output contains no whitespace and no trailing newline.
+    Adam, AdamW, Adamax, Adagrad, AMSGrad, MomentumSGD and SGD are
+    supported. The parameters mapping is validated with the dump_state
+    contract and its values must be the optimizer's parameters itemwise
+    in the same order. The output contains no whitespace and no trailing
+    newline.
 
     For AMSGrad the version-1 form is emitted: top-level keys are
     version, names and amsgrad in that order; version is the integer 1,
@@ -9090,16 +9091,25 @@ def dump_checkpoint(parameters, optimizer):
     array and state is exactly the object produced by dump_momentum_sgd
     (keys parameters, velocity; each parameter entry has data then
     requires_grad), with every array ordered by names.
+
+    For Adagrad the version-7 form is emitted: top-level keys are
+    version, type, names and state in that order; version is the integer
+    7, type is the string "adagrad", names is the parameter-name array
+    and state is exactly the object produced by dump_adagrad (keys
+    parameters, sum_sq; each parameter entry has data then
+    requires_grad), with every array ordered by names.
     """
     if not isinstance(
-        optimizer, (Adam, AdamW, Adamax, AMSGrad, MomentumSGD, SGD)
+        optimizer, (Adam, AdamW, Adamax, Adagrad, AMSGrad, MomentumSGD, SGD)
     ):
         raise TypeError(
-            "optimizer must be an Adam, AdamW, Adamax, AMSGrad,"
+            "optimizer must be an Adam, AdamW, Adamax, Adagrad, AMSGrad,"
             " MomentumSGD or SGD instance"
         )
-    _check_state_parameters(parameters)
     optimizer_parameters = optimizer.parameters
+    if not isinstance(optimizer_parameters, list):
+        raise TypeError("optimizer parameters must be a list")
+    _check_state_parameters(parameters)
     if len(parameters) != len(optimizer_parameters):
         raise ValueError("parameters must match the optimizer parameters")
     for (_, tensor), parameter in zip(
@@ -9128,6 +9138,14 @@ def dump_checkpoint(parameters, optimizer):
             + names
             + ',"state":'
             + dump_momentum_sgd(optimizer)
+            + "}"
+        )
+    if isinstance(optimizer, Adagrad):
+        return (
+            '{"version":7,"type":"adagrad","names":'
+            + names
+            + ',"state":'
+            + dump_adagrad(optimizer)
             + "}"
         )
     if isinstance(optimizer, AMSGrad):
@@ -9256,6 +9274,12 @@ class _CheckpointParser:
             self._expect(',"state":')
             kind = "momentum_sgd"
             state_text = self._parse_state(_MomentumSGDParser)
+        elif version == 7:
+            self._expect(',"type":"adagrad","names":')
+            names = self._parse_names()
+            self._expect(',"state":')
+            kind = "adagrad"
+            state_text = self._parse_state(_AdagradParser)
         else:
             raise ValueError("unsupported checkpoint version")
         if not names:
@@ -9271,14 +9295,15 @@ def load_checkpoint(parameters, optimizer, text):
     The parameters mapping is validated with the dump_state contract and
     its values must be the optimizer's parameters itemwise in the same
     order. The exact version-1 (AMSGrad), version-2 (Adam),
-    version-3 (AdamW), version-4 (Adamax), version-5 (SGD) and
-    version-6 (MomentumSGD) forms produced by dump_checkpoint are
-    accepted, and the checkpoint type must match the target optimizer.
+    version-3 (AdamW), version-4 (Adamax), version-5 (SGD),
+    version-6 (MomentumSGD) and version-7 (Adagrad) forms produced by
+    dump_checkpoint are accepted, and the checkpoint type must match the
+    target optimizer.
 
-    Versions 1-3, 5 and 6 require the checkpoint names to match the
+    Versions 1-3 and 5-7 require the checkpoint names to match the
     target parameter names in order and behave exactly like
-    load_amsgrad, load_adam, load_adamw, load_sgd or load_momentum_sgd
-    for the embedded state.
+    load_amsgrad, load_adam, load_adamw, load_sgd, load_momentum_sgd or
+    load_adagrad for the embedded state.
 
     Version 4 binds state positions by name: its names array must name
     exactly the same parameter set as the target (duplicates rejected),
@@ -9289,16 +9314,18 @@ def load_checkpoint(parameters, optimizer, text):
     hyperparameters; return None. On any failure no state is touched.
     """
     if not isinstance(
-        optimizer, (Adam, AdamW, Adamax, AMSGrad, MomentumSGD, SGD)
+        optimizer, (Adam, AdamW, Adamax, Adagrad, AMSGrad, MomentumSGD, SGD)
     ):
         raise TypeError(
-            "optimizer must be an Adam, AdamW, Adamax, AMSGrad,"
+            "optimizer must be an Adam, AdamW, Adamax, Adagrad, AMSGrad,"
             " MomentumSGD or SGD instance"
         )
     if not isinstance(text, str):
         raise TypeError("text must be a string")
-    _check_state_parameters(parameters)
     optimizer_parameters = optimizer.parameters
+    if not isinstance(optimizer_parameters, list):
+        raise TypeError("optimizer parameters must be a list")
+    _check_state_parameters(parameters)
     if len(parameters) != len(optimizer_parameters):
         raise ValueError("parameters must match the optimizer parameters")
     for (_, tensor), parameter in zip(
@@ -9324,6 +9351,9 @@ def load_checkpoint(parameters, optimizer, text):
     elif kind == "momentum_sgd":
         if not isinstance(optimizer, MomentumSGD):
             raise ValueError("checkpoint type must match the optimizer")
+    elif kind == "adagrad":
+        if not isinstance(optimizer, Adagrad):
+            raise ValueError("checkpoint type must match the optimizer")
     elif not isinstance(optimizer, Adam):
         raise ValueError("checkpoint type must match the optimizer")
     target_names = list(parameters.keys())
@@ -9346,6 +9376,8 @@ def load_checkpoint(parameters, optimizer, text):
         load_sgd(optimizer, state_text)
     elif kind == "momentum_sgd":
         load_momentum_sgd(optimizer, state_text)
+    elif kind == "adagrad":
+        load_adagrad(optimizer, state_text)
     else:
         load_adam(optimizer, state_text)
     return None

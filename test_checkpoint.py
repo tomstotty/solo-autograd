@@ -1,7 +1,7 @@
 """Contract tests for dump_checkpoint/load_checkpoint.
 
-Covers AMSGrad v1, Adam v2, AdamW v3, Adamax v4, SGD v5 and
-MomentumSGD v6. Standard library only; discovered by
+Covers AMSGrad v1, Adam v2, AdamW v3, Adamax v4, SGD v5,
+MomentumSGD v6 and Adagrad v7. Standard library only; discovered by
 ``python -m unittest discover``.
 """
 
@@ -16,6 +16,7 @@ from autograd import (
     MomentumSGD,
     RMSprop,
     Tensor,
+    dump_adagrad,
     dump_adam,
     dump_amsgrad,
     dump_checkpoint,
@@ -795,7 +796,7 @@ class MomentumSGDDumpFormatTests(unittest.TestCase):
     def test_rejects_unsupported_optimizer(self):
         w = Tensor([0.1], True)
         with self.assertRaises(TypeError):
-            dump_checkpoint({"w": w}, Adagrad([w], 0.01))
+            dump_checkpoint({"w": w}, RMSprop([w], 0.01))
         with self.assertRaises(TypeError):
             dump_checkpoint({"w": w}, object())
 
@@ -896,7 +897,7 @@ class MomentumSGDLoadValidationTests(unittest.TestCase):
         w = Tensor([0.1], True)
         with self.assertRaises(TypeError):
             load_checkpoint(
-                {"w": w}, Adagrad([w], 0.01), self.text
+                {"w": w}, RMSprop([w], 0.01), self.text
             )
         with self.assertRaises(TypeError):
             load_checkpoint({"w": w}, object(), self.text)
@@ -1072,6 +1073,390 @@ class MomentumSGDLoadValidationTests(unittest.TestCase):
                 self.assertIs(
                     self.optimizer.momentum, momentum_before
                 )
+
+
+def make_adagrad_state():
+    w = Tensor([0.1, -0.2, 0.3], True)
+    b = Tensor(1.5, False)
+    optimizer = Adagrad([w, b], 0.01)
+    w.grad = [0.4, -0.5, 0.6]
+    b.grad = 0.7
+    optimizer.step()
+    return {"w": w, "b": b}, optimizer
+
+
+class AdagradDumpFormatTests(unittest.TestCase):
+
+    def test_textual_form(self):
+        parameters, optimizer = make_adagrad_state()
+        text = dump_checkpoint(parameters, optimizer)
+        self.assertIsInstance(text, str)
+        self.assertFalse(text.endswith("\n"))
+        for whitespace in (" ", "\n", "\t", "\r"):
+            self.assertNotIn(whitespace, text)
+        payload = json.loads(text)
+        self.assertEqual(
+            list(payload.keys()), ["version", "type", "names", "state"]
+        )
+        self.assertEqual(payload["version"], 7)
+        self.assertIsInstance(payload["version"], int)
+        self.assertEqual(payload["type"], "adagrad")
+        self.assertEqual(payload["names"], ["w", "b"])
+        self.assertEqual(
+            list(payload["state"].keys()), ["parameters", "sum_sq"]
+        )
+        inner_start = text.index('"state":') + len('"state":')
+        self.assertEqual(text[inner_start:-1], dump_adagrad(optimizer))
+
+    def test_exact_byte_form(self):
+        w = Tensor(1.5, True)
+        b = Tensor([-0.0, 2.0], False)
+        optimizer = Adagrad([w, b], 0.1)
+        text = dump_checkpoint({"w": w, "b": b}, optimizer)
+        self.assertEqual(
+            text,
+            '{"version":7,"type":"adagrad","names":["w","b"],"state":'
+            '{"parameters":['
+            '{"data":1.500000,"requires_grad":true},'
+            '{"data":[0.000000,2.000000],"requires_grad":false}'
+            '],"sum_sq":[0.000000,[0.000000,0.000000]]}}',
+        )
+
+    def test_stepped_state_exact_byte_form(self):
+        w = Tensor(1.0, True)
+        optimizer = Adagrad([w], 0.1)
+        w.grad = 0.5
+        optimizer.step()
+        text = dump_checkpoint({"w": w}, optimizer)
+        self.assertEqual(
+            text,
+            '{"version":7,"type":"adagrad","names":["w"],"state":'
+            '{"parameters":['
+            '{"data":0.900000,"requires_grad":true}'
+            '],"sum_sq":[0.250000]}}',
+        )
+
+    def test_six_decimals_no_exponent_no_negative_zero(self):
+        tiny = Tensor(1e-9, True)
+        huge = Tensor(1e20, True)
+        negzero = Tensor(-0.0, False)
+        optimizer = Adagrad([tiny, huge, negzero], 1.0)
+        text = dump_checkpoint(
+            {"tiny": tiny, "huge": huge, "negzero": negzero}, optimizer
+        )
+        self.assertIn("0.000000", text)
+        self.assertIn("100000000000000000000.000000", text)
+        self.assertNotIn("e+", text)
+        self.assertNotIn("e-", text)
+        self.assertNotIn("E", text)
+        self.assertNotIn("-0.000000", text)
+
+    def test_parameters_follow_dump_state_contract(self):
+        _, optimizer = make_adagrad_state()
+        w, b = optimizer.parameters
+        with self.assertRaises(TypeError):
+            dump_checkpoint([("w", w), ("b", b)], optimizer)
+        with self.assertRaises(ValueError):
+            dump_checkpoint({}, optimizer)
+        with self.assertRaises(TypeError):
+            dump_checkpoint({1: w, "b": b}, optimizer)
+        with self.assertRaises(ValueError):
+            dump_checkpoint({"1": w, "b": b}, optimizer)
+        with self.assertRaises(TypeError):
+            dump_checkpoint({"w": 1.0, "b": b}, optimizer)
+        with self.assertRaises(ValueError):
+            dump_checkpoint({"w": w, "x": w}, optimizer)
+
+    def test_values_must_be_optimizer_parameters_in_order(self):
+        _, optimizer = make_adagrad_state()
+        w, b = optimizer.parameters
+        with self.assertRaises(ValueError):
+            dump_checkpoint({"w": b, "b": w}, optimizer)
+        with self.assertRaises(ValueError):
+            dump_checkpoint({"w": w}, optimizer)
+        with self.assertRaises(ValueError):
+            dump_checkpoint(
+                {"w": Tensor(list(w.data), True), "b": b}, optimizer
+            )
+
+    def test_optimizer_parameters_must_be_a_list(self):
+        w = Tensor([0.1], True)
+        optimizer = Adagrad([w], 0.01)
+        optimizer.parameters = tuple(optimizer.parameters)
+        with self.assertRaises(TypeError):
+            dump_checkpoint({"w": w}, optimizer)
+
+
+class AdagradLoadRoundTripTests(unittest.TestCase):
+
+    def test_round_trip_restores_semantics(self):
+        parameters, optimizer = make_adagrad_state()
+        text = dump_checkpoint(parameters, optimizer)
+        qw = Tensor([9.0, 9.0, 9.0], True)
+        qb = Tensor(9.0, True)
+        target = Adagrad([qw, qb], 0.5)
+        result = load_checkpoint({"w": qw, "b": qb}, target, text)
+        self.assertIsNone(result)
+        # sum_sq = g*g, so w moves by lr * g / (sqrt(g*g) + eps);
+        # values are stored at the six-decimal serialization precision.
+        self.assertEqual(qw.data, [0.09, -0.19, 0.29])
+        # b had requires_grad False, so the step left it at 1.5.
+        self.assertEqual(qb.data, 1.5)
+        self.assertTrue(qw.requires_grad)
+        self.assertFalse(qb.requires_grad)
+        self.assertIsNone(qw.grad)
+        self.assertIsNone(qb.grad)
+        self.assertEqual(target.sum_sq, [[0.16, 0.25, 0.36], 0.0])
+        # List/Tensor identities and hyperparameters survive.
+        self.assertIs(target.parameters[0], qw)
+        self.assertIs(target.parameters[1], qb)
+        self.assertEqual(target.lr, 0.5)
+        self.assertEqual(target.eps, 1e-8)
+
+    def test_resume_is_byte_identical_from_shared_text(self):
+        parameters, optimizer = make_adagrad_state()
+        text = dump_checkpoint(parameters, optimizer)
+        gradients = [
+            ([0.11, 0.22, -0.33], 0.44),
+            ([0.5, -0.6, 0.7], -0.8),
+            ([1.0, 1.0, 1.0], 2.0),
+        ]
+
+        def branch():
+            w = Tensor([0.0, 0.0, 0.0], True)
+            b = Tensor(0.0, False)
+            opt = Adagrad([w, b], 0.01)
+            load_checkpoint({"w": w, "b": b}, opt, text)
+            for grad_w, grad_b in gradients:
+                w.grad = list(grad_w)
+                b.grad = grad_b
+                opt.step()
+            return dump_checkpoint({"w": w, "b": b}, opt)
+
+        self.assertEqual(branch(), branch())
+
+    def test_dump_is_deterministic(self):
+        text1 = dump_checkpoint(*make_adagrad_state())
+        text2 = dump_checkpoint(*make_adagrad_state())
+        self.assertEqual(text1, text2)
+
+    def test_cross_kind_load_is_rejected(self):
+        adagrad_parameters, adagrad_optimizer = make_adagrad_state()
+        adagrad_text = dump_checkpoint(adagrad_parameters, adagrad_optimizer)
+        sgd_parameters, sgd_optimizer = make_sgd_state()
+        sgd_text = dump_checkpoint(sgd_parameters, sgd_optimizer)
+        w = Tensor([0.0, 0.0, 0.0], True)
+        b = Tensor(0.0, False)
+        with self.assertRaises(ValueError):
+            load_checkpoint(
+                {"w": w, "b": b}, SGD([w, b], 0.01), adagrad_text
+            )
+        with self.assertRaises(ValueError):
+            load_checkpoint(
+                {"w": w, "b": b},
+                Adagrad([w, b], 0.01),
+                sgd_text,
+            )
+
+
+class AdagradLoadValidationTests(unittest.TestCase):
+
+    def setUp(self):
+        self.parameters, self.optimizer = make_adagrad_state()
+        self.text = dump_checkpoint(self.parameters, self.optimizer)
+
+    def test_rejects_non_str_text(self):
+        for bad in (None, b"x", 1, 1.0, [], {}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    load_checkpoint(
+                        self.parameters, self.optimizer, bad
+                    )
+
+    def test_rejects_unsupported_optimizer(self):
+        w = Tensor([0.1], True)
+        with self.assertRaises(TypeError):
+            load_checkpoint(
+                {"w": w}, RMSprop([w], 0.01), self.text
+            )
+        with self.assertRaises(TypeError):
+            load_checkpoint({"w": w}, object(), self.text)
+
+    def test_optimizer_parameters_must_be_a_list(self):
+        optimizer = Adagrad([Tensor([0.1], True)], 0.01)
+        optimizer.parameters = tuple(optimizer.parameters)
+        with self.assertRaises(TypeError):
+            load_checkpoint(
+                {"w": optimizer.parameters[0]}, optimizer, self.text
+            )
+
+    def test_rejects_bad_parameters(self):
+        with self.assertRaises(TypeError):
+            load_checkpoint(
+                list(self.parameters.items()), self.optimizer, self.text
+            )
+        with self.assertRaises(ValueError):
+            load_checkpoint({}, self.optimizer, self.text)
+        w, b = self.optimizer.parameters
+        with self.assertRaises(ValueError):
+            load_checkpoint(
+                {"w": b, "b": w}, self.optimizer, self.text
+            )
+
+    def test_rejects_malformed_text(self):
+        state = dump_adagrad(self.optimizer)
+        bad_texts = (
+            "",
+            "{",
+            "not json",
+            "null",
+            "[]",
+            '{"version":7,"names":["w","b"],"type":"adagrad",'
+            '"state":' + state + "}",
+            '{"type":"adagrad","version":7,"names":["w","b"],'
+            '"state":' + state + "}",
+            '{"version":7,"type":"adagrad","state":'
+            + state
+            + ',"names":["w","b"]}',
+            '{"version":7,"names":["w","b"],"state":' + state + "}",
+            '{"version":7,"type":"adagrad","names":["w","b"],'
+            '"sum_sq":' + state + "}",
+            '{"version":7,"type":"sgd","names":["w","b"],"state":'
+            + state
+            + "}",
+            '{"version":5,"type":"adagrad","names":["w","b"],'
+            '"state":' + state + "}",
+            '{"version":07,"type":"adagrad","names":["w","b"],'
+            '"state":' + state + "}",
+            '{"version":7.0,"type":"adagrad","names":["w","b"],'
+            '"state":' + state + "}",
+            '{"version":7,"type":"adagrad","names":["w"],'
+            '"state":' + state + "}",
+            '{"version":7,"type":"adagrad","names":["b","w"],'
+            '"state":' + state + "}",
+            '{"version":7,"type":"adagrad","names":["w","w"],'
+            '"state":' + state + "}",
+            '{"version":7,"type":"adagrad","names":["w","x"],'
+            '"state":' + state + "}",
+            '{"version":7,"type":"adagrad","names":["w","b"],'
+            '"extra":0,"state":' + state + "}",
+            # Inner state key order: sum_sq before parameters.
+            '{"version":7,"type":"adagrad","names":["w","b"],'
+            '"state":{"sum_sq":[],"parameters":[]}}',
+            # Inner parameter entry key order: requires_grad before data.
+            '{"version":7,"type":"adagrad","names":["w","b"],'
+            '"state":{"parameters":['
+            '{"requires_grad":true,"data":1.0}'
+            '],"sum_sq":[1.0]}}',
+            # Extra inner state key.
+            '{"version":7,"type":"adagrad","names":["w","b"],'
+            '"state":{"parameters":['
+            '{"data":1.0,"requires_grad":true}'
+            '],"sum_sq":[1.0],"t":0}}',
+            # Missing sum_sq.
+            '{"version":7,"type":"adagrad","names":["w","b"],'
+            '"state":{"parameters":['
+            '{"data":1.0,"requires_grad":true}]}}',
+            # sum_sq length mismatch.
+            '{"version":7,"type":"adagrad","names":["w","b"],'
+            '"state":{"parameters":['
+            '{"data":1.0,"requires_grad":true},'
+            '{"data":2.0,"requires_grad":false}'
+            '],"sum_sq":[1.0]}}',
+            # Lexical/numeric number violations.
+            '{"version":7,"type":"adagrad","names":["w","b"],'
+            '"state":{"parameters":['
+            '{"data":1e9,"requires_grad":true}'
+            '],"sum_sq":[1.0]}}',
+            '{"version":7,"type":"adagrad","names":["w","b"],'
+            '"state":{"parameters":['
+            '{"data":-0.000000,"requires_grad":true}'
+            '],"sum_sq":[1.0]}}',
+            '{"version":7,"type":"adagrad","names":["w","b"],'
+            '"state":{"parameters":['
+            '{"data":1.0000000,"requires_grad":true}'
+            '],"sum_sq":[1.0]}}',
+            '{"version":7,"type":"adagrad","names":["w","b"],'
+            '"state":{"parameters":['
+            '{"data":1.000000,"requires_grad":true}'
+            '],"sum_sq":[1e9]}}',
+            '{"version":7,"type":"adagrad","names":["w","b"],'
+            '"state":{"parameters":['
+            '{"data":1.000000,"requires_grad":true}'
+            '],"sum_sq":[-0.000000]}}',
+            '{"version":7,"type":"adagrad","names":["w","b"],'
+            '"state":{"parameters":['
+            '{"data":true,"requires_grad":true}'
+            '],"sum_sq":[1.0]}}',
+            self.text + " ",
+            self.text[:-1],
+            self.text + "}",
+        )
+        for bad in bad_texts:
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    load_checkpoint(
+                        self.parameters, self.optimizer, bad
+                    )
+
+    def test_rejects_state_shape_mismatch(self):
+        qw = Tensor(9.0, True)
+        qb = Tensor([9.0, 9.0], False)
+        target = Adagrad([qw, qb], 0.5)
+        with self.assertRaises(ValueError):
+            load_checkpoint({"w": qw, "b": qb}, target, self.text)
+        with self.assertRaises(ValueError):
+            load_checkpoint({"b": qb, "w": qw}, target, self.text)
+
+    def test_rejects_sum_sq_shape_mismatch(self):
+        # Data shapes match the target but a vector parameter's sum_sq
+        # slot is a scalar, which must be rejected with state untouched.
+        qw = Tensor([9.0, 9.0, 9.0], True)
+        qb = Tensor(9.0, False)
+        target = Adagrad([qw, qb], 0.5)
+        bad = (
+            '{"version":7,"type":"adagrad","names":["w","b"],"state":'
+            '{"parameters":['
+            '{"data":[1.0,2.0,3.0],"requires_grad":true},'
+            '{"data":1.0,"requires_grad":false}'
+            '],"sum_sq":[0.000000,0.000000]}}'
+        )
+        with self.assertRaises(ValueError):
+            load_checkpoint({"w": qw, "b": qb}, target, bad)
+
+    def test_failed_load_changes_nothing(self):
+        w, b = self.optimizer.parameters
+        w.grad = [0.9, 0.9, 0.9]
+        b.grad = 0.9
+        data_before = list(w.data)
+        b_data_before = b.data
+        grad_before = list(w.grad)
+        sum_sq_before = [
+            list(slot) if isinstance(slot, list) else slot
+            for slot in self.optimizer.sum_sq
+        ]
+        lr_before = self.optimizer.lr
+        eps_before = self.optimizer.eps
+        bad_texts = (
+            "{",
+            self.text.replace('["w","b"]', '["x","b"]'),
+            self.text.replace('"version":7', '"version":6'),
+            self.text.replace('"type":"adagrad"', '"type":"sgd"'),
+            self.text.replace('"sum_sq":[', '"sum_sq":[9.9,', 1),
+        )
+        for bad in bad_texts:
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    load_checkpoint(
+                        self.parameters, self.optimizer, bad
+                    )
+                self.assertEqual(w.data, data_before)
+                self.assertEqual(b.data, b_data_before)
+                self.assertEqual(w.grad, grad_before)
+                self.assertEqual(b.grad, 0.9)
+                self.assertEqual(self.optimizer.sum_sq, sum_sq_before)
+                self.assertIs(self.optimizer.lr, lr_before)
+                self.assertIs(self.optimizer.eps, eps_before)
 
 
 if __name__ == "__main__":
