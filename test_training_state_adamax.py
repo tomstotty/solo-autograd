@@ -75,7 +75,7 @@ class DumpAdamaxTests(unittest.TestCase):
 
     def test_rejects_other_optimizer(self):
         a = Tensor(1.0, requires_grad=True)
-        for opt in (ag.SGD([a], lr=0.1), ag.Adam([a], lr=0.1)):
+        for opt in (ag.SGD([a], lr=0.1), ag.AdamW([a], lr=0.1)):
             parameters = {"a": a}
             with self.assertRaises(TypeError):
                 ag.dump_training_state(parameters, opt, 0, 0)
@@ -228,7 +228,7 @@ class LoadValidationTests(unittest.TestCase):
 
     def test_rejects_other_optimizer(self):
         a = Tensor(1.0, requires_grad=True)
-        other = ag.Adam([a], lr=0.1)
+        other = ag.AdamW([a], lr=0.1)
         with self.assertRaises(TypeError):
             ag.load_training_state({"a": a}, other, self.text)
 
