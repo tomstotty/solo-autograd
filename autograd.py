@@ -2505,6 +2505,66 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def prod(self):
+        # Re-validate at call time since the data may have been mutated
+        # after construction: a finite float scalar or a non-empty 1D
+        # float list. bools, ints and other types are a TypeError; an
+        # empty list or any non-finite value is a ValueError.
+        data = _validate_data(self.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        if isinstance(data, list):
+            # Accumulate from 1.0 in ascending index order; a non-finite
+            # partial product aborts before a result tensor exists, so no
+            # state can change on failure.
+            total = 1.0
+            for value in data:
+                total *= value
+                if not math.isfinite(total):
+                    raise ValueError("prod intermediate must be finite")
+            out_data = total
+        else:
+            # A scalar's product is the scalar itself.
+            out_data = data
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # Snapshot the input so later caller-side mutation or replacement
+        # of the input cannot change a pending backward pass.
+        snapshot_x = list(data) if isinstance(data, list) else data
+
+        def backward_fn(grad):
+            # Scalar input: the contribution is g itself. Vector input:
+            # the contribution for element i is g times the product of
+            # every x[j] with j != i, accumulated from 1.0 in ascending
+            # j order; a single-element vector uses the empty product
+            # 1.0, so a zero element still gets a well-defined gradient.
+            # Each intermediate is checked as it is produced, and the
+            # generic engine validates the contribution itself and every
+            # merge into an existing grad.
+            if not isinstance(snapshot_x, list):
+                return [(parent, grad)]
+            n = len(snapshot_x)
+            contribution = []
+            for i in range(n):
+                product = 1.0
+                for j in range(n):
+                    if j != i:
+                        product *= snapshot_x[j]
+                        if not math.isfinite(product):
+                            raise ValueError(
+                                "prod backward intermediate must be finite"
+                            )
+                value = product * grad
+                if not math.isfinite(value):
+                    raise ValueError(
+                        "prod backward intermediate must be finite"
+                    )
+                contribution.append(value)
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def variance(self, correction=0):
         data = _require_nonempty_float_vector(self, "variance")
         if isinstance(correction, bool) or not isinstance(correction, int):
