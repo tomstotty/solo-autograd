@@ -9621,6 +9621,127 @@ def _load_checkpoint_adamax(parameters, optimizer, text, names):
     return None
 
 
+def dump_training_state(parameters, optimizer, global_step, rng_state):
+    """Serialize named parameters, an RMSprop optimizer and loop state.
+
+    Only RMSprop is supported; any other optimizer raises TypeError. The
+    parameters mapping and the optimizer state follow the dump_checkpoint
+    version-8 contract. global_step must be a non-bool non-negative int
+    and rng_state a non-bool int in 0..4294967295; a wrong type raises
+    TypeError and an out-of-range value raises ValueError.
+
+    The output contains no whitespace and no trailing newline; top-level
+    keys are version, global_step, rng_state and checkpoint in that
+    order, where version is the integer 1, global_step and rng_state are
+    the two loop-state integers and checkpoint is exactly the JSON object
+    produced by dump_checkpoint, keeping its version-8 bytes unchanged.
+    """
+    if not isinstance(optimizer, RMSprop):
+        raise TypeError("optimizer must be an RMSprop instance")
+    checkpoint = dump_checkpoint(parameters, optimizer)
+    if isinstance(global_step, bool) or not isinstance(global_step, int):
+        raise TypeError("global_step must be a non-bool non-negative int")
+    if global_step < 0:
+        raise ValueError("global_step must be a non-bool non-negative int")
+    if isinstance(rng_state, bool) or not isinstance(rng_state, int):
+        raise TypeError("rng_state must be a non-bool int in 0..4294967295")
+    if rng_state < 0 or rng_state > 4294967295:
+        raise ValueError("rng_state must be a non-bool int in 0..4294967295")
+    return (
+        '{"version":1,"global_step":'
+        + str(global_step)
+        + ',"rng_state":'
+        + str(rng_state)
+        + ',"checkpoint":'
+        + checkpoint
+        + "}"
+    )
+
+
+class _TrainingStateParser:
+    """Strict parser for the exact textual form of dump_training_state."""
+
+    def __init__(self, text):
+        self._text = text
+        self._pos = 0
+
+    def _fail(self):
+        raise ValueError("text does not match the dump_training_state format")
+
+    def _expect(self, literal):
+        if not self._text.startswith(literal, self._pos):
+            self._fail()
+        self._pos += len(literal)
+
+    def _parse_integer(self):
+        match = _CHECKPOINT_INTEGER.match(self._text, self._pos)
+        if match is None:
+            self._fail()
+        self._pos = match.end()
+        return int(match.group(0))
+
+    def parse(self):
+        self._expect('{"version":')
+        version = self._parse_integer()
+        if version != 1:
+            raise ValueError("unsupported training state version")
+        self._expect(',"global_step":')
+        global_step = self._parse_integer()
+        self._expect(',"rng_state":')
+        rng_state = self._parse_integer()
+        if rng_state > 4294967295:
+            raise ValueError("rng_state must be in 0..4294967295")
+        self._expect(',"checkpoint":')
+        # The checkpoint object is the final value, immediately followed
+        # by the training state's own single closing brace. Its exact
+        # format (including the version-8 digest) is validated by the
+        # checkpoint parser before any state is applied.
+        if not self._text.endswith("}"):
+            self._fail()
+        checkpoint_text = self._text[self._pos:-1]
+        return global_step, rng_state, checkpoint_text
+
+
+def load_training_state(parameters, optimizer, text):
+    """Restore named parameters, an RMSprop optimizer and loop state.
+
+    Only RMSprop is supported; any other optimizer raises TypeError, and
+    a non-string text raises TypeError. The parameters mapping and the
+    optimizer state follow the load_checkpoint version-8 contract. Only
+    the exact form produced by dump_training_state is accepted: any
+    outer parse, key set/order, version, integer lexical/range or inner
+    version-8 error raises ValueError.
+
+    The content is fully validated before anything is committed. On
+    success, atomically restore data, requires_grad, square_avg and the
+    RMSprop hyperparameters, clear every grad and return the tuple
+    (global_step, rng_state) of two ints. On any failure the parameters,
+    grads, slots and hyperparameters are left unchanged.
+    """
+    if not isinstance(optimizer, RMSprop):
+        raise TypeError("optimizer must be an RMSprop instance")
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+    optimizer_parameters = optimizer.parameters
+    if not isinstance(optimizer_parameters, list):
+        raise TypeError("optimizer parameters must be a list")
+    _check_state_parameters(parameters)
+    if len(parameters) != len(optimizer_parameters):
+        raise ValueError("parameters must match the optimizer parameters")
+    for (_, tensor), parameter in zip(
+        parameters.items(), optimizer_parameters
+    ):
+        if tensor is not parameter:
+            raise ValueError(
+                "parameter values must be the optimizer parameters in order"
+            )
+    global_step, rng_state, checkpoint_text = _TrainingStateParser(
+        text
+    ).parse()
+    load_checkpoint(parameters, optimizer, checkpoint_text)
+    return (global_step, rng_state)
+
+
 def _format_float(value):
     if not math.isfinite(value):
         raise ValueError("cannot serialize a non-finite float")
