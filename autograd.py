@@ -2455,6 +2455,64 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def prod(self):
+        # Re-validate at call time since the data may have been mutated
+        # after construction: a finite float scalar or a non-empty 1D
+        # float list. bools, ints and other types are a TypeError; an
+        # empty list or any non-finite value is a ValueError.
+        data = _validate_data(self.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        if isinstance(data, list):
+            # Accumulate from 1.0 in ascending index order; a non-finite
+            # partial product aborts before a result tensor exists, so no
+            # state can change on failure.
+            acc = 1.0
+            for value in data:
+                acc *= value
+                if not math.isfinite(acc):
+                    raise ValueError("prod intermediate must be finite")
+            out_data = acc
+        else:
+            # A scalar's product is the scalar itself.
+            out_data = data
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # _validate_data already returns a fresh list for vector input,
+        # so `data` is a snapshot: later caller-side mutation or
+        # replacement of the input cannot change a pending backward pass.
+        snapshot = data
+
+        def backward_fn(grad):
+            # Scalar input: the contribution is g itself. Vector input:
+            # element i receives g times the product of every x[j] with
+            # j != i, accumulated from 1.0 in ascending index order; a
+            # single-element vector therefore gets the empty product 1.0
+            # and zero elements contribute their mathematical product.
+            if not isinstance(snapshot, list):
+                return [(parent, grad)]
+            contribution = []
+            for i in range(len(snapshot)):
+                cofactor = 1.0
+                for j in range(len(snapshot)):
+                    if j == i:
+                        continue
+                    cofactor *= snapshot[j]
+                    if not math.isfinite(cofactor):
+                        raise ValueError(
+                            "prod backward intermediate must be finite"
+                        )
+                value = cofactor * grad
+                if not math.isfinite(value):
+                    raise ValueError(
+                        "prod backward intermediate must be finite"
+                    )
+                contribution.append(value)
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def mean(self):
         # Re-validate at call time since the data may have been mutated
         # after construction: a finite float scalar or a non-empty 1D
