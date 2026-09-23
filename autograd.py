@@ -8297,6 +8297,215 @@ def load_rmsprop(optimizer, text):
     return None
 
 
+def _check_adamax_state(optimizer):
+    """Validate an Adamax optimizer's full mutable state for dump/load."""
+    parameters = optimizer.parameters
+    if not isinstance(parameters, list):
+        raise TypeError("parameters must be a non-empty list of Tensors")
+    if len(parameters) == 0:
+        raise ValueError("parameters must be non-empty")
+    for parameter in parameters:
+        if not isinstance(parameter, Tensor):
+            raise TypeError("parameters must contain only Tensors")
+    if len({id(parameter) for parameter in parameters}) != len(parameters):
+        raise ValueError("parameters must not contain duplicate Tensors")
+    for parameter in parameters:
+        if not isinstance(parameter.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        _validate_data(parameter.data)
+    if not isinstance(optimizer.m, list):
+        raise TypeError("m must be a list matching the parameters")
+    if len(optimizer.m) != len(parameters):
+        raise ValueError("m must match the parameters in length")
+    if not isinstance(optimizer.u, list):
+        raise TypeError("u must be a list matching the parameters")
+    if len(optimizer.u) != len(parameters):
+        raise ValueError("u must match the parameters in length")
+    for item, parameter in zip(optimizer.m, parameters):
+        Adamax._check_buffer(item, parameter.data, "m")
+    for item, parameter in zip(optimizer.u, parameters):
+        Adamax._check_buffer(item, parameter.data, "u", non_negative=True)
+    if isinstance(optimizer.t, bool) or not isinstance(optimizer.t, int):
+        raise TypeError("t must be a non-bool non-negative int")
+    if optimizer.t < 0:
+        raise ValueError("t must be a non-bool non-negative int")
+
+
+def dump_adamax(optimizer):
+    """Serialize an Adamax optimizer's full state to a compact JSON string.
+
+    The output contains no whitespace and no trailing newline; top-level
+    keys are parameters, m, u, t in that order; floats are written with
+    exactly six decimals and negative zero as 0.000000; t is a JSON
+    integer.
+    """
+    if not isinstance(optimizer, Adamax):
+        raise TypeError("optimizer must be an Adamax instance")
+    _check_adamax_state(optimizer)
+    entries = []
+    for parameter in optimizer.parameters:
+        entries.append(
+            '{"data":'
+            + _json_value(parameter.data)
+            + ',"requires_grad":'
+            + ("true" if parameter.requires_grad else "false")
+            + "}"
+        )
+    moments = "[" + ",".join(_json_value(item) for item in optimizer.m) + "]"
+    infinity_norms = (
+        "[" + ",".join(_json_value(item) for item in optimizer.u) + "]"
+    )
+    return (
+        '{"parameters":['
+        + ",".join(entries)
+        + '],"m":'
+        + moments
+        + ',"u":'
+        + infinity_norms
+        + ',"t":'
+        + str(optimizer.t)
+        + "}"
+    )
+
+
+_ADAMAX_INTEGER = re.compile(r"(?:0|[1-9][0-9]*)")
+
+
+class _AdamaxParser:
+    """Strict parser for the exact textual form produced by dump_adamax."""
+
+    def __init__(self, text):
+        self._text = text
+        self._pos = 0
+
+    def _fail(self):
+        raise ValueError("text does not match the dump_adamax format")
+
+    def _expect(self, literal):
+        if not self._text.startswith(literal, self._pos):
+            self._fail()
+        self._pos += len(literal)
+
+    def _parse_number(self):
+        match = _STATE_NUMBER.match(self._text, self._pos)
+        if match is None:
+            self._fail()
+        token = match.group(0)
+        self._pos = match.end()
+        value = float(token)
+        if not math.isfinite(value) or (value == 0.0 and token[0] == "-"):
+            self._fail()
+        return value
+
+    def _parse_data(self):
+        if not self._text.startswith("[", self._pos):
+            return self._parse_number()
+        self._pos += 1
+        values = [self._parse_number()]
+        while self._text.startswith(",", self._pos):
+            self._pos += 1
+            values.append(self._parse_number())
+        self._expect("]")
+        return values
+
+    def _parse_parameter(self):
+        self._expect('{"data":')
+        data = self._parse_data()
+        self._expect(',"requires_grad":')
+        if self._text.startswith("true", self._pos):
+            self._pos += 4
+            requires_grad = True
+        elif self._text.startswith("false", self._pos):
+            self._pos += 5
+            requires_grad = False
+        else:
+            self._fail()
+        self._expect("}")
+        return (data, requires_grad)
+
+    def _parse_buffer(self):
+        self._expect("[")
+        items = [self._parse_data()]
+        while self._text.startswith(",", self._pos):
+            self._pos += 1
+            items.append(self._parse_data())
+        self._expect("]")
+        return items
+
+    def parse(self):
+        self._expect('{"parameters":[')
+        parameters = [self._parse_parameter()]
+        while self._text.startswith(",", self._pos):
+            self._pos += 1
+            parameters.append(self._parse_parameter())
+        self._expect('],"m":')
+        moments = self._parse_buffer()
+        self._expect(',"u":')
+        infinity_norms = self._parse_buffer()
+        self._expect(',"t":')
+        match = _ADAMAX_INTEGER.match(self._text, self._pos)
+        if match is None:
+            self._fail()
+        self._pos = match.end()
+        t = int(match.group(0))
+        self._expect("}")
+        if self._pos != len(self._text):
+            self._fail()
+        return parameters, moments, infinity_norms, t
+
+
+def load_adamax(optimizer, text):
+    """Restore an Adamax optimizer's full state from a dump_adamax string.
+
+    On full validation success, atomically replace every parameter's data
+    and requires_grad, clear every grad, and replace m, u and t; lr,
+    beta1, beta2, eps and the parameter identities are left unchanged. On
+    any failure no state is touched.
+    """
+    if not isinstance(optimizer, Adamax):
+        raise TypeError("optimizer must be an Adamax instance")
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+    _check_adamax_state(optimizer)
+    parameters, moments, infinity_norms, t = _AdamaxParser(text).parse()
+    count = len(optimizer.parameters)
+    if len(parameters) != count:
+        raise ValueError("state must contain exactly one entry per parameter")
+    if len(moments) != count or len(infinity_norms) != count:
+        raise ValueError("state m and u must match the parameters in length")
+    updates = []
+    for (data, requires_grad), parameter in zip(
+        parameters, optimizer.parameters
+    ):
+        current = parameter.data
+        if isinstance(current, list):
+            if not isinstance(data, list) or len(data) != len(current):
+                raise ValueError("state data shape must match parameter shape")
+        elif isinstance(data, list):
+            raise ValueError("state data shape must match parameter shape")
+        updates.append((parameter, data, requires_grad))
+    for name, buffers in (("m", moments), ("u", infinity_norms)):
+        for buffer, parameter in zip(buffers, optimizer.parameters):
+            current = parameter.data
+            if isinstance(current, list):
+                if not isinstance(buffer, list) or len(buffer) != len(current):
+                    raise ValueError(
+                        "state " + name + " shape must match parameter shape"
+                    )
+            elif isinstance(buffer, list):
+                raise ValueError(
+                    "state " + name + " shape must match parameter shape"
+                )
+    for parameter, data, requires_grad in updates:
+        parameter.data = data
+        parameter.requires_grad = requires_grad
+        parameter.grad = None
+    optimizer.m = moments
+    optimizer.u = infinity_norms
+    optimizer.t = t
+    return None
+
+
 def _format_float(value):
     if not math.isfinite(value):
         raise ValueError("cannot serialize a non-finite float")
