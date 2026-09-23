@@ -9622,23 +9622,38 @@ def _load_checkpoint_adamax(parameters, optimizer, text, names):
 
 
 def dump_training_state(parameters, optimizer, global_step, rng_state):
-    """Serialize named parameters, an RMSprop optimizer and loop state.
+    """Serialize named parameters, a supported optimizer and loop state.
 
-    Only RMSprop is supported; any other optimizer raises TypeError. The
+    RMSprop and Adamax are supported; any other optimizer raises
+    TypeError, and so do non-bool loop values of the wrong type. The
     parameters mapping and the optimizer state follow the dump_checkpoint
-    version-8 contract. global_step must be a non-bool non-negative int
-    and rng_state a non-bool int in 0..4294967295; a wrong type raises
-    TypeError and an out-of-range value raises ValueError.
+    contract. For Adamax, lr, beta1, beta2 and eps are validated exactly
+    as the constructor validates them: a wrong type raises TypeError and
+    an illegal value raises ValueError. global_step must be a non-bool
+    non-negative int and rng_state a non-bool int in 0..4294967295; an
+    out-of-range value raises ValueError.
 
     The output contains no whitespace and no trailing newline; top-level
     keys are version, global_step, rng_state and checkpoint in that
-    order, where version is the integer 1, global_step and rng_state are
-    the two loop-state integers and checkpoint is exactly the JSON object
-    produced by dump_checkpoint, keeping its version-8 bytes unchanged.
+    order, where global_step and rng_state are the two loop-state
+    integers and checkpoint is exactly the JSON object produced by
+    dump_checkpoint, keeping its inner bytes unchanged. RMSprop emits
+    version 1 with a version-8 checkpoint; Adamax emits version 2 with a
+    version-4 checkpoint.
     """
-    if not isinstance(optimizer, RMSprop):
-        raise TypeError("optimizer must be an RMSprop instance")
-    checkpoint = dump_checkpoint(parameters, optimizer)
+    if isinstance(optimizer, RMSprop):
+        version = 1
+        checkpoint = dump_checkpoint(parameters, optimizer)
+    elif isinstance(optimizer, Adamax):
+        version = 2
+        checkpoint = dump_checkpoint(parameters, optimizer)
+        Adamax._check_hyperparameters(
+            optimizer.lr, optimizer.beta1, optimizer.beta2, optimizer.eps
+        )
+    else:
+        raise TypeError(
+            "optimizer must be an RMSprop or Adamax instance"
+        )
     if isinstance(global_step, bool) or not isinstance(global_step, int):
         raise TypeError("global_step must be a non-bool non-negative int")
     if global_step < 0:
@@ -9648,7 +9663,9 @@ def dump_training_state(parameters, optimizer, global_step, rng_state):
     if rng_state < 0 or rng_state > 4294967295:
         raise ValueError("rng_state must be a non-bool int in 0..4294967295")
     return (
-        '{"version":1,"global_step":'
+        '{"version":'
+        + str(version)
+        + ',"global_step":'
         + str(global_step)
         + ',"rng_state":'
         + str(rng_state)
@@ -9683,7 +9700,7 @@ class _TrainingStateParser:
     def parse(self):
         self._expect('{"version":')
         version = self._parse_integer()
-        if version != 1:
+        if version != 1 and version != 2:
             raise ValueError("unsupported training state version")
         self._expect(',"global_step":')
         global_step = self._parse_integer()
@@ -9694,32 +9711,38 @@ class _TrainingStateParser:
         self._expect(',"checkpoint":')
         # The checkpoint object is the final value, immediately followed
         # by the training state's own single closing brace. Its exact
-        # format (including the version-8 digest) is validated by the
+        # format (version 8 for v1, version 4 for v2) is validated by the
         # checkpoint parser before any state is applied.
         if not self._text.endswith("}"):
             self._fail()
         checkpoint_text = self._text[self._pos:-1]
-        return global_step, rng_state, checkpoint_text
+        return version, global_step, rng_state, checkpoint_text
 
 
 def load_training_state(parameters, optimizer, text):
-    """Restore named parameters, an RMSprop optimizer and loop state.
+    """Restore named parameters, a supported optimizer and loop state.
 
-    Only RMSprop is supported; any other optimizer raises TypeError, and
-    a non-string text raises TypeError. The parameters mapping and the
-    optimizer state follow the load_checkpoint version-8 contract. Only
-    the exact form produced by dump_training_state is accepted: any
-    outer parse, key set/order, version, integer lexical/range or inner
-    version-8 error raises ValueError.
+    RMSprop and Adamax are supported; any other optimizer raises
+    TypeError, and a non-string text raises TypeError. The parameters
+    mapping follows the load_checkpoint contract. Only the exact forms
+    produced by dump_training_state are accepted: version 1 must wrap a
+    version-8 RMSprop checkpoint and version 2 a version-4 Adamax
+    checkpoint, and the checkpoint type must match the target optimizer.
+    Any outer parse, key set/order, version/target, integer lexical/range
+    or inner checkpoint error raises ValueError.
 
     The content is fully validated before anything is committed. On
-    success, atomically restore data, requires_grad, square_avg and the
-    RMSprop hyperparameters, clear every grad and return the tuple
-    (global_step, rng_state) of two ints. On any failure the parameters,
-    grads, slots and hyperparameters are left unchanged.
+    success the embedded checkpoint restores the optimizer atomically
+    (RMSprop: data, requires_grad, square_avg and hyperparameters;
+    Adamax: data, requires_grad, m, u and t, keeping object identities
+    and hyperparameters), clears every grad and the tuple
+    (global_step, rng_state) of two ints is returned. On any failure the
+    parameters, grads, slots and hyperparameters are left unchanged.
     """
-    if not isinstance(optimizer, RMSprop):
-        raise TypeError("optimizer must be an RMSprop instance")
+    if not isinstance(optimizer, (RMSprop, Adamax)):
+        raise TypeError(
+            "optimizer must be an RMSprop or Adamax instance"
+        )
     if not isinstance(text, str):
         raise TypeError("text must be a string")
     optimizer_parameters = optimizer.parameters
@@ -9735,9 +9758,20 @@ def load_training_state(parameters, optimizer, text):
             raise ValueError(
                 "parameter values must be the optimizer parameters in order"
             )
-    global_step, rng_state, checkpoint_text = _TrainingStateParser(
+    version, global_step, rng_state, checkpoint_text = _TrainingStateParser(
         text
     ).parse()
+    kind, _, _, _ = _CheckpointParser(checkpoint_text).parse()
+    if version == 1:
+        if kind != "rmsprop" or not isinstance(optimizer, RMSprop):
+            raise ValueError(
+                "version 1 training state must wrap an RMSprop checkpoint"
+            )
+    else:
+        if kind != "adamax" or not isinstance(optimizer, Adamax):
+            raise ValueError(
+                "version 2 training state must wrap an Adamax checkpoint"
+            )
     load_checkpoint(parameters, optimizer, checkpoint_text)
     return (global_step, rng_state)
 
