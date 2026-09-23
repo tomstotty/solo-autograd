@@ -9773,17 +9773,29 @@ class _TrainingStateParser:
         return version, global_step, rng_state, checkpoint_text
 
 
-def _load_checkpoint_adam_named(parameters, optimizer, text, names):
-    """Apply the version-2 Adam state embedded in a version-3 dump.
+def _load_checkpoint_adam_family_named(parameters, optimizer, text, names):
+    """Apply an Adam-family state embedded in a version-3/4 dump by name.
 
-    Binds its entries by name like the version-4 Adamax path: names may be
-    in any order but must name exactly the target parameters, and the
-    data/requires_grad/m/v entries are rearranged into optimizer order.
-    The whole embedded state and its alignment to the target parameters
-    is validated before anything is touched.
+    Single private path shared by version 3 (version-2 Adam checkpoint)
+    and version 4 (version-3 AdamW checkpoint): both embedded states use
+    the parameters/m/v/t layout, so verification, name binding,
+    reordering and the atomic commit are the same code. names may be in
+    any order but must name exactly the target parameters (the
+    checkpoint parser already rejects empty, missing or duplicated
+    names); the data/requires_grad/m/v entries follow that order and are
+    rearranged into optimizer.parameters order. The strict parser
+    enforces the finite-float values and the non-bool non-negative
+    integer t before this runs; counts, name equality and scalar/1-D
+    shapes are then checked against the target. Nothing is touched until
+    every check passes, after which data, requires_grad, m, v and t are
+    committed in one pass and every grad is cleared.
     """
-    _check_adam_state(optimizer)
-    state_parameters, moments, velocities, t = _AdamParser(text).parse()
+    if isinstance(optimizer, AdamW):
+        _check_adamw_state(optimizer)
+        state_parameters, moments, velocities, t = _AdamWParser(text).parse()
+    else:
+        _check_adam_state(optimizer)
+        state_parameters, moments, velocities, t = _AdamParser(text).parse()
     count = len(optimizer.parameters)
     if len(state_parameters) != count:
         raise ValueError("state must contain exactly one entry per parameter")
@@ -9803,77 +9815,7 @@ def _load_checkpoint_adam_named(parameters, optimizer, text, names):
     updates = []
     ordered_moments = []
     ordered_velocities = []
-    for name, parameter in zip(parameters.keys(), optimizer.parameters):
-        data, requires_grad = by_name[name][0]
-        current = parameter.data
-        if isinstance(current, list):
-            if not isinstance(data, list) or len(data) != len(current):
-                raise ValueError(
-                    "state data shape must match parameter shape"
-                )
-        elif isinstance(data, list):
-            raise ValueError("state data shape must match parameter shape")
-        updates.append((parameter, data, requires_grad))
-        ordered_moments.append(by_name[name][1])
-        ordered_velocities.append(by_name[name][2])
-    for slot_name, buffers in (
-        ("m", ordered_moments),
-        ("v", ordered_velocities),
-    ):
-        for buffer, parameter in zip(buffers, optimizer.parameters):
-            current = parameter.data
-            if isinstance(current, list):
-                if not isinstance(buffer, list) or len(buffer) != len(current):
-                    raise ValueError(
-                        "state " + slot_name
-                        + " shape must match parameter shape"
-                    )
-            elif isinstance(buffer, list):
-                raise ValueError(
-                    "state " + slot_name
-                    + " shape must match parameter shape"
-                )
-    for parameter, data, requires_grad in updates:
-        parameter.data = data
-        parameter.requires_grad = requires_grad
-        parameter.grad = None
-    optimizer.m = ordered_moments
-    optimizer.v = ordered_velocities
-    optimizer.t = t
-    return None
-
-
-def _load_checkpoint_adamw_named(parameters, optimizer, text, names):
-    """Apply the version-3 AdamW state embedded in a version-4 dump.
-
-    Binds its entries by name like the version-3 Adam path: names may be
-    in any order but must name exactly the target parameters, and the
-    data/requires_grad/m/v entries are rearranged into optimizer order.
-    The whole embedded state and its alignment to the target parameters
-    is validated before anything is touched.
-    """
-    _check_adamw_state(optimizer)
-    state_parameters, moments, velocities, t = _AdamWParser(text).parse()
-    count = len(optimizer.parameters)
-    if len(state_parameters) != count:
-        raise ValueError("state must contain exactly one entry per parameter")
-    if len(moments) != count or len(velocities) != count:
-        raise ValueError("state m and v must match the parameters in length")
-    target_names = list(parameters.keys())
-    if set(names) != set(target_names) or len(names) != len(target_names):
-        raise ValueError(
-            "checkpoint names must name exactly the target parameters"
-        )
-    by_name = {
-        name: (spec, moment, velocity)
-        for name, spec, moment, velocity in zip(
-            names, state_parameters, moments, velocities
-        )
-    }
-    updates = []
-    ordered_moments = []
-    ordered_velocities = []
-    for name, parameter in zip(parameters.keys(), optimizer.parameters):
+    for name, parameter in zip(target_names, optimizer.parameters):
         data, requires_grad = by_name[name][0]
         current = parameter.data
         if isinstance(current, list):
@@ -9985,7 +9927,7 @@ def load_training_state(parameters, optimizer, text):
             raise ValueError(
                 "version 3 training state must wrap an Adam checkpoint"
             )
-        _load_checkpoint_adam_named(
+        _load_checkpoint_adam_family_named(
             parameters, optimizer, state_text, names
         )
         return (global_step, rng_state)
@@ -9997,7 +9939,7 @@ def load_training_state(parameters, optimizer, text):
             raise ValueError(
                 "version 4 training state must wrap an AdamW checkpoint"
             )
-        _load_checkpoint_adamw_named(
+        _load_checkpoint_adam_family_named(
             parameters, optimizer, state_text, names
         )
         return (global_step, rng_state)
