@@ -553,6 +553,122 @@ class Tensor:
             out_data, True, (parent_self, parent_other), backward_fn
         )
 
+    def maximum(self, other):
+        # other accepts a Tensor or a finite float only; bools, ints and
+        # anything else are a TypeError, and a non-finite float is a
+        # ValueError.
+        if isinstance(other, bool) or not isinstance(other, (Tensor, float)):
+            raise TypeError("other must be a Tensor or a finite float")
+        if isinstance(other, float) and not math.isfinite(other):
+            raise ValueError("other must be finite")
+        other = other if isinstance(other, Tensor) else Tensor(other)
+        a = _validate_data(self.data)
+        b = _validate_data(other.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        if not isinstance(other.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        a_vector = isinstance(a, list)
+        b_vector = isinstance(b, list)
+        if a_vector and b_vector and len(a) != len(b):
+            raise ValueError("vector lengths must match")
+        # Take the larger value index by index in ascending output-index
+        # order, broadcasting a scalar across a vector. Both operands are
+        # finite, but the result is still verified before a tensor exists,
+        # so a failed forward changes no input.
+        if a_vector and b_vector:
+            n_outputs = len(a)
+            out_data = [
+                a[i] if a[i] >= b[i] else b[i] for i in range(n_outputs)
+            ]
+        elif a_vector:
+            n_outputs = len(a)
+            out_data = [x if x >= b else b for x in a]
+        elif b_vector:
+            n_outputs = len(b)
+            out_data = [a if a >= y else y for y in b]
+        else:
+            n_outputs = 1
+            out_data = a if a >= b else b
+        _ensure_finite_data(out_data)
+        if not (self.requires_grad or other.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_other = self, other
+        # Snapshot both operands so later caller-side mutation or
+        # replacement of either input cannot change what a pending
+        # backward pass uses.
+        snapshot_a = list(a) if a_vector else a
+        snapshot_b = list(b) if b_vector else b
+
+        def backward_fn(grad):
+            grad_values = grad if isinstance(grad, list) else [grad]
+            # Per-index winner decided from the snapshots: a > b routes the
+            # whole outgoing grad to self, a < b routes it to other, and a
+            # tie splits it as 0.5*g to each. Values stay index aligned
+            # with the output until any broadcast reduction.
+            da_values = [0.0] * n_outputs
+            db_values = [0.0] * n_outputs
+            for i in range(n_outputs):
+                x = snapshot_a[i] if a_vector else snapshot_a
+                y = snapshot_b[i] if b_vector else snapshot_b
+                g = grad_values[i]
+                if x > y:
+                    da_values[i] = g
+                    db_values[i] = 0.0
+                elif x < y:
+                    da_values[i] = 0.0
+                    db_values[i] = g
+                else:
+                    half = 0.5 * g
+                    if not math.isfinite(half):
+                        raise ValueError(
+                            "maximum backward intermediate must be finite"
+                        )
+                    da_values[i] = half
+                    db_values[i] = half
+            contributions = []
+            if parent_self.requires_grad:
+                if a_vector:
+                    for value in da_values:
+                        if not math.isfinite(value):
+                            raise ValueError(
+                                "maximum backward intermediate must be finite"
+                            )
+                    contributions.append((parent_self, da_values))
+                else:
+                    # A broadcast scalar parent reduces by accumulating
+                    # from 0.0 in ascending output-index order.
+                    total = 0.0
+                    for value in da_values:
+                        total += value
+                        if not math.isfinite(total):
+                            raise ValueError(
+                                "maximum backward intermediate must be finite"
+                            )
+                    contributions.append((parent_self, total))
+            if parent_other.requires_grad:
+                if b_vector:
+                    for value in db_values:
+                        if not math.isfinite(value):
+                            raise ValueError(
+                                "maximum backward intermediate must be finite"
+                            )
+                    contributions.append((parent_other, db_values))
+                else:
+                    total = 0.0
+                    for value in db_values:
+                        total += value
+                        if not math.isfinite(total):
+                            raise ValueError(
+                                "maximum backward intermediate must be finite"
+                            )
+                    contributions.append((parent_other, total))
+            return contributions
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_other), backward_fn
+        )
+
     def pow(self, exponent):
         # The exponent is accepted as a Tensor or a finite float only;
         # bools, ints and anything else are a TypeError, and a non-finite
