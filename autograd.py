@@ -3921,6 +3921,97 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def avg_pool2d(self, height, width, kernel_size, stride=None):
+        data = _require_nonempty_float_vector(self, "avg_pool2d")
+        # height, width, kernel_size and a non-None stride must be
+        # non-bool positive ints; stride=None falls back to kernel_size.
+        for name, value in (
+            ("height", height),
+            ("width", width),
+            ("kernel_size", kernel_size),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(name + " must be a positive int")
+            if value <= 0:
+                raise ValueError(name + " must be a positive int")
+        if stride is None:
+            stride = kernel_size
+        elif isinstance(stride, bool) or not isinstance(stride, int):
+            raise TypeError("stride must be a positive int")
+        elif stride <= 0:
+            raise ValueError("stride must be a positive int")
+        H, W, K, S = height, width, kernel_size, stride
+        # self stores a single-channel H x W image in row-major order.
+        if len(data) != H * W:
+            raise ValueError(
+                "avg_pool2d input length must equal height * width"
+            )
+        out_h = (H - K) // S + 1
+        out_w = (W - K) // S + 1
+        if out_h <= 0 or out_w <= 0:
+            raise ValueError("avg_pool2d output dimensions must be positive")
+        # Each K x K window averages over a fixed denominator of K*K taps.
+        # Taps are accumulated from 0.0 in ascending (or, oc, kr, kc)
+        # order, then the sum is divided by K*K. A non-finite partial sum
+        # or quotient aborts before a result tensor exists, so no state can
+        # change on failure.
+        out_data = []
+        for orow in range(out_h):
+            for ocol in range(out_w):
+                acc = 0.0
+                for kr in range(K):
+                    row = orow * S + kr
+                    for kc in range(K):
+                        acc += data[row * W + (ocol * S + kc)]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "avg_pool2d intermediate must be finite"
+                            )
+                mean = acc / (K * K)
+                if not math.isfinite(mean):
+                    raise ValueError("avg_pool2d intermediate must be finite")
+                out_data.append(mean)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        # Snapshot the image and window parameters with the graph; mutating
+        # the parent's data after the forward pass cannot change what a
+        # pending backward pass uses.
+        parent = self
+        n = H * W
+        snapshot_H = H
+        snapshot_W = W
+        snapshot_K = K
+        snapshot_S = S
+
+        def backward_fn(grad):
+            # dx[j] += grad[or*OW+oc] / (K*K) for every tap, accumulated
+            # from 0.0 in the same ascending (or, oc, kr, kc) order as the
+            # forward pass; a non-finite division or partial sum aborts the
+            # whole pass before any grad is written.
+            dx = [0.0] * n
+            for orow in range(out_h):
+                for ocol in range(out_w):
+                    share = grad[orow * out_w + ocol] / (
+                        snapshot_K * snapshot_K
+                    )
+                    if not math.isfinite(share):
+                        raise ValueError(
+                            "avg_pool2d backward intermediate must be finite"
+                        )
+                    for kr in range(snapshot_K):
+                        row = orow * snapshot_S + kr
+                        for kc in range(snapshot_K):
+                            j = row * snapshot_W + (ocol * snapshot_S + kc)
+                            dx[j] += share
+                            if not math.isfinite(dx[j]):
+                                raise ValueError(
+                                    "avg_pool2d backward intermediate must be"
+                                    " finite"
+                                )
+            return [(parent, dx)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def dropout(self, p=0.5, seed=0):
         data = _require_nonempty_float_vector(self, "dropout")
         if isinstance(p, bool) or not isinstance(p, float):
