@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Minimal autograd framework: finite scalar / 1D float tensors."""
 
+import hashlib
 import json
 import math
 import os
@@ -8420,6 +8421,25 @@ def _check_rmsprop_state(optimizer):
         RMSprop._check_slot(slot, parameter.data)
 
 
+def _check_rmsprop_hyperparameters(optimizer):
+    """Validate an RMSprop optimizer's lr, alpha and eps for dump/load."""
+    lr = optimizer.lr
+    if isinstance(lr, bool) or not isinstance(lr, float):
+        raise TypeError("lr must be a positive finite float")
+    if not math.isfinite(lr) or lr <= 0.0:
+        raise ValueError("lr must be a positive finite float")
+    alpha = optimizer.alpha
+    if isinstance(alpha, bool) or not isinstance(alpha, float):
+        raise TypeError("alpha must be a finite float in [0.0, 1.0)")
+    if not math.isfinite(alpha) or alpha < 0.0 or alpha >= 1.0:
+        raise ValueError("alpha must be a finite float in [0.0, 1.0)")
+    eps = optimizer.eps
+    if isinstance(eps, bool) or not isinstance(eps, float):
+        raise TypeError("eps must be a positive finite float")
+    if not math.isfinite(eps) or eps <= 0.0:
+        raise ValueError("eps must be a positive finite float")
+
+
 def dump_rmsprop(optimizer):
     """Serialize an RMSprop optimizer's full state to a compact JSON string.
 
@@ -9044,6 +9064,7 @@ def load_amsgrad(optimizer, text):
 
 
 _CHECKPOINT_INTEGER = re.compile(r"(?:0|[1-9][0-9]*)")
+_CHECKPOINT_DIGEST = re.compile(r',"digest":"([0-9a-f]{64})"\}\Z')
 
 
 def dump_checkpoint(parameters, optimizer):
@@ -9098,13 +9119,26 @@ def dump_checkpoint(parameters, optimizer):
     and state is exactly the object produced by dump_adagrad (keys
     parameters, sum_sq; each parameter entry has data then
     requires_grad), with every array ordered by names.
+
+    For RMSprop the version-8 form is emitted: a payload object whose
+    top-level keys are version, type, names, hyperparameters and state
+    in that order; version is the integer 8, type is the string
+    "rmsprop", names is the parameter-name array, hyperparameters is an
+    object with keys lr, alpha, eps in that order and state is exactly
+    the object produced by dump_rmsprop (keys parameters, square_avg;
+    each parameter entry has data then requires_grad), with every array
+    ordered by names. The payload carries no trailing newline; the final
+    text replaces the payload's closing brace with
+    ,"digest":"H"} where H is the lowercase 64-character hexadecimal
+    SHA-256 of the payload's UTF-8 bytes.
     """
     if not isinstance(
-        optimizer, (Adam, AdamW, Adamax, Adagrad, AMSGrad, MomentumSGD, SGD)
+        optimizer,
+        (Adam, AdamW, Adamax, Adagrad, AMSGrad, MomentumSGD, RMSprop, SGD),
     ):
         raise TypeError(
             "optimizer must be an Adam, AdamW, Adamax, Adagrad, AMSGrad,"
-            " MomentumSGD or SGD instance"
+            " MomentumSGD, RMSprop or SGD instance"
         )
     optimizer_parameters = optimizer.parameters
     if not isinstance(optimizer_parameters, list):
@@ -9148,6 +9182,23 @@ def dump_checkpoint(parameters, optimizer):
             + dump_adagrad(optimizer)
             + "}"
         )
+    if isinstance(optimizer, RMSprop):
+        _check_rmsprop_hyperparameters(optimizer)
+        payload = (
+            '{"version":8,"type":"rmsprop","names":'
+            + names
+            + ',"hyperparameters":{"lr":'
+            + _format_float(optimizer.lr)
+            + ',"alpha":'
+            + _format_float(optimizer.alpha)
+            + ',"eps":'
+            + _format_float(optimizer.eps)
+            + '},"state":'
+            + dump_rmsprop(optimizer)
+            + "}"
+        )
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return payload[:-1] + ',"digest":"' + digest + '"}'
     if isinstance(optimizer, AMSGrad):
         return (
             '{"version":1,"names":'
@@ -9231,6 +9282,35 @@ class _CheckpointParser:
         state_parser(state_text).parse()
         return state_text
 
+    def _parse_number(self):
+        match = _STATE_NUMBER.match(self._text, self._pos)
+        if match is None:
+            self._fail()
+        token = match.group(0)
+        self._pos = match.end()
+        value = float(token)
+        if not math.isfinite(value) or (value == 0.0 and token[0] == "-"):
+            self._fail()
+        return value
+
+    def _parse_state_digest(self, state_parser):
+        # Version 8 appends ,"digest":"H"} after the state object, where
+        # H is the lowercase hexadecimal SHA-256 of the payload: the
+        # full text with the digest member replaced by the payload's own
+        # closing brace. The digest must verify before the state is
+        # accepted; the state text itself is validated by the optimizer
+        # parser.
+        match = _CHECKPOINT_DIGEST.search(self._text)
+        if match is None:
+            self._fail()
+        payload = self._text[: match.start()] + "}"
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        if digest != match.group(1):
+            self._fail()
+        state_text = self._text[self._pos : match.start()]
+        state_parser(state_text).parse()
+        return state_text
+
     def parse(self):
         self._expect('{"version":')
         match = _CHECKPOINT_INTEGER.match(self._text, self._pos)
@@ -9238,6 +9318,7 @@ class _CheckpointParser:
             self._fail()
         self._pos = match.end()
         version = int(match.group(0))
+        hyperparameters = None
         if version == 1:
             self._expect(',"names":')
             names = self._parse_names()
@@ -9280,13 +9361,26 @@ class _CheckpointParser:
             self._expect(',"state":')
             kind = "adagrad"
             state_text = self._parse_state(_AdagradParser)
+        elif version == 8:
+            self._expect(',"type":"rmsprop","names":')
+            names = self._parse_names()
+            self._expect(',"hyperparameters":{"lr":')
+            lr = self._parse_number()
+            self._expect(',"alpha":')
+            alpha = self._parse_number()
+            self._expect(',"eps":')
+            eps = self._parse_number()
+            self._expect('},"state":')
+            kind = "rmsprop"
+            hyperparameters = (lr, alpha, eps)
+            state_text = self._parse_state_digest(_RMSpropParser)
         else:
             raise ValueError("unsupported checkpoint version")
         if not names:
             raise ValueError("checkpoint names must be non-empty")
         if len(set(names)) != len(names):
             raise ValueError("checkpoint names must not be duplicated")
-        return kind, names, state_text
+        return kind, names, state_text, hyperparameters
 
 
 def load_checkpoint(parameters, optimizer, text):
@@ -9296,14 +9390,21 @@ def load_checkpoint(parameters, optimizer, text):
     its values must be the optimizer's parameters itemwise in the same
     order. The exact version-1 (AMSGrad), version-2 (Adam),
     version-3 (AdamW), version-4 (Adamax), version-5 (SGD),
-    version-6 (MomentumSGD) and version-7 (Adagrad) forms produced by
-    dump_checkpoint are accepted, and the checkpoint type must match the
-    target optimizer.
+    version-6 (MomentumSGD), version-7 (Adagrad) and version-8 (RMSprop)
+    forms produced by dump_checkpoint are accepted, and the checkpoint
+    type must match the target optimizer.
 
     Versions 1-3 and 5-7 require the checkpoint names to match the
     target parameter names in order and behave exactly like
     load_amsgrad, load_adam, load_adamw, load_sgd, load_momentum_sgd or
     load_adagrad for the embedded state.
+
+    Version 8 requires the checkpoint names to match the target
+    parameter names in order and its digest to verify against the
+    payload; its hyperparameters must satisfy lr > 0, 0 <= alpha < 1 and
+    eps > 0. On full validation success it behaves exactly like
+    load_rmsprop for the embedded state and additionally replaces lr,
+    alpha and eps with the checkpoint values.
 
     Version 4 binds state positions by name: its names array must name
     exactly the same parameter set as the target (duplicates rejected),
@@ -9314,11 +9415,12 @@ def load_checkpoint(parameters, optimizer, text):
     hyperparameters; return None. On any failure no state is touched.
     """
     if not isinstance(
-        optimizer, (Adam, AdamW, Adamax, Adagrad, AMSGrad, MomentumSGD, SGD)
+        optimizer,
+        (Adam, AdamW, Adamax, Adagrad, AMSGrad, MomentumSGD, RMSprop, SGD),
     ):
         raise TypeError(
             "optimizer must be an Adam, AdamW, Adamax, Adagrad, AMSGrad,"
-            " MomentumSGD or SGD instance"
+            " MomentumSGD, RMSprop or SGD instance"
         )
     if not isinstance(text, str):
         raise TypeError("text must be a string")
@@ -9335,7 +9437,9 @@ def load_checkpoint(parameters, optimizer, text):
             raise ValueError(
                 "parameter values must be the optimizer parameters in order"
             )
-    kind, names, state_text = _CheckpointParser(text).parse()
+    kind, names, state_text, hyperparameters = _CheckpointParser(
+        text
+    ).parse()
     if kind == "amsgrad":
         if not isinstance(optimizer, AMSGrad):
             raise ValueError("checkpoint type must match the optimizer")
@@ -9353,6 +9457,9 @@ def load_checkpoint(parameters, optimizer, text):
             raise ValueError("checkpoint type must match the optimizer")
     elif kind == "adagrad":
         if not isinstance(optimizer, Adagrad):
+            raise ValueError("checkpoint type must match the optimizer")
+    elif kind == "rmsprop":
+        if not isinstance(optimizer, RMSprop):
             raise ValueError("checkpoint type must match the optimizer")
     elif not isinstance(optimizer, Adam):
         raise ValueError("checkpoint type must match the optimizer")
@@ -9378,6 +9485,18 @@ def load_checkpoint(parameters, optimizer, text):
         load_momentum_sgd(optimizer, state_text)
     elif kind == "adagrad":
         load_adagrad(optimizer, state_text)
+    elif kind == "rmsprop":
+        lr, alpha, eps = hyperparameters
+        if lr <= 0.0:
+            raise ValueError("checkpoint lr must be positive")
+        if alpha < 0.0 or alpha >= 1.0:
+            raise ValueError("checkpoint alpha must be in [0.0, 1.0)")
+        if eps <= 0.0:
+            raise ValueError("checkpoint eps must be positive")
+        load_rmsprop(optimizer, state_text)
+        optimizer.lr = lr
+        optimizer.alpha = alpha
+        optimizer.eps = eps
     else:
         load_adam(optimizer, state_text)
     return None

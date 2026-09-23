@@ -1,10 +1,11 @@
 """Contract tests for dump_checkpoint/load_checkpoint.
 
 Covers AMSGrad v1, Adam v2, AdamW v3, Adamax v4, SGD v5,
-MomentumSGD v6 and Adagrad v7. Standard library only; discovered by
-``python -m unittest discover``.
+MomentumSGD v6, Adagrad v7 and RMSprop v8. Standard library only;
+discovered by ``python -m unittest discover``.
 """
 
+import hashlib
 import json
 import unittest
 
@@ -21,6 +22,7 @@ from autograd import (
     dump_amsgrad,
     dump_checkpoint,
     dump_momentum_sgd,
+    dump_rmsprop,
     dump_sgd,
     load_checkpoint,
 )
@@ -85,8 +87,6 @@ class DumpFormatTests(unittest.TestCase):
 
     def test_rejects_unsupported_optimizer(self):
         w = Tensor([0.1], True)
-        with self.assertRaises(TypeError):
-            dump_checkpoint({"w": w}, RMSprop([w], 0.01))
         with self.assertRaises(TypeError):
             dump_checkpoint({"w": w}, object())
 
@@ -258,8 +258,6 @@ class LoadValidationTests(unittest.TestCase):
 
     def test_rejects_unsupported_optimizer(self):
         w = Tensor([0.1], True)
-        with self.assertRaises(TypeError):
-            load_checkpoint({"w": w}, RMSprop([w], 0.01), self.text)
         with self.assertRaises(TypeError):
             load_checkpoint({"w": w}, object(), self.text)
 
@@ -796,8 +794,6 @@ class MomentumSGDDumpFormatTests(unittest.TestCase):
     def test_rejects_unsupported_optimizer(self):
         w = Tensor([0.1], True)
         with self.assertRaises(TypeError):
-            dump_checkpoint({"w": w}, RMSprop([w], 0.01))
-        with self.assertRaises(TypeError):
             dump_checkpoint({"w": w}, object())
 
 
@@ -895,10 +891,6 @@ class MomentumSGDLoadValidationTests(unittest.TestCase):
 
     def test_rejects_unsupported_optimizer(self):
         w = Tensor([0.1], True)
-        with self.assertRaises(TypeError):
-            load_checkpoint(
-                {"w": w}, RMSprop([w], 0.01), self.text
-            )
         with self.assertRaises(TypeError):
             load_checkpoint({"w": w}, object(), self.text)
 
@@ -1276,10 +1268,6 @@ class AdagradLoadValidationTests(unittest.TestCase):
     def test_rejects_unsupported_optimizer(self):
         w = Tensor([0.1], True)
         with self.assertRaises(TypeError):
-            load_checkpoint(
-                {"w": w}, RMSprop([w], 0.01), self.text
-            )
-        with self.assertRaises(TypeError):
             load_checkpoint({"w": w}, object(), self.text)
 
     def test_optimizer_parameters_must_be_a_list(self):
@@ -1456,6 +1444,431 @@ class AdagradLoadValidationTests(unittest.TestCase):
                 self.assertEqual(b.grad, 0.9)
                 self.assertEqual(self.optimizer.sum_sq, sum_sq_before)
                 self.assertIs(self.optimizer.lr, lr_before)
+                self.assertIs(self.optimizer.eps, eps_before)
+
+
+def make_rmsprop_state():
+    w = Tensor([0.1, -0.2, 0.3], True)
+    b = Tensor(1.5, False)
+    optimizer = RMSprop([w, b], 0.01, alpha=0.9, eps=0.001)
+    w.grad = [0.4, -0.5, 0.6]
+    b.grad = 0.7
+    optimizer.step()
+    return {"w": w, "b": b}, optimizer
+
+
+def redigest_v8(text):
+    """Reattach a valid digest after tampering with a v8 payload."""
+    payload, _ = text.rsplit(',"digest":"', 1)
+    payload += "}"
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return payload[:-1] + ',"digest":"' + digest + '"}'
+
+
+class RMSpropDumpFormatTests(unittest.TestCase):
+
+    def test_textual_form(self):
+        parameters, optimizer = make_rmsprop_state()
+        text = dump_checkpoint(parameters, optimizer)
+        self.assertIsInstance(text, str)
+        self.assertFalse(text.endswith("\n"))
+        for whitespace in (" ", "\n", "\t", "\r"):
+            self.assertNotIn(whitespace, text)
+        payload_text, digest_suffix = text.rsplit(',"digest":"', 1)
+        payload_text += "}"
+        self.assertTrue(digest_suffix.endswith('"}'))
+        digest = digest_suffix[:-2]
+        self.assertEqual(len(digest), 64)
+        self.assertEqual(digest, digest.lower())
+        self.assertEqual(
+            digest,
+            hashlib.sha256(payload_text.encode("utf-8")).hexdigest(),
+        )
+        payload = json.loads(payload_text)
+        self.assertEqual(
+            list(payload.keys()),
+            ["version", "type", "names", "hyperparameters", "state"],
+        )
+        self.assertEqual(payload["version"], 8)
+        self.assertIsInstance(payload["version"], int)
+        self.assertEqual(payload["type"], "rmsprop")
+        self.assertEqual(payload["names"], ["w", "b"])
+        self.assertEqual(
+            list(payload["hyperparameters"].keys()), ["lr", "alpha", "eps"]
+        )
+        self.assertEqual(payload["hyperparameters"]["lr"], 0.01)
+        self.assertEqual(payload["hyperparameters"]["alpha"], 0.9)
+        self.assertEqual(payload["hyperparameters"]["eps"], 0.001)
+        self.assertEqual(
+            list(payload["state"].keys()), ["parameters", "square_avg"]
+        )
+        inner_start = text.index('"state":') + len('"state":')
+        inner_end = text.rindex(',"digest":"')
+        self.assertEqual(text[inner_start:inner_end], dump_rmsprop(optimizer))
+
+    def test_exact_byte_form(self):
+        w = Tensor(1.5, True)
+        b = Tensor([-0.0, 2.0], False)
+        optimizer = RMSprop([w, b], 0.1, alpha=0.5, eps=0.25)
+        text = dump_checkpoint({"w": w, "b": b}, optimizer)
+        self.assertEqual(
+            text,
+            '{"version":8,"type":"rmsprop","names":["w","b"],'
+            '"hyperparameters":'
+            '{"lr":0.100000,"alpha":0.500000,"eps":0.250000},'
+            '"state":'
+            '{"parameters":['
+            '{"data":1.500000,"requires_grad":true},'
+            '{"data":[0.000000,2.000000],"requires_grad":false}'
+            '],"square_avg":[0.000000,[0.000000,0.000000]]},'
+            '"digest":'
+            '"754833bb47a79a1093dadcb553df9db11f446fb1f3d694d286aec04f'
+            '33871cc6"}',
+        )
+
+    def test_six_decimals_no_exponent_no_negative_zero(self):
+        tiny = Tensor(1e-9, True)
+        huge = Tensor(1e20, True)
+        negzero = Tensor(-0.0, False)
+        optimizer = RMSprop([tiny, huge, negzero], 1.0)
+        text = dump_checkpoint(
+            {"tiny": tiny, "huge": huge, "negzero": negzero}, optimizer
+        )
+        self.assertIn("0.000000", text)
+        self.assertIn("100000000000000000000.000000", text)
+        self.assertNotIn("e+", text)
+        self.assertNotIn("e-", text)
+        self.assertNotIn("E", text)
+        self.assertNotIn("-0.000000", text)
+
+    def test_parameters_follow_dump_state_contract(self):
+        _, optimizer = make_rmsprop_state()
+        w, b = optimizer.parameters
+        with self.assertRaises(TypeError):
+            dump_checkpoint([("w", w), ("b", b)], optimizer)
+        with self.assertRaises(ValueError):
+            dump_checkpoint({}, optimizer)
+        with self.assertRaises(TypeError):
+            dump_checkpoint({1: w, "b": b}, optimizer)
+        with self.assertRaises(ValueError):
+            dump_checkpoint({"1": w, "b": b}, optimizer)
+        with self.assertRaises(TypeError):
+            dump_checkpoint({"w": 1.0, "b": b}, optimizer)
+        with self.assertRaises(ValueError):
+            dump_checkpoint({"w": w, "x": w}, optimizer)
+
+    def test_values_must_be_optimizer_parameters_in_order(self):
+        _, optimizer = make_rmsprop_state()
+        w, b = optimizer.parameters
+        with self.assertRaises(ValueError):
+            dump_checkpoint({"w": b, "b": w}, optimizer)
+        with self.assertRaises(ValueError):
+            dump_checkpoint({"w": w}, optimizer)
+        with self.assertRaises(ValueError):
+            dump_checkpoint(
+                {"w": Tensor(list(w.data), True), "b": b}, optimizer
+            )
+
+    def test_optimizer_parameters_must_be_a_list(self):
+        w = Tensor([0.1], True)
+        optimizer = RMSprop([w], 0.01)
+        optimizer.parameters = tuple(optimizer.parameters)
+        with self.assertRaises(TypeError):
+            dump_checkpoint({"w": w}, optimizer)
+
+    def test_rejects_invalid_hyperparameters(self):
+        w = Tensor([0.1], True)
+        for attr, bad, error in (
+            ("lr", 0.0, ValueError),
+            ("lr", -0.5, ValueError),
+            ("lr", float("inf"), ValueError),
+            ("lr", 1, TypeError),
+            ("alpha", -0.1, ValueError),
+            ("alpha", 1.0, ValueError),
+            ("alpha", float("nan"), ValueError),
+            ("alpha", True, TypeError),
+            ("eps", 0.0, ValueError),
+            ("eps", -1e-8, ValueError),
+            ("eps", float("inf"), ValueError),
+            ("eps", "x", TypeError),
+        ):
+            with self.subTest(attr=attr, bad=bad):
+                optimizer = RMSprop([w], 0.01)
+                setattr(optimizer, attr, bad)
+                with self.assertRaises(error):
+                    dump_checkpoint({"w": w}, optimizer)
+
+
+class RMSpropLoadRoundTripTests(unittest.TestCase):
+
+    def test_round_trip_restores_semantics(self):
+        parameters, optimizer = make_rmsprop_state()
+        text = dump_checkpoint(parameters, optimizer)
+        qw = Tensor([9.0, 9.0, 9.0], False)
+        qb = Tensor(9.0, True)
+        target = RMSprop([qw, qb], 0.5, alpha=0.1, eps=0.25)
+        qw.grad = [1.0, 1.0, 1.0]
+        result = load_checkpoint({"w": qw, "b": qb}, target, text)
+        self.assertIsNone(result)
+        # square_avg = 0.1 * g * g after one step from zero; data moves
+        # by lr * g / (sqrt(square_avg) + eps); values are stored at
+        # the six-decimal serialization precision.
+        self.assertEqual(qw.data, [0.068625, -0.168576, 0.268543])
+        # b had requires_grad False, so the step left it at 1.5.
+        self.assertEqual(qb.data, 1.5)
+        self.assertTrue(qw.requires_grad)
+        self.assertFalse(qb.requires_grad)
+        self.assertIsNone(qw.grad)
+        self.assertIsNone(qb.grad)
+        self.assertEqual(target.square_avg, [[0.016, 0.025, 0.036], 0.0])
+        # List/Tensor identities survive; hyperparameters are replaced.
+        self.assertIs(target.parameters[0], qw)
+        self.assertIs(target.parameters[1], qb)
+        self.assertEqual(target.lr, 0.01)
+        self.assertEqual(target.alpha, 0.9)
+        self.assertEqual(target.eps, 0.001)
+
+    def test_resume_is_byte_identical_from_shared_text(self):
+        parameters, optimizer = make_rmsprop_state()
+        text = dump_checkpoint(parameters, optimizer)
+        gradients = [
+            ([0.11, 0.22, -0.33], 0.44),
+            ([0.5, -0.6, 0.7], -0.8),
+            ([1.0, 1.0, 1.0], 2.0),
+        ]
+
+        def branch():
+            w = Tensor([0.0, 0.0, 0.0], True)
+            b = Tensor(0.0, False)
+            opt = RMSprop([w, b], 0.5, alpha=0.1, eps=0.25)
+            load_checkpoint({"w": w, "b": b}, opt, text)
+            for grad_w, grad_b in gradients:
+                w.grad = list(grad_w)
+                b.grad = grad_b
+                opt.step()
+            return dump_checkpoint({"w": w, "b": b}, opt)
+
+        self.assertEqual(branch(), branch())
+
+    def test_dump_is_deterministic(self):
+        text1 = dump_checkpoint(*make_rmsprop_state())
+        text2 = dump_checkpoint(*make_rmsprop_state())
+        self.assertEqual(text1, text2)
+
+    def test_cross_kind_load_is_rejected(self):
+        rmsprop_parameters, rmsprop_optimizer = make_rmsprop_state()
+        rmsprop_text = dump_checkpoint(rmsprop_parameters, rmsprop_optimizer)
+        sgd_parameters, sgd_optimizer = make_sgd_state()
+        sgd_text = dump_checkpoint(sgd_parameters, sgd_optimizer)
+        w = Tensor([0.0, 0.0, 0.0], True)
+        b = Tensor(0.0, False)
+        with self.assertRaises(ValueError):
+            load_checkpoint(
+                {"w": w, "b": b}, SGD([w, b], 0.01), rmsprop_text
+            )
+        with self.assertRaises(ValueError):
+            load_checkpoint(
+                {"w": w, "b": b},
+                RMSprop([w, b], 0.01),
+                sgd_text,
+            )
+
+
+class RMSpropLoadValidationTests(unittest.TestCase):
+
+    def setUp(self):
+        self.parameters, self.optimizer = make_rmsprop_state()
+        self.text = dump_checkpoint(self.parameters, self.optimizer)
+
+    def test_rejects_non_str_text(self):
+        for bad in (None, b"x", 1, 1.0, [], {}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    load_checkpoint(
+                        self.parameters, self.optimizer, bad
+                    )
+
+    def test_rejects_unsupported_optimizer(self):
+        w = Tensor([0.1], True)
+        with self.assertRaises(TypeError):
+            load_checkpoint({"w": w}, object(), self.text)
+
+    def test_optimizer_parameters_must_be_a_list(self):
+        optimizer = RMSprop([Tensor([0.1], True)], 0.01)
+        optimizer.parameters = tuple(optimizer.parameters)
+        with self.assertRaises(TypeError):
+            load_checkpoint(
+                {"w": optimizer.parameters[0]}, optimizer, self.text
+            )
+
+    def test_rejects_bad_parameters(self):
+        with self.assertRaises(TypeError):
+            load_checkpoint(
+                list(self.parameters.items()), self.optimizer, self.text
+            )
+        with self.assertRaises(ValueError):
+            load_checkpoint({}, self.optimizer, self.text)
+        w, b = self.optimizer.parameters
+        with self.assertRaises(ValueError):
+            load_checkpoint(
+                {"w": b, "b": w}, self.optimizer, self.text
+            )
+
+    def test_rejects_malformed_text(self):
+        payload = self.text.rsplit(',"digest":"', 1)[0] + "}"
+        state = dump_rmsprop(self.optimizer)
+        hyper = '"hyperparameters":{"lr":0.010000,"alpha":0.900000,"eps":0.001000}'
+        bad_texts = (
+            "",
+            "{",
+            "not json",
+            "null",
+            "[]",
+            # Missing digest member entirely.
+            payload,
+            # Truncated/extended/uppercase/non-hex digests.
+            self.text[:-3] + 'a"}',
+            self.text[:-66] + "A" * 64 + '"}',
+            self.text[:-66] + "g" * 64 + '"}',
+            self.text[:-66] + "a" * 63 + '"}',
+            self.text + "}",
+            # Digest does not match the payload.
+            redigest_v8(self.text)[:-66] + "0" * 64 + '"}',
+            self.text.replace('"alpha":0.900000', '"alpha":0.800000'),
+            # Top-level key order, missing and extra keys.
+            redigest_v8(self.text).replace(
+                '"version":8,"type":"rmsprop",', '"type":"rmsprop","version":8,'
+            ),
+            redigest_v8(self.text).replace('"type":"rmsprop",', ""),
+            redigest_v8(self.text).replace(
+                ',"hyperparameters"', ',"hyper"', 1
+            ),
+            redigest_v8(self.text).replace(
+                ',"state"', ',"extra":0,"state"', 1
+            ),
+            # Hyperparameter member order, missing and extra keys.
+            redigest_v8(self.text).replace(
+                hyper,
+                '"hyperparameters":{"alpha":0.900000,"lr":0.010000,"eps":0.001000}',
+            ),
+            redigest_v8(self.text).replace(
+                hyper,
+                '"hyperparameters":{"lr":0.010000,"alpha":0.900000}',
+            ),
+            redigest_v8(self.text).replace(
+                hyper,
+                '"hyperparameters":{"lr":0.010000,"alpha":0.900000,"eps":0.001000,"mu":0.100000}',
+            ),
+            # Names: missing, reordered, duplicated, wrong.
+            redigest_v8(self.text).replace('["w","b"]', '["w"]'),
+            redigest_v8(self.text).replace('["w","b"]', '["b","w"]'),
+            redigest_v8(self.text).replace('["w","b"]', '["w","w"]'),
+            redigest_v8(self.text).replace('["w","b"]', '["w","x"]'),
+            # Version and type mismatches.
+            redigest_v8(self.text).replace('"version":8', '"version":7'),
+            redigest_v8(self.text).replace('"type":"rmsprop"', '"type":"sgd"'),
+            redigest_v8(self.text).replace('"version":8', '"version":08'),
+            # Lexical violations in hyperparameters.
+            redigest_v8(self.text).replace('"lr":0.010000', '"lr":0.01000'),
+            redigest_v8(self.text).replace('"lr":0.010000', '"lr":1e-2'),
+            redigest_v8(self.text).replace('"lr":0.010000', '"lr": 0.010000'),
+            redigest_v8(self.text).replace('"alpha":0.900000', '"alpha":-0.000000'),
+            # Inner state key order and lexical violations.
+            redigest_v8(self.text).replace(
+                state,
+                '{"square_avg":[[0.016000,0.025000,0.036000],0.000000],'
+                '"parameters":[]}',
+            ),
+            redigest_v8(self.text).replace(
+                '"data":[0.068625,-0.168576,0.268543]',
+                '"data":[0.068625,-0.168576]',
+            ),
+            redigest_v8(self.text).replace(
+                '"square_avg":[[0.016000,0.025000,0.036000],0.000000]',
+                '"square_avg":[0.016000,0.000000]',
+            ),
+            self.text + " ",
+            self.text + "\n",
+            self.text[:-1],
+        )
+        for bad in bad_texts:
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    load_checkpoint(
+                        self.parameters, self.optimizer, bad
+                    )
+
+    def test_rejects_bad_hyperparameters(self):
+        bad_texts = (
+            self.text.replace('"lr":0.010000', '"lr":0.000000'),
+            self.text.replace('"lr":0.010000', '"lr":-0.010000'),
+            self.text.replace('"alpha":0.900000', '"alpha":1.000000'),
+            self.text.replace('"alpha":0.900000', '"alpha":-0.500000'),
+            self.text.replace('"eps":0.001000', '"eps":0.000000'),
+            self.text.replace('"eps":0.001000', '"eps":-0.001000'),
+        )
+        for bad in bad_texts:
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    load_checkpoint(
+                        self.parameters, self.optimizer, redigest_v8(bad)
+                    )
+
+    def test_rejects_state_shape_mismatch(self):
+        qw = Tensor(9.0, True)
+        qb = Tensor([9.0, 9.0], False)
+        target = RMSprop([qw, qb], 0.5)
+        with self.assertRaises(ValueError):
+            load_checkpoint({"w": qw, "b": qb}, target, self.text)
+        with self.assertRaises(ValueError):
+            load_checkpoint({"b": qb, "w": qw}, target, self.text)
+
+    def test_failed_load_changes_nothing(self):
+        w, b = self.optimizer.parameters
+        w.grad = [0.9, 0.9, 0.9]
+        b.grad = 0.9
+        data_before = list(w.data)
+        b_data_before = b.data
+        grad_before = list(w.grad)
+        square_avg_before = [
+            list(slot) if isinstance(slot, list) else slot
+            for slot in self.optimizer.square_avg
+        ]
+        lr_before = self.optimizer.lr
+        alpha_before = self.optimizer.alpha
+        eps_before = self.optimizer.eps
+        bad_texts = (
+            "{",
+            self.text.replace('["w","b"]', '["x","b"]'),
+            self.text.replace('"version":8', '"version":7'),
+            self.text.replace('"type":"rmsprop"', '"type":"sgd"'),
+            self.text.replace('"alpha":0.900000', '"alpha":0.800000'),
+            redigest_v8(
+                self.text.replace('"lr":0.010000', '"lr":-0.010000')
+            ),
+            redigest_v8(
+                self.text.replace('"alpha":0.900000', '"alpha":1.000000')
+            ),
+            redigest_v8(
+                self.text.replace('"eps":0.001000', '"eps":0.000000')
+            ),
+            redigest_v8(
+                self.text.replace('"square_avg":[', '"square_avg":[9.9,', 1)
+            ),
+        )
+        for bad in bad_texts:
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    load_checkpoint(
+                        self.parameters, self.optimizer, bad
+                    )
+                self.assertEqual(w.data, data_before)
+                self.assertEqual(b.data, b_data_before)
+                self.assertEqual(w.grad, grad_before)
+                self.assertEqual(b.grad, 0.9)
+                self.assertEqual(self.optimizer.square_avg, square_avg_before)
+                self.assertIs(self.optimizer.lr, lr_before)
+                self.assertIs(self.optimizer.alpha, alpha_before)
                 self.assertIs(self.optimizer.eps, eps_before)
 
 
