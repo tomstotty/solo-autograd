@@ -9131,14 +9131,32 @@ def dump_checkpoint(parameters, optimizer):
     text replaces the payload's closing brace with
     ,"digest":"H"} where H is the lowercase 64-character hexadecimal
     SHA-256 of the payload's UTF-8 bytes.
+
+    For Adadelta the version-9 form is emitted: top-level keys are
+    version, type, names and state in that order; version is the integer
+    9, type is the string "adadelta", names is the parameter-name array
+    and state is exactly the object produced by dump_adadelta (keys
+    parameters, square_avg, acc_delta; each parameter entry has data
+    then requires_grad), with every array ordered by names. rho and eps
+    are not serialized.
     """
     if not isinstance(
         optimizer,
-        (Adam, AdamW, Adamax, Adagrad, AMSGrad, MomentumSGD, RMSprop, SGD),
+        (
+            Adam,
+            AdamW,
+            Adamax,
+            Adadelta,
+            Adagrad,
+            AMSGrad,
+            MomentumSGD,
+            RMSprop,
+            SGD,
+        ),
     ):
         raise TypeError(
-            "optimizer must be an Adam, AdamW, Adamax, Adagrad, AMSGrad,"
-            " MomentumSGD, RMSprop or SGD instance"
+            "optimizer must be an Adam, AdamW, Adamax, Adadelta, Adagrad,"
+            " AMSGrad, MomentumSGD, RMSprop or SGD instance"
         )
     optimizer_parameters = optimizer.parameters
     if not isinstance(optimizer_parameters, list):
@@ -9180,6 +9198,14 @@ def dump_checkpoint(parameters, optimizer):
             + names
             + ',"state":'
             + dump_adagrad(optimizer)
+            + "}"
+        )
+    if isinstance(optimizer, Adadelta):
+        return (
+            '{"version":9,"type":"adadelta","names":'
+            + names
+            + ',"state":'
+            + dump_adadelta(optimizer)
             + "}"
         )
     if isinstance(optimizer, RMSprop):
@@ -9361,6 +9387,12 @@ class _CheckpointParser:
             self._expect(',"state":')
             kind = "adagrad"
             state_text = self._parse_state(_AdagradParser)
+        elif version == 9:
+            self._expect(',"type":"adadelta","names":')
+            names = self._parse_names()
+            self._expect(',"state":')
+            kind = "adadelta"
+            state_text = self._parse_state(_AdadeltaParser)
         elif version == 8:
             self._expect(',"type":"rmsprop","names":')
             names = self._parse_names()
@@ -9390,14 +9422,18 @@ def load_checkpoint(parameters, optimizer, text):
     its values must be the optimizer's parameters itemwise in the same
     order. The exact version-1 (AMSGrad), version-2 (Adam),
     version-3 (AdamW), version-4 (Adamax), version-5 (SGD),
-    version-6 (MomentumSGD), version-7 (Adagrad) and version-8 (RMSprop)
-    forms produced by dump_checkpoint are accepted, and the checkpoint
-    type must match the target optimizer.
+    version-6 (MomentumSGD), version-7 (Adagrad), version-8 (RMSprop)
+    and version-9 (Adadelta) forms produced by dump_checkpoint are
+    accepted, and the checkpoint type must match the target optimizer.
 
     Versions 1-3 and 5-7 require the checkpoint names to match the
     target parameter names in order and behave exactly like
     load_amsgrad, load_adam, load_adamw, load_sgd, load_momentum_sgd or
     load_adagrad for the embedded state.
+
+    Version 9 requires the checkpoint names to match the target
+    parameter names in order and behaves exactly like load_adadelta for
+    the embedded state; rho and eps are left unchanged.
 
     Version 8 requires the checkpoint names to match the target
     parameter names in order and its digest to verify against the
@@ -9416,11 +9452,21 @@ def load_checkpoint(parameters, optimizer, text):
     """
     if not isinstance(
         optimizer,
-        (Adam, AdamW, Adamax, Adagrad, AMSGrad, MomentumSGD, RMSprop, SGD),
+        (
+            Adam,
+            AdamW,
+            Adamax,
+            Adadelta,
+            Adagrad,
+            AMSGrad,
+            MomentumSGD,
+            RMSprop,
+            SGD,
+        ),
     ):
         raise TypeError(
-            "optimizer must be an Adam, AdamW, Adamax, Adagrad, AMSGrad,"
-            " MomentumSGD, RMSprop or SGD instance"
+            "optimizer must be an Adam, AdamW, Adamax, Adadelta, Adagrad,"
+            " AMSGrad, MomentumSGD, RMSprop or SGD instance"
         )
     if not isinstance(text, str):
         raise TypeError("text must be a string")
@@ -9458,6 +9504,9 @@ def load_checkpoint(parameters, optimizer, text):
     elif kind == "adagrad":
         if not isinstance(optimizer, Adagrad):
             raise ValueError("checkpoint type must match the optimizer")
+    elif kind == "adadelta":
+        if not isinstance(optimizer, Adadelta):
+            raise ValueError("checkpoint type must match the optimizer")
     elif kind == "rmsprop":
         if not isinstance(optimizer, RMSprop):
             raise ValueError("checkpoint type must match the optimizer")
@@ -9485,6 +9534,8 @@ def load_checkpoint(parameters, optimizer, text):
         load_momentum_sgd(optimizer, state_text)
     elif kind == "adagrad":
         load_adagrad(optimizer, state_text)
+    elif kind == "adadelta":
+        load_adadelta(optimizer, state_text)
     elif kind == "rmsprop":
         lr, alpha, eps = hyperparameters
         if lr <= 0.0:
