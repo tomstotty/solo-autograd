@@ -6581,6 +6581,239 @@ def load_adagrad(optimizer, text):
     return None
 
 
+def _check_adadelta_state(optimizer):
+    """Validate an Adadelta optimizer's full mutable state for dump/load."""
+    parameters = optimizer.parameters
+    if not isinstance(parameters, list):
+        raise TypeError("parameters must be a non-empty list of Tensors")
+    if len(parameters) == 0:
+        raise ValueError("parameters must be non-empty")
+    for parameter in parameters:
+        if not isinstance(parameter, Tensor):
+            raise TypeError("parameters must contain only Tensors")
+    if len({id(parameter) for parameter in parameters}) != len(parameters):
+        raise ValueError("parameters must not contain duplicate Tensors")
+    for parameter in parameters:
+        if not isinstance(parameter.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        _validate_data(parameter.data)
+    if isinstance(optimizer.rho, bool) or not isinstance(optimizer.rho, float):
+        raise TypeError("rho must be a finite float in [0.0, 1.0)")
+    if not math.isfinite(optimizer.rho) or optimizer.rho < 0.0 or optimizer.rho >= 1.0:
+        raise ValueError("rho must be a finite float in [0.0, 1.0)")
+    if isinstance(optimizer.eps, bool) or not isinstance(optimizer.eps, float):
+        raise TypeError("eps must be a positive finite float")
+    if not math.isfinite(optimizer.eps) or optimizer.eps <= 0.0:
+        raise ValueError("eps must be a positive finite float")
+    square_avg = optimizer.square_avg
+    if not isinstance(square_avg, list):
+        raise TypeError("square_avg must be a list matching the parameters")
+    if len(square_avg) != len(parameters):
+        raise ValueError("square_avg must match the parameters in length")
+    acc_delta = optimizer.acc_delta
+    if not isinstance(acc_delta, list):
+        raise TypeError("acc_delta must be a list matching the parameters")
+    if len(acc_delta) != len(parameters):
+        raise ValueError("acc_delta must match the parameters in length")
+    for index, parameter in enumerate(parameters):
+        Adadelta._check_slot(
+            square_avg[index], parameter.data, "square_avg"
+        )
+        Adadelta._check_slot(
+            acc_delta[index], parameter.data, "acc_delta"
+        )
+
+
+def dump_adadelta(optimizer):
+    """Serialize an Adadelta optimizer's full state to a compact JSON string.
+
+    The output contains no whitespace and no trailing newline; top-level
+    keys are parameters, square_avg, acc_delta in that order; each
+    parameter entry has data then requires_grad; the two slot arrays keep
+    each parameter's scalar/array shape. Floats are written with exactly
+    six decimals and negative zero as 0.000000. rho and eps are not
+    serialized.
+    """
+    if not isinstance(optimizer, Adadelta):
+        raise TypeError("optimizer must be an Adadelta instance")
+    _check_adadelta_state(optimizer)
+    entries = []
+    for parameter in optimizer.parameters:
+        entries.append(
+            '{"data":'
+            + _json_value(parameter.data)
+            + ',"requires_grad":'
+            + ("true" if parameter.requires_grad else "false")
+            + "}"
+        )
+    square_avg = (
+        "["
+        + ",".join(_json_value(item) for item in optimizer.square_avg)
+        + "]"
+    )
+    acc_delta = (
+        "["
+        + ",".join(_json_value(item) for item in optimizer.acc_delta)
+        + "]"
+    )
+    return (
+        '{"parameters":['
+        + ",".join(entries)
+        + '],"square_avg":'
+        + square_avg
+        + ',"acc_delta":'
+        + acc_delta
+        + "}"
+    )
+
+
+class _AdadeltaParser:
+    """Strict parser for the exact textual form produced by dump_adadelta."""
+
+    def __init__(self, text):
+        self._text = text
+        self._pos = 0
+
+    def _fail(self):
+        raise ValueError("text does not match the dump_adadelta format")
+
+    def _expect(self, literal):
+        if not self._text.startswith(literal, self._pos):
+            self._fail()
+        self._pos += len(literal)
+
+    def _parse_number(self):
+        match = _STATE_NUMBER.match(self._text, self._pos)
+        if match is None:
+            self._fail()
+        token = match.group(0)
+        self._pos = match.end()
+        value = float(token)
+        if not math.isfinite(value) or (value == 0.0 and token[0] == "-"):
+            self._fail()
+        return value
+
+    def _parse_data(self):
+        if not self._text.startswith("[", self._pos):
+            return self._parse_number()
+        self._pos += 1
+        values = [self._parse_number()]
+        while self._text.startswith(",", self._pos):
+            self._pos += 1
+            values.append(self._parse_number())
+        self._expect("]")
+        return values
+
+    def _parse_parameter(self):
+        self._expect('{"data":')
+        data = self._parse_data()
+        self._expect(',"requires_grad":')
+        if self._text.startswith("true", self._pos):
+            self._pos += 4
+            requires_grad = True
+        elif self._text.startswith("false", self._pos):
+            self._pos += 5
+            requires_grad = False
+        else:
+            self._fail()
+        self._expect("}")
+        return (data, requires_grad)
+
+    def _parse_slots(self):
+        self._expect("[")
+        items = [self._parse_data()]
+        while self._text.startswith(",", self._pos):
+            self._pos += 1
+            items.append(self._parse_data())
+        self._expect("]")
+        return items
+
+    def parse(self):
+        self._expect('{"parameters":[')
+        parameters = [self._parse_parameter()]
+        while self._text.startswith(",", self._pos):
+            self._pos += 1
+            parameters.append(self._parse_parameter())
+        self._expect('],"square_avg":')
+        square_avg = self._parse_slots()
+        self._expect(',"acc_delta":')
+        acc_delta = self._parse_slots()
+        self._expect("}")
+        if self._pos != len(self._text):
+            self._fail()
+        return parameters, square_avg, acc_delta
+
+
+def _check_adadelta_slot_values(slots, name):
+    """Reject negative (already-finite) parsed values in a slot array."""
+    for slot in slots:
+        values = slot if isinstance(slot, list) else [slot]
+        for value in values:
+            if value < 0.0:
+                raise ValueError(name + " must be non-negative")
+
+
+def load_adadelta(optimizer, text):
+    """Restore an Adadelta optimizer's full state from a dump_adadelta string.
+
+    On full validation success, atomically replace every parameter's data
+    and requires_grad, clear every grad, and replace square_avg and
+    acc_delta; rho, eps and the parameter identities are left unchanged.
+    On any failure no state is touched.
+    """
+    if not isinstance(optimizer, Adadelta):
+        raise TypeError("optimizer must be an Adadelta instance")
+    if not isinstance(text, str):
+        raise TypeError("text must be a string")
+    _check_adadelta_state(optimizer)
+    parameters, square_avg, acc_delta = _AdadeltaParser(text).parse()
+    count = len(optimizer.parameters)
+    if len(parameters) != count:
+        raise ValueError("state must contain exactly one entry per parameter")
+    if len(square_avg) != count:
+        raise ValueError("state square_avg must match the parameters in length")
+    if len(acc_delta) != count:
+        raise ValueError("state acc_delta must match the parameters in length")
+    updates = []
+    for (data, requires_grad), parameter in zip(
+        parameters, optimizer.parameters
+    ):
+        current = parameter.data
+        if isinstance(current, list):
+            if not isinstance(data, list) or len(data) != len(current):
+                raise ValueError("state data shape must match parameter shape")
+        elif isinstance(data, list):
+            raise ValueError("state data shape must match parameter shape")
+        updates.append((parameter, data, requires_grad))
+    for slot, parameter in zip(square_avg, optimizer.parameters):
+        current = parameter.data
+        if isinstance(current, list):
+            if not isinstance(slot, list) or len(slot) != len(current):
+                raise ValueError(
+                    "state square_avg shape must match parameter shape"
+                )
+        elif isinstance(slot, list):
+            raise ValueError("state square_avg shape must match parameter shape")
+    for slot, parameter in zip(acc_delta, optimizer.parameters):
+        current = parameter.data
+        if isinstance(current, list):
+            if not isinstance(slot, list) or len(slot) != len(current):
+                raise ValueError(
+                    "state acc_delta shape must match parameter shape"
+                )
+        elif isinstance(slot, list):
+            raise ValueError("state acc_delta shape must match parameter shape")
+    _check_adadelta_slot_values(square_avg, "square_avg")
+    _check_adadelta_slot_values(acc_delta, "acc_delta")
+    for parameter, data, requires_grad in updates:
+        parameter.data = data
+        parameter.requires_grad = requires_grad
+        parameter.grad = None
+    optimizer.square_avg = square_avg
+    optimizer.acc_delta = acc_delta
+    return None
+
+
 def _check_momentum_sgd_state(optimizer):
     """Validate a MomentumSGD optimizer's full mutable state for dump/load."""
     parameters = optimizer.parameters
