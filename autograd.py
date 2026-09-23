@@ -9773,87 +9773,30 @@ class _TrainingStateParser:
         return version, global_step, rng_state, checkpoint_text
 
 
-def _load_checkpoint_adam_named(parameters, optimizer, text, names):
-    """Apply the version-2 Adam state embedded in a version-3 dump.
+def _restore_named_adam_family(
+    parameters, optimizer, text, names, check_state, state_parser
+):
+    """Restore an Adam/AdamW state bound by name through one private path.
 
-    Binds its entries by name like the version-4 Adamax path: names may be
-    in any order but must name exactly the target parameters, and the
-    data/requires_grad/m/v entries are rearranged into optimizer order.
-    The whole embedded state and its alignment to the target parameters
-    is validated before anything is touched.
+    This is the single validate -> rearrange -> commit route shared by the
+    version-2 Adam state embedded in a version-3 training state and the
+    version-3 AdamW state embedded in a version-4 training state. ``names``
+    may be in any order but must name exactly the target parameters
+    (duplicates rejected); the data, requires_grad, m and v entries are
+    bound by name and rearranged into optimizer.parameters order.
+
+    The live optimizer state is validated with ``check_state`` and the
+    embedded text with ``state_parser``; counts, name-set equality and the
+    scalar/one-dimensional shape of every data, m and v entry are all
+    checked (the strict parser already guarantees finite floats, the
+    boolean requires_grad tokens and a non-bool non-negative integer t)
+    before anything is touched. The commit then happens exactly once:
+    each Tensor's data and requires_grad are replaced in place, every grad
+    is cleared, and m, v and t are replaced. Tensor identities, the
+    optimizer.parameters list and the hyperparameters are preserved.
     """
-    _check_adam_state(optimizer)
-    state_parameters, moments, velocities, t = _AdamParser(text).parse()
-    count = len(optimizer.parameters)
-    if len(state_parameters) != count:
-        raise ValueError("state must contain exactly one entry per parameter")
-    if len(moments) != count or len(velocities) != count:
-        raise ValueError("state m and v must match the parameters in length")
-    target_names = list(parameters.keys())
-    if set(names) != set(target_names) or len(names) != len(target_names):
-        raise ValueError(
-            "checkpoint names must name exactly the target parameters"
-        )
-    by_name = {
-        name: (spec, moment, velocity)
-        for name, spec, moment, velocity in zip(
-            names, state_parameters, moments, velocities
-        )
-    }
-    updates = []
-    ordered_moments = []
-    ordered_velocities = []
-    for name, parameter in zip(parameters.keys(), optimizer.parameters):
-        data, requires_grad = by_name[name][0]
-        current = parameter.data
-        if isinstance(current, list):
-            if not isinstance(data, list) or len(data) != len(current):
-                raise ValueError(
-                    "state data shape must match parameter shape"
-                )
-        elif isinstance(data, list):
-            raise ValueError("state data shape must match parameter shape")
-        updates.append((parameter, data, requires_grad))
-        ordered_moments.append(by_name[name][1])
-        ordered_velocities.append(by_name[name][2])
-    for slot_name, buffers in (
-        ("m", ordered_moments),
-        ("v", ordered_velocities),
-    ):
-        for buffer, parameter in zip(buffers, optimizer.parameters):
-            current = parameter.data
-            if isinstance(current, list):
-                if not isinstance(buffer, list) or len(buffer) != len(current):
-                    raise ValueError(
-                        "state " + slot_name
-                        + " shape must match parameter shape"
-                    )
-            elif isinstance(buffer, list):
-                raise ValueError(
-                    "state " + slot_name
-                    + " shape must match parameter shape"
-                )
-    for parameter, data, requires_grad in updates:
-        parameter.data = data
-        parameter.requires_grad = requires_grad
-        parameter.grad = None
-    optimizer.m = ordered_moments
-    optimizer.v = ordered_velocities
-    optimizer.t = t
-    return None
-
-
-def _load_checkpoint_adamw_named(parameters, optimizer, text, names):
-    """Apply the version-3 AdamW state embedded in a version-4 dump.
-
-    Binds its entries by name like the version-3 Adam path: names may be
-    in any order but must name exactly the target parameters, and the
-    data/requires_grad/m/v entries are rearranged into optimizer order.
-    The whole embedded state and its alignment to the target parameters
-    is validated before anything is touched.
-    """
-    _check_adamw_state(optimizer)
-    state_parameters, moments, velocities, t = _AdamWParser(text).parse()
+    check_state(optimizer)
+    state_parameters, moments, velocities, t = state_parser(text).parse()
     count = len(optimizer.parameters)
     if len(state_parameters) != count:
         raise ValueError("state must contain exactly one entry per parameter")
@@ -9985,8 +9928,13 @@ def load_training_state(parameters, optimizer, text):
             raise ValueError(
                 "version 3 training state must wrap an Adam checkpoint"
             )
-        _load_checkpoint_adam_named(
-            parameters, optimizer, state_text, names
+        _restore_named_adam_family(
+            parameters,
+            optimizer,
+            state_text,
+            names,
+            _check_adam_state,
+            _AdamParser,
         )
         return (global_step, rng_state)
     else:
@@ -9997,8 +9945,13 @@ def load_training_state(parameters, optimizer, text):
             raise ValueError(
                 "version 4 training state must wrap an AdamW checkpoint"
             )
-        _load_checkpoint_adamw_named(
-            parameters, optimizer, state_text, names
+        _restore_named_adam_family(
+            parameters,
+            optimizer,
+            state_text,
+            names,
+            _check_adamw_state,
+            _AdamWParser,
         )
         return (global_step, rng_state)
     load_checkpoint(parameters, optimizer, checkpoint_text)
