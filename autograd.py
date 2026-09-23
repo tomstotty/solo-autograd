@@ -9047,11 +9047,11 @@ _CHECKPOINT_INTEGER = re.compile(r"(?:0|[1-9][0-9]*)")
 
 
 def dump_checkpoint(parameters, optimizer):
-    """Serialize named parameters and an Adam/AdamW/AMSGrad optimizer to JSON.
+    """Serialize named parameters and an Adam/AdamW/AMSGrad/Adamax optimizer.
 
-    Only Adam, AdamW and AMSGrad are supported. The parameters mapping is
-    validated with the dump_state contract and its values must be the
-    optimizer's parameters itemwise in the same order. The output
+    Only Adam, AdamW, AMSGrad and Adamax are supported. The parameters
+    mapping is validated with the dump_state contract and its values must
+    be the optimizer's parameters itemwise in the same order. The output
     contains no whitespace and no trailing newline.
 
     For AMSGrad the version-1 form is emitted: top-level keys are
@@ -9070,10 +9070,16 @@ def dump_checkpoint(parameters, optimizer):
     is the string "adamw", names is the parameter-name array and state
     is exactly the object produced by dump_adamw, keeping its
     six-decimal byte-level format.
+
+    For Adamax the version-4 form is emitted: top-level keys are
+    version, type, names and state in that order; version is the integer
+    4, type is the string "adamax", names is the parameter-name array
+    and state is exactly the object produced by dump_adamax, keeping its
+    six-decimal byte-level format.
     """
-    if not isinstance(optimizer, (Adam, AdamW, AMSGrad)):
+    if not isinstance(optimizer, (Adam, AdamW, AMSGrad, Adamax)):
         raise TypeError(
-            "optimizer must be an Adam, AdamW or AMSGrad instance"
+            "optimizer must be an Adam, AdamW, AMSGrad or Adamax instance"
         )
     _check_state_parameters(parameters)
     optimizer_parameters = optimizer.parameters
@@ -9086,9 +9092,18 @@ def dump_checkpoint(parameters, optimizer):
             raise ValueError(
                 "parameter values must be the optimizer parameters in order"
             )
+    # Bind every optimizer parameter to the name of the dict entry that
+    # holds that exact object so the names array and the state entries
+    # agree even when the dict order differs from the optimizer order.
+    names_by_parameter = {
+        id(tensor): name for name, tensor in parameters.items()
+    }
     names = (
         "["
-        + ",".join('"' + name + '"' for name, _ in parameters.items())
+        + ",".join(
+            '"' + names_by_parameter[id(parameter)] + '"'
+            for parameter in optimizer_parameters
+        )
         + "]"
     )
     if isinstance(optimizer, AMSGrad):
@@ -9105,6 +9120,14 @@ def dump_checkpoint(parameters, optimizer):
             + names
             + ',"state":'
             + dump_adamw(optimizer)
+            + "}"
+        )
+    if isinstance(optimizer, Adamax):
+        return (
+            '{"version":4,"type":"adamax","names":'
+            + names
+            + ',"state":'
+            + dump_adamax(optimizer)
             + "}"
         )
     return (
@@ -9191,6 +9214,12 @@ class _CheckpointParser:
             self._expect(',"state":')
             kind = "adamw"
             state_text = self._parse_state(_AdamWParser)
+        elif version == 4:
+            self._expect(',"type":"adamax","names":')
+            names = self._parse_names()
+            self._expect(',"state":')
+            kind = "adamax"
+            state_text = self._parse_state(_AdamaxParser)
         else:
             raise ValueError("unsupported checkpoint version")
         if not names:
@@ -9199,22 +9228,30 @@ class _CheckpointParser:
 
 
 def load_checkpoint(parameters, optimizer, text):
-    """Restore named parameters and an Adam/AdamW/AMSGrad optimizer.
+    """Restore named parameters and an Adam/AdamW/AMSGrad/Adamax optimizer.
 
     The parameters mapping is validated with the dump_state contract and
     its values must be the optimizer's parameters itemwise in the same
-    order. Only the exact version-1 (AMSGrad), version-2 (Adam) and
-    version-3 (AdamW) forms produced by dump_checkpoint are accepted,
-    and the checkpoint type must match the target optimizer. On full
-    validation success, behave exactly like load_amsgrad, load_adam or
-    load_adamw for the embedded state: atomically replace data,
-    requires_grad, the optimizer slots and t, clear every grad, and keep
-    object identities and hyperparameters; return None. On any failure
-    no state is touched.
+    order. Only the exact version-1 (AMSGrad), version-2 (Adam),
+    version-3 (AdamW) and version-4 (Adamax) forms produced by
+    dump_checkpoint are accepted, and the checkpoint type must match the
+    target optimizer.
+
+    Versions 1 to 3 require the checkpoint names to equal the target
+    parameter names in order, and restore byte-for-byte as before.
+    Version 4 only requires the same set of names: each state entry is
+    bound to the target Tensor with the same name and then rearranged
+    into the target optimizer's parameter order, so resuming from a
+    checkpoint whose names were written in a different order is
+    supported. On full validation success, behave exactly like
+    load_amsgrad, load_adam, load_adamw or load_adamax for the embedded
+    state: atomically replace data, requires_grad, the optimizer slots
+    and t, clear every grad, and keep object identities and
+    hyperparameters; return None. On any failure no state is touched.
     """
-    if not isinstance(optimizer, (Adam, AdamW, AMSGrad)):
+    if not isinstance(optimizer, (Adam, AdamW, AMSGrad, Adamax)):
         raise TypeError(
-            "optimizer must be an Adam, AdamW or AMSGrad instance"
+            "optimizer must be an Adam, AdamW, AMSGrad or Adamax instance"
         )
     if not isinstance(text, str):
         raise TypeError("text must be a string")
@@ -9236,8 +9273,16 @@ def load_checkpoint(parameters, optimizer, text):
     elif kind == "adamw":
         if not isinstance(optimizer, AdamW):
             raise ValueError("checkpoint type must match the optimizer")
+    elif kind == "adamax":
+        if not isinstance(optimizer, Adamax):
+            raise ValueError("checkpoint type must match the optimizer")
     elif not isinstance(optimizer, Adam):
         raise ValueError("checkpoint type must match the optimizer")
+    if kind == "adamax":
+        _load_adamax_checkpoint(
+            parameters, optimizer, names, state_text
+        )
+        return None
     if names != list(parameters.keys()):
         raise ValueError("checkpoint names must match parameters in order")
     if kind == "amsgrad":
@@ -9246,6 +9291,84 @@ def load_checkpoint(parameters, optimizer, text):
         load_adamw(optimizer, state_text)
     else:
         load_adam(optimizer, state_text)
+    return None
+
+
+def _load_adamax_checkpoint(parameters, optimizer, names, state_text):
+    """Restore a version-4 Adamax checkpoint, allowing permuted names.
+
+    State entries are bound to the target Tensors by name and the m/u
+    slots are rearranged into the optimizer's parameter order. All
+    validation completes before any state is touched.
+    """
+    _check_adamax_state(optimizer)
+    state_parameters, moments, infinity_norms, t = _AdamaxParser(
+        state_text
+    ).parse()
+    count = len(optimizer.parameters)
+    if (
+        len(names) != count
+        or len(state_parameters) != count
+        or len(moments) != count
+        or len(infinity_norms) != count
+    ):
+        raise ValueError("state must contain exactly one entry per parameter")
+    if len(set(names)) != len(names):
+        raise ValueError("checkpoint names must not repeat")
+    if set(names) != set(parameters.keys()):
+        raise ValueError("checkpoint names must match the parameter names")
+    for index, buffer in enumerate(infinity_norms):
+        values = buffer if isinstance(buffer, list) else [buffer]
+        for value in values:
+            if value < 0.0:
+                raise ValueError("state u must be non-negative")
+    # Validate every named entry against the Tensor carrying that name
+    # in the target mapping (which is the optimizer Tensor itself).
+    for index, name in enumerate(names):
+        tensor = parameters[name]
+        data, _ = state_parameters[index]
+        current = tensor.data
+        if isinstance(current, list):
+            if not isinstance(data, list) or len(data) != len(current):
+                raise ValueError(
+                    "state data shape must match parameter shape"
+                )
+        elif isinstance(data, list):
+            raise ValueError("state data shape must match parameter shape")
+        for slot_name, buffer in (
+            ("m", moments[index]),
+            ("u", infinity_norms[index]),
+        ):
+            if isinstance(current, list):
+                if not isinstance(buffer, list) or len(buffer) != len(current):
+                    raise ValueError(
+                        "state "
+                        + slot_name
+                        + " shape must match parameter shape"
+                    )
+            elif isinstance(buffer, list):
+                raise ValueError(
+                    "state "
+                    + slot_name
+                    + " shape must match parameter shape"
+                )
+    state_index = {name: index for index, name in enumerate(names)}
+    name_by_parameter = {
+        id(tensor): name for name, tensor in parameters.items()
+    }
+    order = [
+        state_index[name_by_parameter[id(parameter)]]
+        for parameter in optimizer.parameters
+    ]
+    for index, name in enumerate(names):
+        data, requires_grad = state_parameters[index]
+        tensor = parameters[name]
+        tensor.data = data
+        tensor.requires_grad = requires_grad
+        tensor.grad = None
+    optimizer.m = [moments[index] for index in order]
+    optimizer.u = [infinity_norms[index] for index in order]
+    optimizer.t = t
     return None
 
 
