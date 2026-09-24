@@ -6745,6 +6745,106 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def adaptive_avg_pool2d(self, height, width, out_height, out_width):
+        data = _require_nonempty_float_vector(
+            self, "adaptive_avg_pool2d"
+        )
+        # height, width, out_height and out_width must be non-bool
+        # positive ints.
+        for name, value in (
+            ("height", height),
+            ("width", width),
+            ("out_height", out_height),
+            ("out_width", out_width),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(name + " must be a positive int")
+            if value <= 0:
+                raise ValueError(name + " must be a positive int")
+        H, W, OH, OW = height, width, out_height, out_width
+        # self stores a single-channel H x W image in row-major order.
+        if len(data) != H * W:
+            raise ValueError(
+                "adaptive_avg_pool2d input length must equal height * width"
+            )
+        # Output cell (or, oc) averages the rectangle
+        # [rs, re) x [cs, ce) whose bounds follow the adaptive pooling
+        # convention: rs = (or*H)//OH, re = ((or+1)*H+OH-1)//OH, and the
+        # analogous column bounds. Inputs are accumulated from 0.0 in
+        # ascending (or, oc, r, c) order, then divided by the rectangle's
+        # cell count. A non-finite partial sum or quotient aborts before a
+        # result tensor exists, so no state can change on failure.
+        regions = []
+        out_data = []
+        for orow in range(OH):
+            rs = (orow * H) // OH
+            re = ((orow + 1) * H + OH - 1) // OH
+            for ocol in range(OW):
+                cs = (ocol * W) // OW
+                ce = ((ocol + 1) * W + OW - 1) // OW
+                count = (re - rs) * (ce - cs)
+                regions.append((rs, re, cs, ce, count))
+                acc = 0.0
+                for r in range(rs, re):
+                    for c in range(cs, ce):
+                        acc += data[r * W + c]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "adaptive_avg_pool2d intermediate must be"
+                                " finite"
+                            )
+                mean = acc / count
+                if not math.isfinite(mean):
+                    raise ValueError(
+                        "adaptive_avg_pool2d intermediate must be finite"
+                    )
+                out_data.append(mean)
+        if not self.requires_grad:
+            return Tensor._make(
+                out_data, False, (), None,
+                grad_validator=lambda g: _validate_vector_grad(g, OH * OW),
+            )
+        # Snapshot the image shape and output regions with the graph;
+        # mutating the parent's data after the forward pass cannot change
+        # what a pending backward pass uses.
+        parent = self
+        n = H * W
+        snapshot_W = W
+        snapshot_regions = regions
+
+        def backward_fn(grad):
+            # dx[r*W+c] += grad[or*OW+oc] / ((re-rs)*(ce-cs)) for every
+            # covered cell, accumulated in the same ascending
+            # (or, oc, r, c) order as the forward pass; a non-finite
+            # division or partial sum aborts the whole pass before any
+            # grad is written.
+            dx = [0.0] * n
+            for o, (rs, re, cs, ce, count) in enumerate(snapshot_regions):
+                share = grad[o] / count
+                if not math.isfinite(share):
+                    raise ValueError(
+                        "adaptive_avg_pool2d backward intermediate must be"
+                        " finite"
+                    )
+                for r in range(rs, re):
+                    for c in range(cs, ce):
+                        j = r * snapshot_W + c
+                        dx[j] += share
+                        if not math.isfinite(dx[j]):
+                            raise ValueError(
+                                "adaptive_avg_pool2d backward intermediate"
+                                " must be finite"
+                            )
+            return [(parent, dx)]
+
+        return Tensor._make(
+            out_data,
+            True,
+            (parent,),
+            backward_fn,
+            grad_validator=lambda g: _validate_vector_grad(g, OH * OW),
+        )
+
     def dropout(self, p=0.5, seed=0):
         data = _require_nonempty_float_vector(self, "dropout")
         if isinstance(p, bool) or not isinstance(p, float):
