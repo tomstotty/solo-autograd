@@ -4817,7 +4817,8 @@ class Tensor:
         )
 
     def conv2d_multi(self, kernel, channels, filters, height, width, size,
-                     stride=1, padding=0, dilation=1, groups=1, bias=None):
+                     stride=1, padding=0, dilation=1, groups=1, bias=None,
+                     padding_mode="zeros"):
         if not isinstance(kernel, Tensor):
             raise TypeError("kernel must be a Tensor")
         if bias is not None and not isinstance(bias, Tensor):
@@ -4850,6 +4851,12 @@ class Tensor:
             raise TypeError("padding must be a non-negative int")
         if padding < 0:
             raise ValueError("padding must be a non-negative int")
+        if not isinstance(padding_mode, str):
+            raise TypeError("padding_mode must be a str")
+        if padding_mode not in ("zeros", "reflect"):
+            raise ValueError(
+                "padding_mode must be 'zeros' or 'reflect'"
+            )
         C, O, H, W, K, S, P, D, G = (
             channels, filters, height, width, size, stride, padding,
             dilation, groups,
@@ -4885,6 +4892,15 @@ class Tensor:
             raise ValueError(
                 "conv2d_multi bias length must equal filters"
             )
+        # Reflection padding folds back onto the image at every edge, which
+        # is only defined for an image of at least two rows and columns and
+        # a pad width strictly smaller than both dimensions.
+        if padding_mode == "reflect" and (H <= 1 or W <= 1 or P >= H
+                                          or P >= W):
+            raise ValueError(
+                "conv2d_multi reflect padding requires height > 1, "
+                "width > 1 and padding < height and padding < width"
+            )
         # Dilation spaces the kernel taps by D, so the effective receptive
         # field spans E = D*(K-1)+1 positions; with D=1 this is simply K.
         E = D * (K - 1) + 1
@@ -4892,12 +4908,13 @@ class Tensor:
         out_w = (W + 2 * P - E) // S + 1
         if out_h <= 0 or out_w <= 0:
             raise ValueError("conv2d_multi output dimensions must be positive")
-        # Snapshot all operands at call time so later caller-side mutation
-        # or replacement of any input can change neither the forward
-        # result nor a pending backward pass.
+        # Snapshot all operands and the padding mode at call time so later
+        # caller-side mutation or replacement of any input can change
+        # neither the forward result nor a pending backward pass.
         snapshot_x = list(x_data)
         snapshot_w = list(w_data)
         snapshot_b = list(b_data) if b_data is not None else None
+        snapshot_mode = padding_mode
         # Grouped multi-channel 2D cross-correlation: the kernel is never
         # flipped. Filter o belongs to group g = o // (O/G) and reads only
         # input channels c0 .. c0+C/G-1, where c0 = g*(C/G). In ascending
@@ -4908,9 +4925,12 @@ class Tensor:
         #   * w[((o*(C/G)+cl)*K+kr)*K+kc],
         # with c = c0+cl, r = or*S+kr*D-P and q = oc*S+kc*D-P;
         # out-of-range input positions from padding or the dilation gaps
-        # are skipped. With G=1 this reduces to dense (o, or, oc, c, kr,
-        # kc) order. A non-finite product or partial sum aborts before a
-        # result tensor exists, so no state can change.
+        # are skipped with zero padding. With reflection padding r and q
+        # are folded back into range first: r<0 maps to -r, r>=H to
+        # 2*H-2-r and likewise for q with W; several folded positions may
+        # land on the same input cell. With G=1 this reduces to dense
+        # (o, or, oc, c, kr, kc) order. A non-finite product or partial
+        # sum aborts before a result tensor exists, so no state can change.
         out_len = O * out_h * out_w
         out_data = [0.0] * out_len
         for o in range(O):
@@ -4925,12 +4945,24 @@ class Tensor:
                         c = c0 + cl
                         for kr in range(K):
                             r = orow * S + kr * D - P
-                            if not 0 <= r < H:
-                                continue
+                            if snapshot_mode == "zeros":
+                                if not 0 <= r < H:
+                                    continue
+                            else:
+                                if r < 0:
+                                    r = -r
+                                if r >= H:
+                                    r = 2 * H - 2 - r
                             for kc in range(K):
                                 q = ocol * S + kc * D - P
-                                if not 0 <= q < W:
-                                    continue
+                                if snapshot_mode == "zeros":
+                                    if not 0 <= q < W:
+                                        continue
+                                else:
+                                    if q < 0:
+                                        q = -q
+                                    if q >= W:
+                                        q = 2 * W - 2 - q
                                 xi = (c * H + r) * W + q
                                 wi = ((o * CPG + cl) * K + kr) * K + kc
                                 product = snapshot_x[xi] * snapshot_w[wi]
@@ -4957,10 +4989,12 @@ class Tensor:
             # dx[xi] += g*w[wi] and dw[wi] += g*x[xi], accumulated from
             # 0.0 in the same ascending (o, or, oc, cl, kr, kc) order and
             # group-channel mapping as the forward pass, using the same
-            # dilated r/q indexing and skipping out-of-range positions;
-            # db[o] += g, accumulated from 0.0 in ascending (or, oc)
-            # order per filter. A non-finite product or partial sum
-            # aborts the whole pass before any grad is written.
+            # dilated r/q indexing, zero-padding skip and reflection fold
+            # (several padded positions may fold onto one xi and so merge
+            # into the same dx/dw entries); db[o] += g, accumulated from
+            # 0.0 in ascending (or, oc) order per filter. A non-finite
+            # product or partial sum aborts the whole pass before any grad
+            # is written.
             dx = [0.0] * (C * H * W)
             dw = [0.0] * (O * CPG * K * K)
             db = [0.0] * O if snapshot_b is not None else None
@@ -4981,12 +5015,24 @@ class Tensor:
                             c = c0 + cl
                             for kr in range(K):
                                 r = orow * S + kr * D - P
-                                if not 0 <= r < H:
-                                    continue
+                                if snapshot_mode == "zeros":
+                                    if not 0 <= r < H:
+                                        continue
+                                else:
+                                    if r < 0:
+                                        r = -r
+                                    if r >= H:
+                                        r = 2 * H - 2 - r
                                 for kc in range(K):
                                     q = ocol * S + kc * D - P
-                                    if not 0 <= q < W:
-                                        continue
+                                    if snapshot_mode == "zeros":
+                                        if not 0 <= q < W:
+                                            continue
+                                    else:
+                                        if q < 0:
+                                            q = -q
+                                        if q >= W:
+                                            q = 2 * W - 2 - q
                                     xi = (c * H + r) * W + q
                                     wi = (
                                         ((o * CPG + cl) * K + kr) * K + kc
