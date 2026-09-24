@@ -153,6 +153,24 @@ def _validate_grad(grad, like):
     raise TypeError("grad must be a float or a list of floats")
 
 
+def _validate_vector_grad(grad, length):
+    """Validate an outgoing grad that must be a finite-float list.
+
+    bool/int/float scalars (including a bool, which is also an int), an
+    omitted grad, wrong-length or non-finite lists are ValueError; None
+    and any other non-list type are TypeError; a list containing a
+    non-float (bool/int included) is TypeError. Matches the bmm/cumprod
+    rule for vector outputs.
+    """
+    if grad is _MISSING or isinstance(grad, (bool, int, float)):
+        raise ValueError("grad must be a list of finite floats")
+    if grad is None or not isinstance(grad, list):
+        raise TypeError("grad must be a list of finite floats")
+    if len(grad) != length:
+        raise ValueError("grad length must match tensor length")
+    return [_as_finite_float(x) for x in grad]
+
+
 def _require_nonempty_float_vector(tensor, op):
     """Validate the shared log_softmax/cross_entropy preconditions."""
     data = tensor.data
@@ -243,9 +261,13 @@ class Tensor:
         self._parents = ()
         self._backward_fn = None
         self._backward_record = None
+        # Per-tensor override for externally supplied backward() grads;
+        # None means use the generic _validate_grad rules.
+        self._grad_validator = None
 
     @classmethod
-    def _make(cls, data, requires_grad, parents, backward_fn):
+    def _make(cls, data, requires_grad, parents, backward_fn,
+              grad_validator=None):
         obj = cls.__new__(cls)
         obj.data = data
         obj.requires_grad = requires_grad
@@ -253,6 +275,7 @@ class Tensor:
         obj._parents = parents
         obj._backward_fn = backward_fn
         obj._backward_record = None
+        obj._grad_validator = grad_validator
         return obj
 
     def _coerce(self, other):
@@ -1748,7 +1771,10 @@ class Tensor:
                             )
                     out_data.append(acc)
         if not (self.requires_grad or other.requires_grad):
-            return Tensor._make(out_data, False, (), None)
+            return Tensor._make(
+                out_data, False, (), None,
+                grad_validator=lambda g: _validate_vector_grad(g, B * R * C),
+            )
         parent_self, parent_other = self, other
 
         def backward_fn(grad):
@@ -1811,7 +1837,8 @@ class Tensor:
             return [(entry[0], entry[1]) for entry in merged.values()]
 
         return Tensor._make(
-            out_data, True, (parent_self, parent_other), backward_fn
+            out_data, True, (parent_self, parent_other), backward_fn,
+            grad_validator=lambda g: _validate_vector_grad(g, B * R * C),
         )
 
     def linear(self, weight, bias):
@@ -3204,6 +3231,90 @@ class Tensor:
             return [(parent, contribution)]
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
+
+    def cumprod(self):
+        # One-dimensional prefix product. Re-validate at call time since
+        # the data may have been mutated after construction: data must be
+        # a non-empty 1D list of finite floats (anything that is not a
+        # list, including a scalar, and an empty list are ValueError; a
+        # non-float element is TypeError), and requires_grad must be a
+        # bool (TypeError); non-finite elements are ValueError.
+        data = self.data
+        if not isinstance(data, list) or len(data) == 0:
+            raise ValueError("cumprod requires a non-empty 1D float list")
+        for value in data:
+            if isinstance(value, bool) or not isinstance(value, float):
+                raise TypeError("cumprod data elements must be floats")
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        for value in data:
+            if not math.isfinite(value):
+                raise ValueError("cumprod data elements must be finite")
+        # Snapshot the input so later caller-side mutation or replacement
+        # of self.data changes neither the forward result nor a pending
+        # backward pass.
+        snapshot = list(data)
+        n = len(snapshot)
+        # y[i] = prod x[0:i+1], accumulated from 1.0 in ascending i
+        # order; a non-finite partial product aborts before a result
+        # tensor exists, so the input and all graph state stay untouched.
+        out_data = []
+        acc = 1.0
+        for i in range(n):
+            acc *= snapshot[i]
+            if not math.isfinite(acc):
+                raise ValueError("cumprod intermediate must be finite")
+            out_data.append(acc)
+        if not self.requires_grad:
+            return Tensor._make(
+                out_data, False, (), None,
+                grad_validator=lambda g: _validate_vector_grad(g, n),
+            )
+        parent = self
+
+        def backward_fn(grad):
+            # dx[j] = sum over i = j..n-1 of
+            #   g[i] * prod(x[0:i+1] excluding x[j]),
+            # i ascending, each dx[j] accumulated from 0.0. The cofactor
+            # is rebuilt straight from the snapshot in strictly ascending
+            # k order (never y[i] / x[j]), so zero elements differentiate
+            # naturally. A non-finite cofactor term, partial product,
+            # contribution or partial sum aborts the whole pass before
+            # any grad is written.
+            dx = [0.0] * n
+            for j in range(n):
+                total = 0.0
+                for i in range(j, n):
+                    cofactor = 1.0
+                    for k in range(i + 1):
+                        if k == j:
+                            continue
+                        cofactor *= snapshot[k]
+                        if not math.isfinite(cofactor):
+                            raise ValueError(
+                                "cumprod backward intermediate must be finite"
+                            )
+                    term = grad[i] * cofactor
+                    if not math.isfinite(term):
+                        raise ValueError(
+                            "cumprod backward intermediate must be finite"
+                        )
+                    total += term
+                    if not math.isfinite(total):
+                        raise ValueError(
+                            "cumprod backward intermediate must be finite"
+                        )
+                dx[j] = total
+                if not math.isfinite(dx[j]):
+                    raise ValueError(
+                        "cumprod backward intermediate must be finite"
+                    )
+            return [(parent, dx)]
+
+        return Tensor._make(
+            out_data, True, (parent,), backward_fn,
+            grad_validator=lambda g: _validate_vector_grad(g, n),
+        )
 
     def mean(self):
         # Re-validate at call time since the data may have been mutated
@@ -7457,9 +7568,10 @@ class Tensor:
         return None
 
     def backward(self, grad=_MISSING):
-        if not self._parents:
-            raise ValueError("cannot call backward on a tensor without a graph")
-        if grad is _MISSING:
+        validator = self._grad_validator
+        if validator is not None:
+            grad = validator(grad)
+        elif grad is _MISSING:
             if isinstance(self.data, list):
                 raise ValueError(
                     "grad must be provided for a non-scalar tensor"
@@ -7469,6 +7581,9 @@ class Tensor:
             raise TypeError("grad must not be None")
         else:
             grad = _validate_grad(grad, self.data)
+
+        if not self._parents:
+            raise ValueError("cannot call backward on a tensor without a graph")
 
         # Repeated backward on the same result accumulates the upstream
         # grad and recomputes this graph's contributions from the running
