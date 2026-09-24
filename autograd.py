@@ -4650,13 +4650,18 @@ class Tensor:
         )
 
     def conv2d_multi(self, kernel, channels, filters, height, width, size,
-                     stride=1, padding=0, dilation=1, groups=1):
+                     stride=1, padding=0, dilation=1, groups=1, bias=None):
         if not isinstance(kernel, Tensor):
             raise TypeError("kernel must be a Tensor")
+        if bias is not None and not isinstance(bias, Tensor):
+            raise TypeError("bias must be a Tensor or None")
         # Both operands must hold non-empty 1D finite float lists; data may
         # have been mutated after construction, so re-validate at call time.
         x_data = _require_nonempty_float_vector(self, "conv2d_multi")
         w_data = _require_nonempty_float_vector(kernel, "conv2d_multi")
+        b_data = None
+        if bias is not None:
+            b_data = _require_nonempty_float_vector(bias, "conv2d_multi")
         # channels, filters, height, width, size, stride, dilation and
         # groups must be non-bool positive ints, and padding a non-bool
         # non-negative int.
@@ -4708,6 +4713,11 @@ class Tensor:
                 "conv2d_multi kernel length must equal "
                 "filters * (channels // groups) * size * size"
             )
+        # The bias holds one trainable offset per output channel.
+        if b_data is not None and len(b_data) != O:
+            raise ValueError(
+                "conv2d_multi bias length must equal filters"
+            )
         # Dilation spaces the kernel taps by D, so the effective receptive
         # field spans E = D*(K-1)+1 positions; with D=1 this is simply K.
         E = D * (K - 1) + 1
@@ -4715,16 +4725,18 @@ class Tensor:
         out_w = (W + 2 * P - E) // S + 1
         if out_h <= 0 or out_w <= 0:
             raise ValueError("conv2d_multi output dimensions must be positive")
-        # Snapshot both operands at call time so later caller-side mutation
-        # or replacement of either input can change neither the forward
+        # Snapshot all operands at call time so later caller-side mutation
+        # or replacement of any input can change neither the forward
         # result nor a pending backward pass.
         snapshot_x = list(x_data)
         snapshot_w = list(w_data)
+        snapshot_b = list(b_data) if b_data is not None else None
         # Grouped multi-channel 2D cross-correlation: the kernel is never
         # flipped. Filter o belongs to group g = o // (O/G) and reads only
         # input channels c0 .. c0+C/G-1, where c0 = g*(C/G). In ascending
-        # (o, or, oc, cl, kr, kc) order (cl the in-group channel), each
-        # output starts at 0.0 and accumulates
+        # (o, or, oc) order each output starts at bias[o] (0.0 without a
+        # bias), then in ascending (cl, kr, kc) order (cl the in-group
+        # channel) accumulates
         # y[(o*OH+or)*OW+oc] += x[(c*H+r)*W+q]
         #   * w[((o*(C/G)+cl)*K+kr)*K+kc],
         # with c = c0+cl, r = or*S+kr*D-P and q = oc*S+kc*D-P;
@@ -4737,9 +4749,11 @@ class Tensor:
         for o in range(O):
             g = o // FPG
             c0 = g * CPG
+            bias_o = snapshot_b[o] if snapshot_b is not None else 0.0
             for orow in range(out_h):
                 for ocol in range(out_w):
                     oi = (o * out_h + orow) * out_w + ocol
+                    out_data[oi] = bias_o
                     for cl in range(CPG):
                         c = c0 + cl
                         for kr in range(K):
@@ -4764,25 +4778,38 @@ class Tensor:
                                         "conv2d_multi intermediate must be"
                                         " finite"
                                     )
-        if not (self.requires_grad or kernel.requires_grad):
+        needs_grad = self.requires_grad or kernel.requires_grad
+        if bias is not None and bias.requires_grad:
+            needs_grad = True
+        if not needs_grad:
             return Tensor._make(out_data, False, (), None)
         parent_self, parent_kernel = self, kernel
+        parent_bias = bias
 
         def backward_fn(grad):
             # dx[xi] += g*w[wi] and dw[wi] += g*x[xi], accumulated from
             # 0.0 in the same ascending (o, or, oc, cl, kr, kc) order and
             # group-channel mapping as the forward pass, using the same
-            # dilated r/q indexing and skipping out-of-range positions. A
-            # non-finite product or partial sum aborts the whole pass
-            # before any grad is written.
+            # dilated r/q indexing and skipping out-of-range positions;
+            # db[o] += g, accumulated from 0.0 in ascending (or, oc)
+            # order per filter. A non-finite product or partial sum
+            # aborts the whole pass before any grad is written.
             dx = [0.0] * (C * H * W)
             dw = [0.0] * (O * CPG * K * K)
+            db = [0.0] * O if snapshot_b is not None else None
             for o in range(O):
                 g = o // FPG
                 c0 = g * CPG
                 for orow in range(out_h):
                     for ocol in range(out_w):
                         gv = grad[(o * out_h + orow) * out_w + ocol]
+                        if db is not None:
+                            db[o] = db[o] + gv
+                            if not math.isfinite(db[o]):
+                                raise ValueError(
+                                    "conv2d_multi backward "
+                                    "intermediate must be finite"
+                                )
                         for cl in range(CPG):
                             c = c0 + cl
                             for kr in range(K):
@@ -4821,14 +4848,16 @@ class Tensor:
                                             "conv2d_multi backward "
                                             "intermediate must be finite"
                                         )
-            # The same object may play both roles; merge such roles into
-            # one contribution per tensor, and submit only parents that
-            # require grad.
+            # The same object may play several roles; merge such roles
+            # into one contribution per tensor, and submit only parents
+            # that require grad.
             merged = {}
-            roles = (
+            roles = [
                 (parent_self, dx),
                 (parent_kernel, dw),
-            )
+            ]
+            if parent_bias is not None:
+                roles.append((parent_bias, db))
             for parent, value in roles:
                 if not parent.requires_grad:
                     continue
@@ -4841,9 +4870,10 @@ class Tensor:
                     entry[1] = combined
             return [(entry[0], entry[1]) for entry in merged.values()]
 
-        return Tensor._make(
-            out_data, True, (parent_self, parent_kernel), backward_fn
-        )
+        parents = (parent_self, parent_kernel)
+        if parent_bias is not None:
+            parents = parents + (parent_bias,)
+        return Tensor._make(out_data, True, parents, backward_fn)
 
     def max_pool1d(self, kernel_size, stride=None, padding=0, dilation=1):
         data = _require_nonempty_float_vector(self, "max_pool1d")
