@@ -667,6 +667,130 @@ class Tensor:
             out_data, True, (parent_self, parent_other), backward_fn
         )
 
+    def where(self, condition, other):
+        # condition is a bool or a non-empty list of bools only; a bad
+        # container or element type is a TypeError and an empty list is a
+        # ValueError.
+        if isinstance(condition, bool):
+            cond_values = [condition]
+            cond_vector = False
+        elif isinstance(condition, list):
+            if len(condition) == 0:
+                raise ValueError("condition list must be non-empty")
+            for flag in condition:
+                if not isinstance(flag, bool):
+                    raise TypeError("condition elements must be bools")
+            # Snapshot the condition so later caller-side mutation cannot
+            # change a pending backward pass.
+            cond_values = condition[:]
+            cond_vector = True
+        else:
+            raise TypeError(
+                "condition must be a bool or a non-empty list of bools"
+            )
+        # other is a Tensor or a finite float only; bools, ints and anything
+        # else are a TypeError, and a non-finite float is a ValueError.
+        other = self._coerce(other)
+        a = _validate_data(self.data)
+        b = _validate_data(other.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        if not isinstance(other.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        a_vector = isinstance(a, list)
+        b_vector = isinstance(b, list)
+        # The output is a vector whenever the condition or either datum is a
+        # list; every list must share one length, while scalars and a scalar
+        # condition broadcast. All scalar inputs produce a scalar output.
+        lengths = []
+        if cond_vector:
+            lengths.append(len(cond_values))
+        if a_vector:
+            lengths.append(len(a))
+        if b_vector:
+            lengths.append(len(b))
+        if lengths and any(length != lengths[0] for length in lengths):
+            raise ValueError("vector lengths must match")
+        n_outputs = lengths[0] if lengths else 1
+        # Select self where the condition is true and other otherwise, in
+        # ascending output-index order. selections snapshots the per-index
+        # decision and a/b snapshot both sides' shapes, so later mutation of
+        # the condition or of either datum leaves this graph unchanged.
+        out_values = []
+        for i in range(n_outputs):
+            chosen = cond_values[i] if cond_vector else cond_values[0]
+            if chosen:
+                out_values.append(a[i] if a_vector else a)
+            else:
+                out_values.append(b[i] if b_vector else b)
+        out_data = out_values if lengths else out_values[0]
+        _ensure_finite_data(out_data)
+        if not (self.requires_grad or other.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_other = self, other
+        selections = (
+            cond_values[:]
+            if cond_vector
+            else [cond_values[0]] * n_outputs
+        )
+
+        def backward_fn(grad):
+            grad_values = grad if isinstance(grad, list) else [grad]
+            da_values = [0.0] * n_outputs
+            db_values = [0.0] * n_outputs
+            # Hand each outgoing element to the side the condition selected
+            # and give the other side 0.0.
+            for i in range(n_outputs):
+                g = grad_values[i]
+                if selections[i]:
+                    da_values[i] = g
+                else:
+                    db_values[i] = g
+            roles = []
+            if parent_self.requires_grad:
+                if a_vector:
+                    roles.append((parent_self, da_values))
+                else:
+                    # A broadcast scalar parent reduces by accumulating
+                    # from 0.0 in ascending output-index order.
+                    total = 0.0
+                    for value in da_values:
+                        total += value
+                        if not math.isfinite(total):
+                            raise ValueError(
+                                "where backward intermediate must be finite"
+                            )
+                    roles.append((parent_self, total))
+            if parent_other.requires_grad:
+                if b_vector:
+                    roles.append((parent_other, db_values))
+                else:
+                    total = 0.0
+                    for value in db_values:
+                        total += value
+                        if not math.isfinite(total):
+                            raise ValueError(
+                                "where backward intermediate must be finite"
+                            )
+                    roles.append((parent_other, total))
+            # The same object may play both sides; merge such roles into one
+            # contribution per tensor, submitting only parents that require
+            # grad.
+            merged = {}
+            for parent, value in roles:
+                entry = merged.get(id(parent))
+                if entry is None:
+                    merged[id(parent)] = [parent, value]
+                else:
+                    combined = _merge_grad(entry[1], value)
+                    _ensure_finite_grad(combined)
+                    entry[1] = combined
+            return [(entry[0], entry[1]) for entry in merged.values()]
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_other), backward_fn
+        )
+
     def pow(self, exponent):
         # The exponent is accepted as a Tensor or a finite float only;
         # bools, ints and anything else are a TypeError, and a non-finite
