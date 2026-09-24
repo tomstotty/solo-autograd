@@ -5397,6 +5397,142 @@ class Tensor:
             backward_fn,
         )
 
+    def scatter_add(self, indices, source):
+        """Scatter-add source into a copy of self along 1D indices.
+
+        For each o in ascending order, out[indices[o]] gains the matching
+        source value (a scalar source broadcasts to every o); repeated
+        indices accumulate. The result has the same shape as self. When
+        either operand requires grad a two-parent graph is built, carrying
+        private snapshots of the indices and both shapes, so later
+        mutation of the indices list or of either operand's data cannot
+        change a pending backward pass.
+        """
+        if not isinstance(source, Tensor):
+            raise TypeError("source must be a Tensor")
+        data = self.data
+        if not isinstance(data, list) or len(data) == 0:
+            raise ValueError(
+                "scatter_add requires a non-empty 1D float list"
+            )
+        source_data = source.data
+        if isinstance(source_data, bool) or not (
+            isinstance(source_data, float) or isinstance(source_data, list)
+        ):
+            raise TypeError(
+                "source data must be a finite float scalar or a non-empty"
+                " 1D float list"
+            )
+        if isinstance(source_data, list) and len(source_data) == 0:
+            raise ValueError("source data list must be non-empty")
+        for value in data:
+            if isinstance(value, bool) or not isinstance(value, float):
+                raise TypeError("scatter_add data elements must be floats")
+        source_values = (
+            source_data if isinstance(source_data, list) else [source_data]
+        )
+        for value in source_values:
+            if isinstance(value, bool) or not isinstance(value, float):
+                raise TypeError("source data elements must be floats")
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        if not isinstance(source.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        for value in data:
+            if not math.isfinite(value):
+                raise ValueError("scatter_add data elements must be finite")
+        for value in source_values:
+            if not math.isfinite(value):
+                raise ValueError("source data elements must be finite")
+        if not isinstance(indices, list):
+            raise TypeError("indices must be a list of non-bool ints")
+        if len(indices) == 0:
+            raise ValueError("indices must be non-empty")
+        for index in indices:
+            if isinstance(index, bool) or not isinstance(index, int):
+                raise TypeError("indices elements must be non-bool ints")
+        n = len(data)
+        for index in indices:
+            if index < 0 or index >= n:
+                raise ValueError("scatter_add index out of range")
+        source_is_vector = isinstance(source_data, list)
+        if source_is_vector and len(source_data) != len(indices):
+            raise ValueError(
+                "source vector length must match indices length"
+            )
+        # Snapshot the indices and the source values at call time so later
+        # caller-side mutation can change neither the forward result nor a
+        # pending backward pass.
+        snapshot_indices = list(indices)
+        snapshot_source = (
+            list(source_data) if source_is_vector else source_data
+        )
+        # Copy self, then accumulate in ascending o order; a non-finite
+        # partial sum aborts before a result tensor exists, so no state can
+        # change on failure.
+        out_data = list(data)
+        for o in range(len(snapshot_indices)):
+            value = (
+                snapshot_source[o] if source_is_vector else snapshot_source
+            )
+            index = snapshot_indices[o]
+            updated = out_data[index] + value
+            if not math.isfinite(updated):
+                raise ValueError("scatter_add result must be finite")
+            out_data[index] = updated
+        if not (self.requires_grad or source.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_source = self, source
+
+        def backward_fn(grad):
+            # Self receives a copy of the full upstream vector; a vector
+            # source receives grad[indices[o]] at each position o, and a
+            # scalar source receives those values summed from 0.0 in
+            # ascending o order. A non-finite intermediate aborts the
+            # whole pass before any grad is written.
+            roles = []
+            if parent_self.requires_grad:
+                roles.append((parent_self, list(grad)))
+            if parent_source.requires_grad:
+                if source_is_vector:
+                    ds = []
+                    for o in range(len(snapshot_indices)):
+                        value = grad[snapshot_indices[o]]
+                        if not math.isfinite(value):
+                            raise ValueError(
+                                "scatter_add backward intermediate must be"
+                                " finite"
+                            )
+                        ds.append(value)
+                    roles.append((parent_source, ds))
+                else:
+                    total = 0.0
+                    for o in range(len(snapshot_indices)):
+                        total += grad[snapshot_indices[o]]
+                        if not math.isfinite(total):
+                            raise ValueError(
+                                "scatter_add backward intermediate must be"
+                                " finite"
+                            )
+                    roles.append((parent_source, total))
+            # The same object may play both roles; merge such roles into
+            # one contribution per tensor, and submit only parents that
+            # require grad.
+            merged = {}
+            for parent, value in roles:
+                entry = merged.get(id(parent))
+                if entry is None:
+                    merged[id(parent)] = [parent, value]
+                else:
+                    combined = _merge_grad(entry[1], value)
+                    _ensure_finite_grad(combined)
+                    entry[1] = combined
+            return [(entry[0], entry[1]) for entry in merged.values()]
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_source), backward_fn
+        )
+
     def gather(self, indices):
         data = _require_nonempty_float_vector(self, "gather")
         if not isinstance(indices, list):
