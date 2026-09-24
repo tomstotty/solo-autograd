@@ -3862,15 +3862,16 @@ class Tensor:
         )
 
     def conv2d_multi(self, kernel, channels, filters, height, width, size,
-                     stride=1, padding=0, dilation=1):
+                     stride=1, padding=0, dilation=1, groups=1):
         if not isinstance(kernel, Tensor):
             raise TypeError("kernel must be a Tensor")
         # Both operands must hold non-empty 1D finite float lists; data may
         # have been mutated after construction, so re-validate at call time.
         x_data = _require_nonempty_float_vector(self, "conv2d_multi")
         w_data = _require_nonempty_float_vector(kernel, "conv2d_multi")
-        # channels, filters, height, width, size, stride and dilation must be
-        # non-bool positive ints, and padding a non-bool non-negative int.
+        # channels, filters, height, width, size, stride, dilation and
+        # groups must be non-bool positive ints, and padding a non-bool
+        # non-negative int.
         for name, value in (
             ("channels", channels),
             ("filters", filters),
@@ -3879,6 +3880,7 @@ class Tensor:
             ("size", size),
             ("stride", stride),
             ("dilation", dilation),
+            ("groups", groups),
         ):
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError(name + " must be a positive int")
@@ -3888,20 +3890,35 @@ class Tensor:
             raise TypeError("padding must be a non-negative int")
         if padding < 0:
             raise ValueError("padding must be a non-negative int")
-        C, O, H, W, K, S, P, D = (
-            channels, filters, height, width, size, stride, padding, dilation
+        C, O, H, W, K, S, P, D, G = (
+            channels, filters, height, width, size, stride, padding,
+            dilation, groups,
         )
+        # Groups partition the channels and filters into G disjoint blocks;
+        # both counts must divide evenly for the split to be well defined.
+        if C % G != 0 or O % G != 0:
+            raise ValueError(
+                "groups must evenly divide channels and filters"
+            )
+        CPG = C // G
+        FPG = O // G
         # self stores C channels of H x W images and kernel O filters of
-        # C channels of K x K weights, all in row-major order.
+        # C/G channels of K x K weights, all in row-major order.
         if len(x_data) != C * H * W:
             raise ValueError(
                 "conv2d_multi input length must equal "
                 "channels * height * width"
             )
-        if len(w_data) != O * C * K * K:
+        kernel_len = O * CPG * K * K
+        if len(w_data) != kernel_len:
+            if G == 1:
+                raise ValueError(
+                    "conv2d_multi kernel length must equal "
+                    "filters * channels * size * size"
+                )
             raise ValueError(
                 "conv2d_multi kernel length must equal "
-                "filters * channels * size * size"
+                "filters * (channels // groups) * size * size"
             )
         # Dilation spaces the kernel taps by D, so the effective receptive
         # field spans E = D*(K-1)+1 positions; with D=1 this is simply K.
@@ -3915,22 +3932,28 @@ class Tensor:
         # result nor a pending backward pass.
         snapshot_x = list(x_data)
         snapshot_w = list(w_data)
-        # Batched multi-channel 2D cross-correlation: the kernel is never
-        # flipped. In ascending (o, or, oc, c, kr, kc) order, each output
-        # starts at 0.0 and accumulates
+        # Grouped multi-channel 2D cross-correlation: the kernel is never
+        # flipped. Filter o belongs to group g = o // (O/G) and reads only
+        # input channels c0 .. c0+C/G-1, where c0 = g*(C/G). In ascending
+        # (o, or, oc, cl, kr, kc) order (cl the in-group channel), each
+        # output starts at 0.0 and accumulates
         # y[(o*OH+or)*OW+oc] += x[(c*H+r)*W+q]
-        #                        * w[((o*C+c)*K+kr)*K+kc],
-        # with r = or*S+kr*D-P and q = oc*S+kc*D-P; out-of-range input
-        # positions from padding or the dilation gaps are skipped. A
-        # non-finite product or partial sum aborts before a result tensor
-        # exists, so no state can change.
+        #   * w[((o*(C/G)+cl)*K+kr)*K+kc],
+        # with c = c0+cl, r = or*S+kr*D-P and q = oc*S+kc*D-P;
+        # out-of-range input positions from padding or the dilation gaps
+        # are skipped. With G=1 this reduces to dense (o, or, oc, c, kr,
+        # kc) order. A non-finite product or partial sum aborts before a
+        # result tensor exists, so no state can change.
         out_len = O * out_h * out_w
         out_data = [0.0] * out_len
         for o in range(O):
+            g = o // FPG
+            c0 = g * CPG
             for orow in range(out_h):
                 for ocol in range(out_w):
                     oi = (o * out_h + orow) * out_w + ocol
-                    for c in range(C):
+                    for cl in range(CPG):
+                        c = c0 + cl
                         for kr in range(K):
                             r = orow * S + kr * D - P
                             if not 0 <= r < H:
@@ -3940,7 +3963,7 @@ class Tensor:
                                 if not 0 <= q < W:
                                     continue
                                 xi = (c * H + r) * W + q
-                                wi = ((o * C + c) * K + kr) * K + kc
+                                wi = ((o * CPG + cl) * K + kr) * K + kc
                                 product = snapshot_x[xi] * snapshot_w[wi]
                                 if not math.isfinite(product):
                                     raise ValueError(
@@ -3959,17 +3982,21 @@ class Tensor:
 
         def backward_fn(grad):
             # dx[xi] += g*w[wi] and dw[wi] += g*x[xi], accumulated from
-            # 0.0 in the same ascending (o, or, oc, c, kr, kc) order as the
-            # forward pass, using the same dilated r/q indexing and skipping
-            # out-of-range positions. A non-finite product or partial sum
-            # aborts the whole pass before any grad is written.
+            # 0.0 in the same ascending (o, or, oc, cl, kr, kc) order and
+            # group-channel mapping as the forward pass, using the same
+            # dilated r/q indexing and skipping out-of-range positions. A
+            # non-finite product or partial sum aborts the whole pass
+            # before any grad is written.
             dx = [0.0] * (C * H * W)
-            dw = [0.0] * (O * C * K * K)
+            dw = [0.0] * (O * CPG * K * K)
             for o in range(O):
+                g = o // FPG
+                c0 = g * CPG
                 for orow in range(out_h):
                     for ocol in range(out_w):
-                        g = grad[(o * out_h + orow) * out_w + ocol]
-                        for c in range(C):
+                        gv = grad[(o * out_h + orow) * out_w + ocol]
+                        for cl in range(CPG):
+                            c = c0 + cl
                             for kr in range(K):
                                 r = orow * S + kr * D - P
                                 if not 0 <= r < H:
@@ -3980,9 +4007,9 @@ class Tensor:
                                         continue
                                     xi = (c * H + r) * W + q
                                     wi = (
-                                        ((o * C + c) * K + kr) * K + kc
+                                        ((o * CPG + cl) * K + kr) * K + kc
                                     )
-                                    contrib_x = g * snapshot_w[wi]
+                                    contrib_x = gv * snapshot_w[wi]
                                     if not math.isfinite(contrib_x):
                                         raise ValueError(
                                             "conv2d_multi backward "
@@ -3994,7 +4021,7 @@ class Tensor:
                                             "conv2d_multi backward "
                                             "intermediate must be finite"
                                         )
-                                    contrib_w = g * snapshot_x[xi]
+                                    contrib_w = gv * snapshot_x[xi]
                                     if not math.isfinite(contrib_w):
                                         raise ValueError(
                                             "conv2d_multi backward "
