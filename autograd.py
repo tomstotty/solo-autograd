@@ -6845,6 +6845,242 @@ class Tensor:
             grad_validator=lambda g: _validate_vector_grad(g, OH * OW),
         )
 
+    def grid_sample2d(self, grid, height, width, out_height, out_width):
+        if not isinstance(grid, Tensor):
+            raise TypeError("grid must be a Tensor")
+        # height, width, out_height and out_width must be non-bool
+        # positive ints.
+        for name, value in (
+            ("height", height),
+            ("width", width),
+            ("out_height", out_height),
+            ("out_width", out_width),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(name + " must be a positive int")
+            if value <= 0:
+                raise ValueError(name + " must be a positive int")
+        H, W, OH, OW = height, width, out_height, out_width
+        # self and grid must each hold a finite float list; data may have
+        # been mutated after construction, so re-validate at call time.
+        # For each operand the order mirrors the shared vector rule:
+        # non-list -> ValueError, non-float elements / non-bool
+        # requires_grad -> TypeError, non-finite values -> ValueError;
+        # the required non-empty lengths are enforced after both operands
+        # pass those checks.
+        self_data = self.data
+        if not isinstance(self_data, list):
+            raise ValueError("grid_sample2d input must be a 1D float list")
+        for value in self_data:
+            if isinstance(value, bool) or not isinstance(value, float):
+                raise TypeError("grid_sample2d input elements must be floats")
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        for value in self_data:
+            if not math.isfinite(value):
+                raise ValueError("grid_sample2d input elements must be finite")
+        grid_data = grid.data
+        if not isinstance(grid_data, list):
+            raise ValueError("grid_sample2d grid must be a 1D float list")
+        for value in grid_data:
+            if isinstance(value, bool) or not isinstance(value, float):
+                raise TypeError("grid_sample2d grid elements must be floats")
+        if not isinstance(grid.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        for value in grid_data:
+            if not math.isfinite(value):
+                raise ValueError("grid_sample2d grid elements must be finite")
+        if len(self_data) != H * W:
+            raise ValueError(
+                "grid_sample2d input length must equal height * width"
+            )
+        if len(grid_data) != 2 * OH * OW:
+            raise ValueError(
+                "grid_sample2d grid length must equal 2 * out_height *"
+                " out_width"
+            )
+        # Snapshot both operands at call time so later caller-side mutation
+        # or replacement of either data list can change neither the forward
+        # result nor a pending backward pass.
+        input_data = list(self_data)
+        grid_values = list(grid_data)
+        # grid stores OH*OW points (gx, gy) in row-major order; point p
+        # maps to x = (gx+1)*(W-1)/2, y = (gy+1)*(H-1)/2, the aligned-
+        # corners convention. Each output is bilinear: with i = floor(x),
+        # j = floor(y), a = x-i, b = y-j, the four neighbours (j+v, i+u)
+        # are summed over ascending (v, u) in {0,1}^2 with weights
+        # wy[v]*wx[u] = (1-b, b)*(1-a, a); out-of-range neighbours count
+        # as 0.0. Points outside [-1, 1] therefore sample zero. Every
+        # product and partial sum is checked as it is produced; a non-
+        # finite intermediate aborts before a result tensor exists, so no
+        # state can change on failure.
+        scale_x = (W - 1) / 2.0
+        scale_y = (H - 1) / 2.0
+        points = []
+        out_data = []
+        for p in range(OH * OW):
+            gx = grid_values[2 * p]
+            gy = grid_values[2 * p + 1]
+            x = (gx + 1.0) * scale_x
+            if not math.isfinite(x):
+                raise ValueError("grid_sample2d intermediate must be finite")
+            y = (gy + 1.0) * scale_y
+            if not math.isfinite(y):
+                raise ValueError("grid_sample2d intermediate must be finite")
+            i = math.floor(x)
+            j = math.floor(y)
+            a = x - float(i)
+            b = y - float(j)
+            if not math.isfinite(a) or not math.isfinite(b):
+                raise ValueError("grid_sample2d intermediate must be finite")
+            points.append((i, j, a, b))
+            acc = 0.0
+            for v in (0, 1):
+                wy = (1.0 - b) if v == 0 else b
+                for u in (0, 1):
+                    r = j + v
+                    c = i + u
+                    if 0 <= r < H and 0 <= c < W:
+                        wx = (1.0 - a) if u == 0 else a
+                        term = input_data[r * W + c] * wy * wx
+                        if not math.isfinite(term):
+                            raise ValueError(
+                                "grid_sample2d intermediate must be finite"
+                            )
+                        acc += term
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "grid_sample2d intermediate must be finite"
+                            )
+            out_data.append(acc)
+        if not (self.requires_grad or grid.requires_grad):
+            return Tensor._make(
+                out_data,
+                False,
+                (),
+                None,
+                grad_validator=lambda g: _validate_vector_grad(g, OH * OW),
+            )
+        parent_self, parent_grid = self, grid
+        snapshot_W = W
+        snapshot_H = H
+        snapshot_points = points
+        snapshot_input = input_data
+
+        def backward_fn(grad):
+            # Analytic derivatives of the four bilinear terms, using the
+            # forward floor branches (i, j) fixed in snapshot_points. For
+            # point p and neighbour (v, u), let w = wy[v]*wx[u]:
+            #   dinput[(j+v)*W+i+u] += grad[p] * w
+            #   dgx[2p] += grad[p] * value * wy[v] * d_wx[u] * scale_x
+            #   dgy[2p+1] += grad[p] * value * d_wy[v] * wx[u] * scale_y
+            # where d_wx = (-1, 1), d_wy = (-1, 1). Neighbours are visited
+            # in the same ascending (v, u) order as the forward pass and
+            # out-of-range positions contribute 0.0. Every product and
+            # partial sum is checked as it is produced; a non-finite
+            # intermediate aborts the whole pass before any grad is
+            # written.
+            d_input = [0.0] * (snapshot_H * snapshot_W)
+            d_grid = [0.0] * (2 * OH * OW)
+            need_input = parent_self.requires_grad
+            need_grid = parent_grid.requires_grad
+            for p in range(OH * OW):
+                i, j, a, b = snapshot_points[p]
+                gp = grad[p]
+                for v in (0, 1):
+                    if v == 0:
+                        wy = 1.0 - b
+                        d_wy = -1.0
+                    else:
+                        wy = b
+                        d_wy = 1.0
+                    for u in (0, 1):
+                        r = j + v
+                        c = i + u
+                        if not (0 <= r < snapshot_H and 0 <= c < snapshot_W):
+                            continue
+                        if u == 0:
+                            wx = 1.0 - a
+                            d_wx = -1.0
+                        else:
+                            wx = a
+                            d_wx = 1.0
+                        if need_input:
+                            weight = wy * wx
+                            if not math.isfinite(weight):
+                                raise ValueError(
+                                    "grid_sample2d backward intermediate must be"
+                                    " finite"
+                                )
+                            term = gp * weight
+                            if not math.isfinite(term):
+                                raise ValueError(
+                                    "grid_sample2d backward intermediate must be"
+                                    " finite"
+                                )
+                            idx = r * snapshot_W + c
+                            d_input[idx] += term
+                            if not math.isfinite(d_input[idx]):
+                                raise ValueError(
+                                    "grid_sample2d backward intermediate must be"
+                                    " finite"
+                                )
+                        if need_grid:
+                            value = snapshot_input[r * snapshot_W + c]
+                            term_x = gp * value * wy * d_wx * scale_x
+                            if not math.isfinite(term_x):
+                                raise ValueError(
+                                    "grid_sample2d backward intermediate must be"
+                                    " finite"
+                                )
+                            gx_idx = 2 * p
+                            d_grid[gx_idx] += term_x
+                            if not math.isfinite(d_grid[gx_idx]):
+                                raise ValueError(
+                                    "grid_sample2d backward intermediate must be"
+                                    " finite"
+                                )
+                            term_y = gp * value * d_wy * wx * scale_y
+                            if not math.isfinite(term_y):
+                                raise ValueError(
+                                    "grid_sample2d backward intermediate must be"
+                                    " finite"
+                                )
+                            gy_idx = 2 * p + 1
+                            d_grid[gy_idx] += term_y
+                            if not math.isfinite(d_grid[gy_idx]):
+                                raise ValueError(
+                                    "grid_sample2d backward intermediate must be"
+                                    " finite"
+                                )
+            # One object may play both roles; merge the two contributions
+            # into one. Their shapes only agree when self and grid are the
+            # same tensor and H*W == 2*OH*OW.
+            merged = {}
+            roles = (
+                (parent_self, d_input),
+                (parent_grid, d_grid),
+            )
+            for parent, value in roles:
+                if not parent.requires_grad:
+                    continue
+                entry = merged.get(id(parent))
+                if entry is None:
+                    merged[id(parent)] = [parent, value]
+                else:
+                    combined = _merge_grad(entry[1], value)
+                    _ensure_finite_grad(combined)
+                    entry[1] = combined
+            return [(entry[0], entry[1]) for entry in merged.values()]
+
+        return Tensor._make(
+            out_data,
+            True,
+            (parent_self, parent_grid),
+            backward_fn,
+            grad_validator=lambda g: _validate_vector_grad(g, OH * OW),
+        )
+
     def dropout(self, p=0.5, seed=0):
         data = _require_nonempty_float_vector(self, "dropout")
         if isinstance(p, bool) or not isinstance(p, float):
