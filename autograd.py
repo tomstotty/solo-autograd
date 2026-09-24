@@ -3443,6 +3443,88 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def logcumsumexp(self):
+        data = _require_nonempty_float_vector(self, "logcumsumexp")
+        # Snapshot the input so later caller-side mutation cannot change
+        # either the forward result or a pending backward pass.
+        x = list(data)
+        # Stable one-dimensional prefix log-sum-exp, scanning in ascending
+        # index order. Each step combines the running prefix with the next
+        # value via logaddexp, so exp is only ever evaluated on a
+        # non-positive difference; exp(x_i) is never accumulated directly.
+        y = [x[0]]
+        for i in range(1, len(x)):
+            m = max(y[i - 1], x[i])
+            d = min(y[i - 1], x[i]) - m
+            if d == float("-inf"):
+                e = 0.0
+            else:
+                if not math.isfinite(d):
+                    raise ValueError(
+                        "logcumsumexp intermediate must be finite"
+                    )
+                e = math.exp(d)
+                if not math.isfinite(e):
+                    raise ValueError(
+                        "logcumsumexp intermediate must be finite"
+                    )
+            value = m + math.log1p(e)
+            if not math.isfinite(value):
+                raise ValueError(
+                    "logcumsumexp intermediate must be finite"
+                )
+            y.append(value)
+        out_data = y
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        snapshot_x = x
+        snapshot_y = y
+
+        def backward_fn(grad):
+            # dy[i]/dx[j] = exp(x[j] - y[i]) for j <= i and 0 otherwise.
+            # For each j, accumulate grad[i] times that factor for i from
+            # j to n-1 in ascending order, starting from 0.0. A diff of
+            # -inf contributes exp(-inf) = 0.0; any other non-finite
+            # intermediate aborts before any grad is applied.
+            dx = [0.0] * len(snapshot_x)
+            for j in range(len(snapshot_x)):
+                total = 0.0
+                for i in range(j, len(snapshot_y)):
+                    diff = snapshot_x[j] - snapshot_y[i]
+                    if diff == float("-inf"):
+                        factor = 0.0
+                    else:
+                        if not math.isfinite(diff):
+                            raise ValueError(
+                                "logcumsumexp backward intermediate "
+                                "must be finite"
+                            )
+                        factor = math.exp(diff)
+                        if not math.isfinite(factor):
+                            raise ValueError(
+                                "logcumsumexp backward intermediate "
+                                "must be finite"
+                            )
+                    contribution = grad[i] * factor
+                    if not math.isfinite(contribution):
+                        raise ValueError(
+                            "logcumsumexp backward intermediate must be finite"
+                        )
+                    total += contribution
+                    if not math.isfinite(total):
+                        raise ValueError(
+                            "logcumsumexp backward intermediate must be finite"
+                        )
+                    dx[j] = total
+                if not math.isfinite(dx[j]):
+                    raise ValueError(
+                        "logcumsumexp backward intermediate must be finite"
+                    )
+            return [(parent, dx)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def cross_entropy(self, target, label_smoothing=0.0):
         data = _require_nonempty_float_vector(self, "cross_entropy")
         if isinstance(target, bool) or not isinstance(target, int):
