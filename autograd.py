@@ -3316,6 +3316,90 @@ class Tensor:
             grad_validator=lambda g: _validate_vector_grad(g, n),
         )
 
+    def cumsum(self, exclusive=False, reverse=False):
+        # One-dimensional cumulative sum in four differentiable modes.
+        # Re-validate at call time since the data may have been mutated
+        # after construction: data must be a non-empty 1D list of finite
+        # floats (anything that is not a list, including a scalar, and an
+        # empty list are ValueError; a non-float element — bool, int or a
+        # nested list included — is TypeError; a non-finite element is
+        # ValueError), requires_grad and both flags must be bools
+        # (TypeError).
+        data = self.data
+        if not isinstance(data, list) or len(data) == 0:
+            raise ValueError("cumsum requires a non-empty 1D float list")
+        for value in data:
+            if isinstance(value, bool) or not isinstance(value, float):
+                raise TypeError("cumsum data elements must be floats")
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        for value in data:
+            if not math.isfinite(value):
+                raise ValueError("cumsum data elements must be finite")
+        if not isinstance(exclusive, bool):
+            raise TypeError("exclusive must be a bool")
+        if not isinstance(reverse, bool):
+            raise TypeError("reverse must be a bool")
+        # Snapshot the length and both flags so later caller-side mutation
+        # or replacement of self.data changes neither the forward result
+        # nor a pending backward pass.
+        n = len(data)
+        exclusive_flag = exclusive
+        reverse_flag = reverse
+        # Traverse i = 0..n-1 (reverse=False) or i = n-1..0 (reverse=True)
+        # with acc starting at 0.0; exclusive writes y[i] = acc before
+        # accumulating x[i], inclusive accumulates first and then writes.
+        # A non-finite partial sum aborts before a result tensor exists,
+        # so the input and all graph state stay untouched.
+        out_data = [0.0] * n
+        acc = 0.0
+        indices = range(n - 1, -1, -1) if reverse_flag else range(n)
+        for i in indices:
+            if exclusive_flag:
+                out_data[i] = acc
+                acc += data[i]
+            else:
+                acc += data[i]
+                out_data[i] = acc
+            if not math.isfinite(acc):
+                raise ValueError("cumsum intermediate must be finite")
+        if not self.requires_grad:
+            return Tensor._make(
+                out_data, False, (), None,
+                grad_validator=lambda g: _validate_vector_grad(g, n),
+            )
+        parent = self
+
+        def backward_fn(grad):
+            # dy[i]/dx[j] is 1.0 exactly when x[j] reaches y[i]: with
+            # reverse=False that is i >= j (inclusive) or i > j
+            # (exclusive); with reverse=True it is i <= j or i < j. Each
+            # dx[j] is accumulated from 0.0 over i in ascending order; a
+            # non-finite partial sum aborts the whole pass before any
+            # grad is written.
+            dx = [0.0] * n
+            for j in range(n):
+                total = 0.0
+                for i in range(n):
+                    if reverse_flag:
+                        include = i < j if exclusive_flag else i <= j
+                    else:
+                        include = i > j if exclusive_flag else i >= j
+                    if not include:
+                        continue
+                    total += grad[i]
+                    if not math.isfinite(total):
+                        raise ValueError(
+                            "cumsum backward intermediate must be finite"
+                        )
+                dx[j] = total
+            return [(parent, dx)]
+
+        return Tensor._make(
+            out_data, True, (parent,), backward_fn,
+            grad_validator=lambda g: _validate_vector_grad(g, n),
+        )
+
     def mean(self):
         # Re-validate at call time since the data may have been mutated
         # after construction: a finite float scalar or a non-empty 1D
