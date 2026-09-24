@@ -8981,6 +8981,492 @@ class Tensor:
             grad_validator=lambda g: _validate_vector_grad(g, q * h * d),
         )
 
+    def mha_batch(self, key, value, batch, q, k, h, d, mask=None,
+                  causal=False, dropout=0.0, seed=0):
+        if not isinstance(key, Tensor):
+            raise TypeError("key must be a Tensor")
+        if not isinstance(value, Tensor):
+            raise TypeError("value must be a Tensor")
+        # The five sizes must be non-bool positive ints.
+        for name, dim in (("batch", batch), ("q", q), ("k", k),
+                          ("h", h), ("d", d)):
+            if isinstance(dim, bool) or not isinstance(dim, int):
+                raise TypeError(name + " must be a positive int")
+            if dim <= 0:
+                raise ValueError(name + " must be a positive int")
+        if not isinstance(causal, bool):
+            raise TypeError("causal must be a bool")
+        # p = dropout must be a finite float in [0, 1); a non-float is a
+        # type error, a non-finite or out-of-range float a value error.
+        p = dropout
+        if not isinstance(p, float):
+            raise TypeError("dropout must be a float")
+        if not math.isfinite(p) or p < 0.0 or p >= 1.0:
+            raise ValueError("dropout must be a finite float in [0, 1)")
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise TypeError("seed must be an int")
+        if seed < 0 or seed > 4294967295:
+            raise ValueError("seed must be in 0..2**32 - 1")
+        B = batch
+        # All three operands must hold non-empty 1D finite float lists;
+        # data may have been mutated after construction, so re-validate at
+        # call time. Each operand is either the unbatched flattened layout
+        # (q*h*d queries, k*h*d keys/values), broadcast to every batch, or
+        # the batched layout with batch as the outermost dimension:
+        # index (((b*token + token)*h + head)*d + r).
+        q_data = _require_nonempty_float_vector(self, "mha_batch")
+        k_data = _require_nonempty_float_vector(key, "mha_batch")
+        v_data = _require_nonempty_float_vector(value, "mha_batch")
+        if len(q_data) == q * h * d:
+            q_full = False
+        elif len(q_data) == B * q * h * d:
+            q_full = True
+        else:
+            raise ValueError(
+                "query length must equal q * h * d or batch * q * h * d"
+            )
+        if len(k_data) == k * h * d:
+            k_full = False
+        elif len(k_data) == B * k * h * d:
+            k_full = True
+        else:
+            raise ValueError(
+                "key length must equal k * h * d or batch * k * h * d"
+            )
+        if len(v_data) == k * h * d:
+            v_full = False
+        elif len(v_data) == B * k * h * d:
+            v_full = True
+        else:
+            raise ValueError(
+                "value length must equal k * h * d or batch * k * h * d"
+            )
+        # mask is either None (every position allowed), a length q*k flat
+        # list of bools shared by every batch, or a length B*q*k list with
+        # one q*k block per batch; other lengths are value errors.
+        if mask is None:
+            mask_list = None
+            mask_full = False
+        else:
+            if not isinstance(mask, list):
+                raise TypeError("mask must be a list of bools")
+            if len(mask) == q * k:
+                mask_full = False
+            elif len(mask) == B * q * k:
+                mask_full = True
+            else:
+                raise ValueError(
+                    "mask length must equal q * k or batch * q * k"
+                )
+            for flag in mask:
+                if not isinstance(flag, bool):
+                    raise TypeError("mask elements must be bools")
+            mask_list = list(mask)
+        # Position (b, i, j) is visible iff the mask allows it (None means
+        # allowed) and, under causal, j <= i. Every query row of every
+        # batch must keep at least one visible key.
+        vis = [False] * (B * q * k)
+        for b in range(B):
+            for i in range(q):
+                for j in range(k):
+                    allowed = not causal or j <= i
+                    if allowed and mask_list is not None:
+                        if mask_full:
+                            allowed = mask_list[(b * q + i) * k + j]
+                        else:
+                            allowed = mask_list[i * k + j]
+                    vis[(b * q + i) * k + j] = allowed
+        for b in range(B):
+            for i in range(q):
+                base = (b * q + i) * k
+                if not any(vis[base:base + k]):
+                    raise ValueError(
+                        "each row must have at least one visible key"
+                    )
+        # Snapshot the inputs at call time so later caller-side mutation
+        # or replacement of any data list or the mask can change neither
+        # the forward result nor a pending backward pass.
+        snapshot_q = list(q_data)
+        snapshot_k = list(k_data)
+        snapshot_v = list(v_data)
+        snapshot_vis = vis
+
+        def qi(b, head, i, r):
+            return ((b * q + i) * h + head) * d + r
+
+        def ki(b, head, j, r):
+            return ((b * k + j) * h + head) * d + r
+
+        def qsrc(b, head, i, r):
+            return (((b if q_full else 0) * q + i) * h + head) * d + r
+
+        def ksrc(b, head, j, r):
+            return (((b if k_full else 0) * k + j) * h + head) * d + r
+
+        def vsrc(b, head, j, r):
+            return (((b if v_full else 0) * k + j) * h + head) * d + r
+
+        def pidx(b, head, i, j):
+            return ((b * h + head) * q + i) * k + j
+
+        scale = math.sqrt(float(d))
+        if not math.isfinite(scale):
+            raise ValueError("mha_batch intermediate must be finite")
+        # Scores: s[b,head,i,j] = (sum_r Q*K) / sqrt(d), accumulated from
+        # 0.0 in ascending (b, i, j, head, r) order. A non-finite product,
+        # partial sum or scaled score aborts before a result tensor
+        # exists, so no state can change on failure.
+        scores = [0.0] * (B * h * q * k)
+        for b in range(B):
+            for i in range(q):
+                for j in range(k):
+                    for head in range(h):
+                        acc = 0.0
+                        for r in range(d):
+                            product = (
+                                snapshot_q[qsrc(b, head, i, r)]
+                                * snapshot_k[ksrc(b, head, j, r)]
+                            )
+                            if not math.isfinite(product):
+                                raise ValueError(
+                                    "mha_batch intermediate must be finite"
+                                )
+                            acc += product
+                            if not math.isfinite(acc):
+                                raise ValueError(
+                                    "mha_batch intermediate must be finite"
+                                )
+                        score = acc / scale
+                        if not math.isfinite(score):
+                            raise ValueError(
+                                "mha_batch intermediate must be finite"
+                            )
+                        scores[pidx(b, head, i, j)] = score
+        # Per-batch per-head per-row stable softmax over the visible
+        # positions only, in ascending (b, i, head, j) key order:
+        # m = row max of the visible scores, z_j = exp(s_j - m),
+        # s = sum(z), p_j = z_j / s; invisible positions stay 0.0. exp is
+        # only ever evaluated on values in (-inf, 0].
+        probs = [0.0] * (B * h * q * k)
+        for b in range(B):
+            for i in range(q):
+                base = (b * q + i) * k
+                allowed = [j for j in range(k) if snapshot_vis[base + j]]
+                for head in range(h):
+                    sbase = pidx(b, head, i, 0)
+                    m = max(scores[sbase + j] for j in allowed)
+                    z = [0.0] * k
+                    row_sum = 0.0
+                    for j in allowed:
+                        diff = scores[sbase + j] - m
+                        if not math.isfinite(diff):
+                            raise ValueError(
+                                "mha_batch intermediate must be finite"
+                            )
+                        z_j = math.exp(diff)
+                        if not math.isfinite(z_j):
+                            raise ValueError(
+                                "mha_batch intermediate must be finite"
+                            )
+                        z[j] = z_j
+                        row_sum += z_j
+                        if not math.isfinite(row_sum):
+                            raise ValueError(
+                                "mha_batch intermediate must be finite"
+                            )
+                    for j in allowed:
+                        p_j = z[j] / row_sum
+                        if not math.isfinite(p_j):
+                            raise ValueError(
+                                "mha_batch intermediate must be finite"
+                            )
+                        probs[sbase + j] = p_j
+        # Deterministic dropout: a single LCG seeded with seed advances
+        # only on visible positions, in ascending (b, i, head, j) order:
+        # s = (1664525*s + 1013904223) mod 2^32, u = s / 2^32,
+        # M = 1.0 if u >= p else 0.0, P' = M*P/(1-p). Invisible positions
+        # consume no draws. No global random state is touched.
+        keep = 1.0 - p
+        drop_m = [0.0] * (B * h * q * k)
+        probs_drop = [0.0] * (B * h * q * k)
+        s = seed
+        for b in range(B):
+            for i in range(q):
+                base = (b * q + i) * k
+                for head in range(h):
+                    sbase = pidx(b, head, i, 0)
+                    for j in range(k):
+                        if not snapshot_vis[base + j]:
+                            continue
+                        s = (1664525 * s + 1013904223) % 4294967296
+                        u = s / 4294967296.0
+                        m_val = 1.0 if u >= p else 0.0
+                        dropped = m_val * probs[sbase + j] / keep
+                        if not math.isfinite(dropped):
+                            raise ValueError(
+                                "mha_batch intermediate must be finite"
+                            )
+                        drop_m[sbase + j] = m_val
+                        probs_drop[sbase + j] = dropped
+        # Output: y[b,head,i,r] = sum_j P'[b,head,i,j] * V[b,head,j,r],
+        # accumulated from 0.0 in ascending (b, i, head, r, j) order;
+        # invisible positions contribute 0.
+        out_data = [0.0] * (B * q * h * d)
+        for b in range(B):
+            for i in range(q):
+                base = (b * q + i) * k
+                for head in range(h):
+                    for r in range(d):
+                        acc = 0.0
+                        for j in range(k):
+                            if not snapshot_vis[base + j]:
+                                continue
+                            product = (
+                                probs_drop[pidx(b, head, i, j)]
+                                * snapshot_v[vsrc(b, head, j, r)]
+                            )
+                            if not math.isfinite(product):
+                                raise ValueError(
+                                    "mha_batch intermediate must be finite"
+                                )
+                            acc += product
+                            if not math.isfinite(acc):
+                                raise ValueError(
+                                    "mha_batch intermediate must be finite"
+                                )
+                        out_data[qi(b, head, i, r)] = acc
+        if not (
+            self.requires_grad or key.requires_grad or value.requires_grad
+        ):
+            return Tensor._make(
+                out_data, False, (), None,
+                grad_validator=lambda g: _validate_vector_grad(
+                    g, B * q * h * d
+                ),
+            )
+        parent_self, parent_key, parent_value = self, key, value
+        saved_p = list(probs)
+        saved_pd = list(probs_drop)
+        saved_m = list(drop_m)
+
+        def backward_fn(grad):
+            # H = G V^T, dV = P'^T G, dP = H*M/(1-p), then the mha
+            # formulas: D[b,h,i,j] = p*(dP - sum_j p*dP) over visible
+            # positions, dQ = D K / sqrt(d), dK = D^T Q / sqrt(d);
+            # invisible positions contribute 0.0. Broadcast parents are
+            # reduced over b in ascending order. Every product and partial
+            # sum is checked as it is produced, and the generic engine
+            # validates each contribution and every merge into an existing
+            # grad.
+            h_mat = [0.0] * (B * h * q * k)
+            d_mat = [0.0] * (B * h * q * k)
+            dq = [0.0] * (B * q * h * d)
+            dk = [0.0] * (B * k * h * d)
+            dv = [0.0] * (B * k * h * d)
+            for b in range(B):
+                for i in range(q):
+                    for head in range(h):
+                        for j in range(k):
+                            acc = 0.0
+                            for r in range(d):
+                                product = (
+                                    grad[qi(b, head, i, r)]
+                                    * snapshot_v[vsrc(b, head, j, r)]
+                                )
+                                if not math.isfinite(product):
+                                    raise ValueError(
+                                        "mha_batch backward intermediate"
+                                        " must be finite"
+                                    )
+                                acc += product
+                                if not math.isfinite(acc):
+                                    raise ValueError(
+                                        "mha_batch backward intermediate"
+                                        " must be finite"
+                                    )
+                            h_mat[pidx(b, head, i, j)] = acc
+            for b in range(B):
+                for i in range(q):
+                    base = (b * q + i) * k
+                    allowed = [
+                        j for j in range(k) if snapshot_vis[base + j]
+                    ]
+                    for head in range(h):
+                        sbase = pidx(b, head, i, 0)
+                        row_sum = 0.0
+                        for j in allowed:
+                            dp_j = (
+                                h_mat[sbase + j] * saved_m[sbase + j] / keep
+                            )
+                            if not math.isfinite(dp_j):
+                                raise ValueError(
+                                    "mha_batch backward intermediate"
+                                    " must be finite"
+                                )
+                            d_mat[sbase + j] = dp_j
+                            product = saved_p[sbase + j] * dp_j
+                            if not math.isfinite(product):
+                                raise ValueError(
+                                    "mha_batch backward intermediate"
+                                    " must be finite"
+                                )
+                            row_sum += product
+                            if not math.isfinite(row_sum):
+                                raise ValueError(
+                                    "mha_batch backward intermediate"
+                                    " must be finite"
+                                )
+                        for j in allowed:
+                            difference = d_mat[sbase + j] - row_sum
+                            if not math.isfinite(difference):
+                                raise ValueError(
+                                    "mha_batch backward intermediate"
+                                    " must be finite"
+                                )
+                            d_ij = saved_p[sbase + j] * difference
+                            if not math.isfinite(d_ij):
+                                raise ValueError(
+                                    "mha_batch backward intermediate"
+                                    " must be finite"
+                                )
+                            d_mat[sbase + j] = d_ij
+            for b in range(B):
+                for i in range(q):
+                    base = (b * q + i) * k
+                    for head in range(h):
+                        for r in range(d):
+                            acc = 0.0
+                            for j in range(k):
+                                if not snapshot_vis[base + j]:
+                                    continue
+                                product = (
+                                    d_mat[pidx(b, head, i, j)]
+                                    * snapshot_k[ksrc(b, head, j, r)]
+                                )
+                                if not math.isfinite(product):
+                                    raise ValueError(
+                                        "mha_batch backward intermediate"
+                                        " must be finite"
+                                    )
+                                acc += product
+                                if not math.isfinite(acc):
+                                    raise ValueError(
+                                        "mha_batch backward intermediate"
+                                        " must be finite"
+                                    )
+                            contribution = acc / scale
+                            if not math.isfinite(contribution):
+                                raise ValueError(
+                                    "mha_batch backward intermediate"
+                                    " must be finite"
+                                )
+                            dq[qi(b, head, i, r)] = contribution
+            for b in range(B):
+                for j in range(k):
+                    for head in range(h):
+                        for r in range(d):
+                            acc = 0.0
+                            for i in range(q):
+                                if not snapshot_vis[(b * q + i) * k + j]:
+                                    continue
+                                product = (
+                                    d_mat[pidx(b, head, i, j)]
+                                    * snapshot_q[qsrc(b, head, i, r)]
+                                )
+                                if not math.isfinite(product):
+                                    raise ValueError(
+                                        "mha_batch backward intermediate"
+                                        " must be finite"
+                                    )
+                                acc += product
+                                if not math.isfinite(acc):
+                                    raise ValueError(
+                                        "mha_batch backward intermediate"
+                                        " must be finite"
+                                    )
+                            contribution = acc / scale
+                            if not math.isfinite(contribution):
+                                raise ValueError(
+                                    "mha_batch backward intermediate"
+                                    " must be finite"
+                                )
+                            dk[ki(b, head, j, r)] = contribution
+            for b in range(B):
+                for j in range(k):
+                    for head in range(h):
+                        for r in range(d):
+                            acc = 0.0
+                            for i in range(q):
+                                if not snapshot_vis[(b * q + i) * k + j]:
+                                    continue
+                                product = (
+                                    saved_pd[pidx(b, head, i, j)]
+                                    * grad[qi(b, head, i, r)]
+                                )
+                                if not math.isfinite(product):
+                                    raise ValueError(
+                                        "mha_batch backward intermediate"
+                                        " must be finite"
+                                    )
+                                acc += product
+                                if not math.isfinite(acc):
+                                    raise ValueError(
+                                        "mha_batch backward intermediate"
+                                        " must be finite"
+                                    )
+                            dv[ki(b, head, j, r)] = acc
+            # Reduce broadcast parents over the batch dimension in
+            # ascending b order; full-layout parents keep their per-batch
+            # gradients.
+            def reduce_batch(full_grad, full, width):
+                if full:
+                    return full_grad
+                reduced = [0.0] * width
+                for b in range(B):
+                    offset = b * width
+                    for idx in range(width):
+                        reduced[idx] += full_grad[offset + idx]
+                        if not math.isfinite(reduced[idx]):
+                            raise ValueError(
+                                "mha_batch backward intermediate"
+                                " must be finite"
+                            )
+                return reduced
+
+            dq_parent = reduce_batch(dq, q_full, q * h * d)
+            dk_parent = reduce_batch(dk, k_full, k * h * d)
+            dv_parent = reduce_batch(dv, v_full, k * h * d)
+            # One object may play several roles (e.g. key and value are
+            # the same tensor); merge such roles into one contribution
+            # per tensor, and submit only parents that require grad.
+            merged = {}
+            roles = (
+                (parent_self, dq_parent),
+                (parent_key, dk_parent),
+                (parent_value, dv_parent),
+            )
+            for parent, value in roles:
+                if not parent.requires_grad:
+                    continue
+                entry = merged.get(id(parent))
+                if entry is None:
+                    merged[id(parent)] = [parent, value]
+                else:
+                    combined = _merge_grad(entry[1], value)
+                    _ensure_finite_grad(combined)
+                    entry[1] = combined
+            return [(entry[0], entry[1]) for entry in merged.values()]
+
+        return Tensor._make(
+            out_data,
+            True,
+            (parent_self, parent_key, parent_value),
+            backward_fn,
+            grad_validator=lambda g: _validate_vector_grad(
+                g, B * q * h * d
+            ),
+        )
+
     def lstm(self, w, u, b, h0, c0, steps, input_size, hidden_size):
         if not isinstance(w, Tensor):
             raise TypeError("w must be a Tensor")
