@@ -6878,6 +6878,277 @@ class Tensor:
             backward_fn,
         )
 
+    def layer_norm_batch(self, weight, bias, rows, cols, eps=1e-5):
+        if not isinstance(weight, Tensor):
+            raise TypeError("weight must be a Tensor")
+        if not isinstance(bias, Tensor):
+            raise TypeError("bias must be a Tensor")
+        # All three data lists may have been mutated after construction, so
+        # re-validate at call time: a non-list/empty list is a ValueError,
+        # a non-float element or a non-bool requires_grad is a TypeError,
+        # a non-finite element is a ValueError. self is an R x C row-major
+        # batch while weight and bias both have length C.
+        x_data = _require_nonempty_float_vector(
+            self, "layer_norm_batch"
+        )
+        w_data = _require_nonempty_float_vector(
+            weight, "layer_norm_batch"
+        )
+        b_data = _require_nonempty_float_vector(
+            bias, "layer_norm_batch"
+        )
+        if isinstance(rows, bool) or not isinstance(rows, int):
+            raise TypeError("rows must be a positive int")
+        if isinstance(cols, bool) or not isinstance(cols, int):
+            raise TypeError("cols must be a positive int")
+        if rows <= 0:
+            raise ValueError("rows must be a positive int")
+        if cols <= 0:
+            raise ValueError("cols must be a positive int")
+        R, C = rows, cols
+        if len(x_data) != R * C:
+            raise ValueError(
+                "layer_norm_batch self length must equal rows * cols"
+            )
+        if len(w_data) != C or len(b_data) != C:
+            raise ValueError(
+                "layer_norm_batch weight and bias lengths must equal cols"
+            )
+        if isinstance(eps, bool) or not isinstance(eps, float):
+            raise TypeError("eps must be a positive finite float")
+        if not math.isfinite(eps) or eps <= 0.0:
+            raise ValueError("eps must be a positive finite float")
+        # Snapshot all three inputs so later caller-side mutation or
+        # replacement can change neither the forward result nor a pending
+        # backward pass.
+        x = list(x_data)
+        w = list(w_data)
+        b = list(b_data)
+        # Per row, in ascending column order, accumulate from 0.0:
+        # mu = sum(x)/C, z_c = x_c - mu, v = sum(z*z)/C,
+        # s = 1/sqrt(v+eps), h_c = z_c*s, y_c = h_c*w_c + b_c. A
+        # non-finite intermediate aborts before a result tensor exists, so
+        # no state can change on failure.
+        out_data = []
+        saved_s = []
+        saved_h = []
+        for r in range(R):
+            total = 0.0
+            for c in range(C):
+                total += x[r * C + c]
+                if not math.isfinite(total):
+                    raise ValueError(
+                        "layer_norm_batch intermediate must be finite"
+                    )
+            mu = total / C
+            if not math.isfinite(mu):
+                raise ValueError(
+                    "layer_norm_batch intermediate must be finite"
+                )
+            centered = []
+            for c in range(C):
+                z_c = x[r * C + c] - mu
+                if not math.isfinite(z_c):
+                    raise ValueError(
+                        "layer_norm_batch intermediate must be finite"
+                    )
+                centered.append(z_c)
+            var_sum = 0.0
+            for c in range(C):
+                square = centered[c] * centered[c]
+                if not math.isfinite(square):
+                    raise ValueError(
+                        "layer_norm_batch intermediate must be finite"
+                    )
+                var_sum += square
+                if not math.isfinite(var_sum):
+                    raise ValueError(
+                        "layer_norm_batch intermediate must be finite"
+                    )
+            v = var_sum / C
+            if not math.isfinite(v):
+                raise ValueError(
+                    "layer_norm_batch intermediate must be finite"
+                )
+            denom = v + eps
+            if not math.isfinite(denom):
+                raise ValueError(
+                    "layer_norm_batch intermediate must be finite"
+                )
+            s = 1.0 / math.sqrt(denom)
+            if not math.isfinite(s):
+                raise ValueError(
+                    "layer_norm_batch intermediate must be finite"
+                )
+            saved_s.append(s)
+            for c in range(C):
+                h_c = centered[c] * s
+                if not math.isfinite(h_c):
+                    raise ValueError(
+                        "layer_norm_batch intermediate must be finite"
+                    )
+                saved_h.append(h_c)
+                scaled = h_c * w[c]
+                if not math.isfinite(scaled):
+                    raise ValueError(
+                        "layer_norm_batch intermediate must be finite"
+                    )
+                y_c = scaled + b[c]
+                if not math.isfinite(y_c):
+                    raise ValueError(
+                        "layer_norm_batch intermediate must be finite"
+                    )
+                out_data.append(y_c)
+        if not (
+            self.requires_grad
+            or weight.requires_grad
+            or bias.requires_grad
+        ):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_weight, parent_bias = self, weight, bias
+        # Save w, the per-row scales and the normalized values with the
+        # graph so a pending backward pass is independent of any subsequent
+        # data mutation.
+        saved_w = w
+
+        def backward_fn(grad):
+            # Per row: u_c = g_c*w_c, U = sum(u), H = sum(u_c*h_c), then
+            # dx_c = s*(C*u_c - U - h_c*H)/C. dw_c accumulates g_c*h_c and
+            # db_c accumulates g_c across rows, each from 0.0 in ascending
+            # (row, column) order. Only the roles that require grad are
+            # computed and submitted, and a single Tensor playing several
+            # roles receives one elementwise merged contribution. Any
+            # non-finite intermediate aborts the whole pass before a grad
+            # is written.
+            role_contribs = []
+            if parent_self.requires_grad:
+                dx = [0.0] * (R * C)
+                for r in range(R):
+                    u = []
+                    U = 0.0
+                    for c in range(C):
+                        u_c = grad[r * C + c] * saved_w[c]
+                        if not math.isfinite(u_c):
+                            raise ValueError(
+                                "layer_norm_batch backward intermediate"
+                                " must be finite"
+                            )
+                        u.append(u_c)
+                        U += u_c
+                        if not math.isfinite(U):
+                            raise ValueError(
+                                "layer_norm_batch backward intermediate"
+                                " must be finite"
+                            )
+                    H = 0.0
+                    for c in range(C):
+                        product = u[c] * saved_h[r * C + c]
+                        if not math.isfinite(product):
+                            raise ValueError(
+                                "layer_norm_batch backward intermediate"
+                                " must be finite"
+                            )
+                        H += product
+                        if not math.isfinite(H):
+                            raise ValueError(
+                                "layer_norm_batch backward intermediate"
+                                " must be finite"
+                            )
+                    s_r = saved_s[r]
+                    for c in range(C):
+                        scaled = C * u[c]
+                        if not math.isfinite(scaled):
+                            raise ValueError(
+                                "layer_norm_batch backward intermediate"
+                                " must be finite"
+                            )
+                        shifted = scaled - U
+                        if not math.isfinite(shifted):
+                            raise ValueError(
+                                "layer_norm_batch backward intermediate"
+                                " must be finite"
+                            )
+                        correction = saved_h[r * C + c] * H
+                        if not math.isfinite(correction):
+                            raise ValueError(
+                                "layer_norm_batch backward intermediate"
+                                " must be finite"
+                            )
+                        bracket = shifted - correction
+                        if not math.isfinite(bracket):
+                            raise ValueError(
+                                "layer_norm_batch backward intermediate"
+                                " must be finite"
+                            )
+                        row_scaled = bracket * s_r
+                        if not math.isfinite(row_scaled):
+                            raise ValueError(
+                                "layer_norm_batch backward intermediate"
+                                " must be finite"
+                            )
+                        dx_c = row_scaled / C
+                        if not math.isfinite(dx_c):
+                            raise ValueError(
+                                "layer_norm_batch backward intermediate"
+                                " must be finite"
+                            )
+                        dx[r * C + c] = dx_c
+                role_contribs.append((parent_self, dx))
+            if parent_weight.requires_grad:
+                dw = [0.0] * C
+                for r in range(R):
+                    for c in range(C):
+                        term = grad[r * C + c] * saved_h[r * C + c]
+                        if not math.isfinite(term):
+                            raise ValueError(
+                                "layer_norm_batch backward intermediate"
+                                " must be finite"
+                            )
+                        dw[c] += term
+                        if not math.isfinite(dw[c]):
+                            raise ValueError(
+                                "layer_norm_batch backward intermediate"
+                                " must be finite"
+                            )
+                role_contribs.append((parent_weight, dw))
+            if parent_bias.requires_grad:
+                db = [0.0] * C
+                for r in range(R):
+                    for c in range(C):
+                        db[c] += grad[r * C + c]
+                        if not math.isfinite(db[c]):
+                            raise ValueError(
+                                "layer_norm_batch backward intermediate"
+                                " must be finite"
+                            )
+                role_contribs.append((parent_bias, db))
+            # Merge roles that the same Tensor object plays, element by
+            # element in index order; a non-finite partial sum aborts.
+            merged = {}
+            order = []
+            for parent, contribution in role_contribs:
+                key = id(parent)
+                if key not in merged:
+                    merged[key] = list(contribution)
+                    order.append(parent)
+                    continue
+                current = merged[key]
+                for i in range(len(contribution)):
+                    current[i] += contribution[i]
+                    if not math.isfinite(current[i]):
+                        raise ValueError(
+                            "layer_norm_batch backward intermediate must"
+                            " be finite"
+                        )
+            return [(parent, merged[id(parent)]) for parent in order]
+
+        return Tensor._make(
+            out_data,
+            True,
+            (parent_self, parent_weight, parent_bias),
+            backward_fn,
+        )
+
     def norm(self, p=2.0):
         data = _require_nonempty_float_vector(self, "norm")
         if isinstance(p, bool) or not isinstance(p, float):
