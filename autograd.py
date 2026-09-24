@@ -4641,21 +4641,28 @@ class Tensor:
         )
 
     def conv1d_batch(self, kernel, batch, channels, filters, length, size,
-                     stride=1, padding=0, dilation=1):
+                     stride=1, padding=0, dilation=1, groups=1, bias=None):
         if not isinstance(kernel, Tensor):
             raise TypeError("kernel must be a Tensor")
-        # Both operands must hold non-empty 1D finite float lists; data may
+        if bias is not None and not isinstance(bias, Tensor):
+            raise TypeError("bias must be a Tensor or None")
+        # The operands must hold non-empty 1D finite float lists; data may
         # have been mutated after construction, so re-validate at call time.
         x_data = _require_nonempty_float_vector(self, "conv1d_batch")
         w_data = _require_nonempty_float_vector(kernel, "conv1d_batch")
-        # batch, channels, filters, length, size, stride and dilation must
-        # be non-bool positive ints, and padding a non-bool non-negative int.
+        b_data = None
+        if bias is not None:
+            b_data = _require_nonempty_float_vector(bias, "conv1d_batch")
+        # batch, channels, filters, length, size, groups, stride and
+        # dilation must be non-bool positive ints, and padding a non-bool
+        # non-negative int.
         for name, value in (
             ("batch", batch),
             ("channels", channels),
             ("filters", filters),
             ("length", length),
             ("size", size),
+            ("groups", groups),
             ("stride", stride),
             ("dilation", dilation),
         ):
@@ -4667,53 +4674,81 @@ class Tensor:
             raise TypeError("padding must be a non-negative int")
         if padding < 0:
             raise ValueError("padding must be a non-negative int")
-        B, C, O, N, K, S, P, D = (
-            batch, channels, filters, length, size, stride, padding,
-            dilation,
+        B, C, O, N, K, G, S, P, D = (
+            batch, channels, filters, length, size, groups, stride,
+            padding, dilation,
         )
+        # Groups partition the channels and filters into G disjoint blocks;
+        # both counts must divide evenly for the split to be well defined.
+        if C % G != 0 or O % G != 0:
+            raise ValueError(
+                "groups must evenly divide channels and filters"
+            )
+        CPG = C // G
+        FPG = O // G
         # self stores B sequences of C channels of N samples and kernel O
-        # filters of C channels of K weights, all in row-major order.
+        # filters of C/G channels of K weights, all in row-major order.
         if len(x_data) != B * C * N:
             raise ValueError(
                 "conv1d_batch input length must equal "
                 "batch * channels * length"
             )
-        if len(w_data) != O * C * K:
+        kernel_len = O * CPG * K
+        if len(w_data) != kernel_len:
+            if G == 1:
+                raise ValueError(
+                    "conv1d_batch kernel length must equal "
+                    "filters * channels * size"
+                )
             raise ValueError(
                 "conv1d_batch kernel length must equal "
-                "filters * channels * size"
+                "filters * (channels // groups) * size"
+            )
+        # The bias holds one trainable offset per output filter.
+        if b_data is not None and len(b_data) != O:
+            raise ValueError(
+                "conv1d_batch bias length must equal filters"
             )
         # Dilation spaces the kernel taps by D, so the effective receptive
         # field spans E = D*(K-1)+1 positions.
         L = (N + 2 * P - D * (K - 1) - 1) // S + 1
         if L <= 0:
             raise ValueError("conv1d_batch output length must be positive")
-        # Snapshot both operands at call time so later caller-side mutation
-        # or replacement of either input can change neither the forward
-        # result nor a pending backward pass.
+        # Snapshot all operands at call time so later caller-side mutation
+        # or replacement of any input can change neither the forward result
+        # nor a pending backward pass.
         snapshot_x = list(x_data)
         snapshot_w = list(w_data)
-        # Batched multi-channel 1D cross-correlation: the kernel is never
-        # flipped. The output is B x O x L in row-major order; in ascending
-        # (b, o, t, c, r) order each output starts at 0.0 and accumulates
-        # y[(b*O+o)*L+t] += x[(b*C+c)*N+j] * w[(o*C+c)*K+r],
+        snapshot_b = list(b_data) if b_data is not None else None
+        # Batched grouped multi-channel 1D cross-correlation: the kernel is
+        # never flipped. Filter o belongs to group g = o // (O/G) and reads
+        # only input channels c0 .. c0+C/G-1, where c0 = g*(C/G). The
+        # output is B x O x L in row-major order; in ascending
+        # (b, o, t, cl, r) order (cl the in-group channel, c = c0+cl) each
+        # output starts at bias[o] (0.0 without a bias) and accumulates
+        # y[(b*O+o)*L+t] += x[(b*C+c)*N+j] * w[(o*(C/G)+cl)*K+r],
         # with j = t*S+r*D-P; out-of-range input positions from padding
-        # are skipped. A non-finite product or partial sum aborts before a
-        # result tensor exists, so no state can change.
+        # are skipped. With G=1 this reduces to dense (b, o, t, c, r)
+        # order. A non-finite product or partial sum aborts before a result
+        # tensor exists, so no state can change.
         out_len = B * O * L
         out_data = [0.0] * out_len
         for b in range(B):
             for o in range(O):
+                g = o // FPG
+                c0 = g * CPG
+                bias_o = snapshot_b[o] if snapshot_b is not None else 0.0
                 for t in range(L):
                     oi = (b * O + o) * L + t
-                    acc = 0.0
-                    for c in range(C):
+                    acc = bias_o
+                    for cl in range(CPG):
+                        c = c0 + cl
                         for r in range(K):
                             j = t * S + r * D - P
                             if not 0 <= j < N:
                                 continue
                             xi = (b * C + c) * N + j
-                            wi = (o * C + c) * K + r
+                            wi = (o * CPG + cl) * K + r
                             product = snapshot_x[xi] * snapshot_w[wi]
                             if not math.isfinite(product):
                                 raise ValueError(
@@ -4726,33 +4761,49 @@ class Tensor:
                                 )
                     out_data[oi] = acc
         needs_grad = self.requires_grad or kernel.requires_grad
+        if bias is not None and bias.requires_grad:
+            needs_grad = True
         if not needs_grad:
             return Tensor._make(
                 out_data, False, (), None,
                 grad_validator=lambda g: _validate_vector_grad(g, out_len),
             )
         parent_self, parent_kernel = self, kernel
+        parent_bias = bias
 
         def backward_fn(grad):
             # dx[xi] += g*w[wi] and dw[wi] += g*x[xi], accumulated from
-            # 0.0 in the same ascending (b, o, t, c, r) order, indexing and
-            # the same dilated j computation and out-of-range skip as the
-            # forward pass; dw has no batch index, so its contributions
-            # reduce across all B images. A non-finite product or partial
-            # sum aborts the whole pass before any grad is written.
+            # 0.0 in the same ascending (b, o, t, cl, r) order, indexing
+            # and group-channel mapping as the forward pass, with the same
+            # dilated j computation and out-of-range skip; dw has no batch
+            # index, so its contributions reduce across all B images.
+            # db[o] += g reduces in ascending (b, t) order per filter. A
+            # non-finite product or partial sum aborts the whole pass
+            # before any grad is written.
             dx = [0.0] * (B * C * N)
-            dw = [0.0] * (O * C * K)
+            dw = [0.0] * (O * CPG * K)
+            db = [0.0] * O if snapshot_b is not None else None
             for b in range(B):
                 for o in range(O):
+                    g = o // FPG
+                    c0 = g * CPG
                     for t in range(L):
                         gv = grad[(b * O + o) * L + t]
-                        for c in range(C):
+                        if db is not None:
+                            db[o] = db[o] + gv
+                            if not math.isfinite(db[o]):
+                                raise ValueError(
+                                    "conv1d_batch backward "
+                                    "intermediate must be finite"
+                                )
+                        for cl in range(CPG):
+                            c = c0 + cl
                             for r in range(K):
                                 j = t * S + r * D - P
                                 if not 0 <= j < N:
                                     continue
                                 xi = (b * C + c) * N + j
-                                wi = (o * C + c) * K + r
+                                wi = (o * CPG + cl) * K + r
                                 contrib_x = gv * snapshot_w[wi]
                                 if not math.isfinite(contrib_x):
                                     raise ValueError(
@@ -4781,10 +4832,13 @@ class Tensor:
             # one contribution per tensor, and submit only parents that
             # require grad.
             merged = {}
-            for parent, value in (
+            roles = [
                 (parent_self, dx),
                 (parent_kernel, dw),
-            ):
+            ]
+            if parent_bias is not None:
+                roles.append((parent_bias, db))
+            for parent, value in roles:
                 if not parent.requires_grad:
                     continue
                 entry = merged.get(id(parent))
@@ -4796,8 +4850,11 @@ class Tensor:
                     entry[1] = combined
             return [(entry[0], entry[1]) for entry in merged.values()]
 
+        parents = (parent_self, parent_kernel)
+        if parent_bias is not None:
+            parents = parents + (parent_bias,)
         return Tensor._make(
-            out_data, True, (parent_self, parent_kernel), backward_fn,
+            out_data, True, parents, backward_fn,
             grad_validator=lambda g: _validate_vector_grad(g, out_len),
         )
 
