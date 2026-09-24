@@ -4211,13 +4211,19 @@ class Tensor:
         )
 
     def conv1d_multi(self, kernel, channels, filters, length, size,
-                     stride=1, padding=0, dilation=1):
+                     stride=1, padding=0, dilation=1, bias=None,
+                     padding_mode="zeros"):
         if not isinstance(kernel, Tensor):
             raise TypeError("kernel must be a Tensor")
-        # Both operands must hold non-empty 1D finite float lists; data may
+        if bias is not None and not isinstance(bias, Tensor):
+            raise TypeError("bias must be a Tensor or None")
+        # The operands must hold non-empty 1D finite float lists; data may
         # have been mutated after construction, so re-validate at call time.
         x_data = _require_nonempty_float_vector(self, "conv1d_multi")
         w_data = _require_nonempty_float_vector(kernel, "conv1d_multi")
+        b_data = None
+        if bias is not None:
+            b_data = _require_nonempty_float_vector(bias, "conv1d_multi")
         # channels, filters, length, size, stride and dilation must be
         # non-bool positive ints, and padding a non-bool non-negative int.
         for name, value in (
@@ -4236,6 +4242,12 @@ class Tensor:
             raise TypeError("padding must be a non-negative int")
         if padding < 0:
             raise ValueError("padding must be a non-negative int")
+        if not isinstance(padding_mode, str):
+            raise TypeError("padding_mode must be a str")
+        if padding_mode not in ("zeros", "reflect"):
+            raise ValueError(
+                "padding_mode must be 'zeros' or 'reflect'"
+            )
         C, O, N, K, S, P, D = (
             channels, filters, length, size, stride, padding, dilation
         )
@@ -4250,34 +4262,58 @@ class Tensor:
                 "conv1d_multi kernel length must equal "
                 "filters * channels * size"
             )
+        # The bias holds one trainable offset per output filter.
+        if b_data is not None and len(b_data) != O:
+            raise ValueError(
+                "conv1d_multi bias length must equal filters"
+            )
+        # Reflection padding folds back onto the signal at both edges, which
+        # is only defined for a signal of at least two positions and a pad
+        # width strictly smaller than that signal.
+        if padding_mode == "reflect" and (N <= 1 or P >= N):
+            raise ValueError(
+                "conv1d_multi reflect padding requires length > 1 and "
+                "padding < length"
+            )
         # Dilation spaces the kernel taps by D, so the effective receptive
         # field spans E = D*(K-1)+1 positions; with D=1 this is simply K.
         E = D * (K - 1) + 1
         out_len = (N + 2 * P - E) // S + 1
         if out_len <= 0:
             raise ValueError("conv1d_multi output length must be positive")
-        # Snapshot both operands at call time so later caller-side mutation
-        # or replacement of either input can change neither the forward
-        # result nor a pending backward pass.
+        # Snapshot all operands at call time so later caller-side mutation
+        # or replacement of any input can change neither the forward result
+        # nor a pending backward pass.
         snapshot_x = list(x_data)
         snapshot_w = list(w_data)
+        snapshot_b = list(b_data) if b_data is not None else None
         # Batched multi-channel 1D cross-correlation: the kernel is never
         # flipped. In ascending (o, t, c, r) order, each output starts at
-        # 0.0 and accumulates
+        # bias[o] (0.0 without a bias) and accumulates
         # y[o*L+t] += x[c*N+j] * w[(o*C+c)*K+r],
-        # with j = t*S+r*D-P; out-of-range input positions from padding or
-        # the dilation gaps are skipped. A non-finite product or partial sum
+        # with j = t*S+r*D-P. With zero padding, out-of-range input
+        # positions from padding or the dilation gaps are skipped. With
+        # reflection padding j is folded back into range first: j<0 maps
+        # to -j, j>=N to 2*N-2-j. A non-finite product or partial sum
         # aborts before a result tensor exists, so no state can change.
         total_out = O * out_len
         out_data = [0.0] * total_out
         for o in range(O):
+            bias_o = snapshot_b[o] if snapshot_b is not None else 0.0
             for t in range(out_len):
                 oi = o * out_len + t
+                out_data[oi] = bias_o
                 for c in range(C):
                     for r in range(K):
                         j = t * S + r * D - P
-                        if not 0 <= j < N:
-                            continue
+                        if padding_mode == "zeros":
+                            if not 0 <= j < N:
+                                continue
+                        else:
+                            if j < 0:
+                                j = -j
+                            if j >= N:
+                                j = 2 * N - 2 - j
                         xi = c * N + j
                         wi = (o * C + c) * K + r
                         product = snapshot_x[xi] * snapshot_w[wi]
@@ -4290,26 +4326,47 @@ class Tensor:
                             raise ValueError(
                                 "conv1d_multi intermediate must be finite"
                             )
-        if not (self.requires_grad or kernel.requires_grad):
+        needs_grad = self.requires_grad or kernel.requires_grad
+        if bias is not None and bias.requires_grad:
+            needs_grad = True
+        if not needs_grad:
             return Tensor._make(out_data, False, (), None)
         parent_self, parent_kernel = self, kernel
+        parent_bias = bias
 
         def backward_fn(grad):
             # dx[xi] += g*w[wi] and dw[wi] += g*x[xi], accumulated from
             # 0.0 in the same ascending (o, t, c, r) order as the forward
-            # pass, using the same dilated j indexing and skipping
-            # out-of-range positions. A non-finite product or partial sum
-            # aborts the whole pass before any grad is written.
+            # pass, using the same dilated j indexing, zero-padding skip
+            # and reflection fold (several padded positions may fold onto
+            # one xi and so merge into the same dx entry); db[o] += g is
+            # accumulated from 0.0 in ascending t order per filter. A
+            # non-finite product or partial sum aborts the whole pass
+            # before any grad is written.
             dx = [0.0] * (C * N)
             dw = [0.0] * (O * C * K)
+            db = [0.0] * O if snapshot_b is not None else None
             for o in range(O):
                 for t in range(out_len):
                     g = grad[o * out_len + t]
+                    if db is not None:
+                        db[o] = db[o] + g
+                        if not math.isfinite(db[o]):
+                            raise ValueError(
+                                "conv1d_multi backward "
+                                "intermediate must be finite"
+                            )
                     for c in range(C):
                         for r in range(K):
                             j = t * S + r * D - P
-                            if not 0 <= j < N:
-                                continue
+                            if padding_mode == "zeros":
+                                if not 0 <= j < N:
+                                    continue
+                            else:
+                                if j < 0:
+                                    j = -j
+                                if j >= N:
+                                    j = 2 * N - 2 - j
                             xi = c * N + j
                             wi = (o * C + c) * K + r
                             contrib_x = g * snapshot_w[wi]
@@ -4336,14 +4393,16 @@ class Tensor:
                                     "conv1d_multi backward "
                                     "intermediate must be finite"
                                 )
-            # The same object may play both roles; merge such roles into
-            # one contribution per tensor, and submit only parents that
-            # require grad.
+            # The same object may play several roles (e.g. the bias is
+            # also the input); merge such roles into one contribution per
+            # tensor, and submit only parents that require grad.
             merged = {}
-            roles = (
+            roles = [
                 (parent_self, dx),
                 (parent_kernel, dw),
-            )
+            ]
+            if parent_bias is not None:
+                roles.append((parent_bias, db))
             for parent, value in roles:
                 if not parent.requires_grad:
                     continue
@@ -4356,9 +4415,10 @@ class Tensor:
                     entry[1] = combined
             return [(entry[0], entry[1]) for entry in merged.values()]
 
-        return Tensor._make(
-            out_data, True, (parent_self, parent_kernel), backward_fn
-        )
+        parents = (parent_self, parent_kernel)
+        if parent_bias is not None:
+            parents = parents + (parent_bias,)
+        return Tensor._make(out_data, True, parents, backward_fn)
 
     def conv_transpose1d(self, kernel, stride=1, padding=0, dilation=1):
         if not isinstance(kernel, Tensor):
