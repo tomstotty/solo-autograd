@@ -3091,6 +3091,112 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def gelu(self):
+        # Re-validate at call time since the data may have been mutated
+        # after construction: a finite float scalar or a non-empty 1D
+        # float list. bools, ints, nested lists and other types are a
+        # TypeError; an empty list or any non-finite value is a ValueError.
+        data = _validate_data(self.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+
+        def forward_value(x):
+            # Exact GELU: z = x/sqrt(2.0), e = erf(z), a = 1.0 + e,
+            # y = 0.5*x*a. Every intermediate is checked as it is
+            # produced; an overflow or non-finite value aborts before a
+            # result tensor exists, so no state can change on failure.
+            z = x / math.sqrt(2.0)
+            if not math.isfinite(z):
+                raise ValueError("gelu intermediate must be finite")
+            e = math.erf(z)
+            if not math.isfinite(e):
+                raise ValueError("gelu intermediate must be finite")
+            a = 1.0 + e
+            if not math.isfinite(a):
+                raise ValueError("gelu intermediate must be finite")
+            half_x = 0.5 * x
+            if not math.isfinite(half_x):
+                raise ValueError("gelu intermediate must be finite")
+            y = half_x * a
+            if not math.isfinite(y):
+                raise ValueError("gelu intermediate must be finite")
+            return y, a
+
+        # Elementwise evaluation in ascending index order.
+        if isinstance(data, list):
+            out_data = []
+            snapshot_a = []
+            for x in data:
+                y, a = forward_value(x)
+                out_data.append(y)
+                snapshot_a.append(a)
+        else:
+            out_data, snapshot_a = forward_value(data)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # Snapshot the input and the forward a = 1.0 + erf(x/sqrt(2.0))
+        # so later caller-side mutation or replacement of the input
+        # cannot change a pending backward pass.
+        snapshot_x = list(data) if isinstance(data, list) else data
+        a_values = (
+            list(snapshot_a) if isinstance(snapshot_a, list) else snapshot_a
+        )
+
+        def backward_value(g, x, a):
+            # d/dx GELU(x) = 0.5*a + x*exp(-0.5*x*x)/sqrt(2.0*pi) with
+            # q = x*x, r = exp(-0.5*q), d = 0.5*a + x*r/sqrt(2.0*pi) and
+            # dx = g*d. Each intermediate is checked as it is produced,
+            # and the generic engine validates the contribution itself
+            # and every merge into an existing grad.
+            q = x * x
+            if not math.isfinite(q):
+                raise ValueError(
+                    "gelu backward intermediate must be finite"
+                )
+            r = _finite_exp(
+                -0.5 * q, "gelu backward intermediate must be finite"
+            )
+            product = x * r
+            if not math.isfinite(product):
+                raise ValueError(
+                    "gelu backward intermediate must be finite"
+                )
+            scaled = product / math.sqrt(2.0 * math.pi)
+            if not math.isfinite(scaled):
+                raise ValueError(
+                    "gelu backward intermediate must be finite"
+                )
+            half_a = 0.5 * a
+            if not math.isfinite(half_a):
+                raise ValueError(
+                    "gelu backward intermediate must be finite"
+                )
+            d = half_a + scaled
+            if not math.isfinite(d):
+                raise ValueError(
+                    "gelu backward intermediate must be finite"
+                )
+            dx = g * d
+            if not math.isfinite(dx):
+                raise ValueError(
+                    "gelu backward intermediate must be finite"
+                )
+            return dx
+
+        def backward_fn(grad):
+            # Elementwise dx = grad*d in ascending index order.
+            if isinstance(grad, list):
+                contribution = [
+                    backward_value(grad[i], snapshot_x[i], a_values[i])
+                    for i in range(len(snapshot_x))
+                ]
+            else:
+                contribution = backward_value(grad, snapshot_x, a_values)
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def exp(self):
         # Re-validate at call time since the data may have been mutated
         # after construction: a finite float scalar or a non-empty 1D
