@@ -7035,6 +7035,94 @@ class Tensor:
             grad_validator=lambda g: _validate_vector_grad(g, OH * OW),
         )
 
+    def affine_grid2d(self, rows, cols):
+        # rows and cols must be non-bool positive ints.
+        for name, value in (("rows", rows), ("cols", cols)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(name + " must be a positive int")
+            if value <= 0:
+                raise ValueError(name + " must be a positive int")
+        # self stores the six affine entries
+        # [a00, a01, a02, a10, a11, a12]. Data may have been mutated
+        # after construction, so re-validate at call time.
+        theta = self.data
+        if not isinstance(theta, list) or len(theta) != 6:
+            raise ValueError(
+                "affine_grid2d requires a 6-element 1D float list"
+            )
+        for value in theta:
+            if isinstance(value, bool) or not isinstance(value, float):
+                raise TypeError("affine_grid2d data elements must be floats")
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        for value in theta:
+            if not math.isfinite(value):
+                raise ValueError("affine_grid2d data elements must be finite")
+        # Snapshot the six coefficients at call time so later caller-side
+        # mutation or replacement of self.data can change neither the
+        # forward result nor a pending backward pass.
+        snapshot = list(theta)
+        a00, a01, a02, a10, a11, a12 = snapshot
+        # Coordinates run in ascending (r, c) order; a singleton axis
+        # collapses to 0.0. Integer true division keeps the ratios finite
+        # even for huge int arguments. Each (gx, gy) pair is appended
+        # interleaved; a non-finite result aborts before a tensor exists.
+        coords = []
+        out_data = []
+        for r in range(rows):
+            y = 0.0 if rows == 1 else (2 * r) / (rows - 1) - 1.0
+            for c in range(cols):
+                x = 0.0 if cols == 1 else (2 * c) / (cols - 1) - 1.0
+                gx = a00 * x + a01 * y + a02
+                gy = a10 * x + a11 * y + a12
+                if not (math.isfinite(gx) and math.isfinite(gy)):
+                    raise ValueError("affine_grid2d result must be finite")
+                coords.append((x, y))
+                out_data.extend((gx, gy))
+        if not self.requires_grad:
+            return Tensor._make(
+                out_data, False, (), None,
+                grad_validator=lambda g: _validate_vector_grad(
+                    g, 2 * rows * cols
+                ),
+            )
+        parent_self = self
+
+        def backward_fn(grad):
+            # With gx = a00*x + a01*y + a02 and
+            # gy = a10*x + a11*y + a12, upstream pair (u, v) at point p
+            # contributes (u*x, u*y, u, v*x, v*y, v) to the six
+            # coefficients. Every term is accumulated from 0.0 in the
+            # same ascending (r, c) order as the forward pass; a
+            # non-finite product or partial sum aborts before any grad
+            # is written.
+            dtheta = [0.0] * 6
+            for p in range(rows * cols):
+                u = grad[2 * p]
+                v = grad[2 * p + 1]
+                x, y = coords[p]
+                contributions = (u * x, u * y, u, v * x, v * y, v)
+                for k, term in enumerate(contributions):
+                    if not math.isfinite(term):
+                        raise ValueError(
+                            "affine_grid2d backward intermediate must be"
+                            " finite"
+                        )
+                    dtheta[k] += term
+                    if not math.isfinite(dtheta[k]):
+                        raise ValueError(
+                            "affine_grid2d backward intermediate must be"
+                            " finite"
+                        )
+            return [(parent_self, dtheta)]
+
+        return Tensor._make(
+            out_data, True, (parent_self,), backward_fn,
+            grad_validator=lambda g: _validate_vector_grad(
+                g, 2 * rows * cols
+            ),
+        )
+
     def dropout(self, p=0.5, seed=0):
         data = _require_nonempty_float_vector(self, "dropout")
         if isinstance(p, bool) or not isinstance(p, float):
