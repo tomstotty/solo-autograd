@@ -3091,6 +3091,99 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def gelu(self):
+        # Re-validate at call time since the data may have been mutated
+        # after construction: a finite float scalar or a non-empty 1D
+        # float list. bools, ints, nested lists and other types are a
+        # TypeError; an empty list or any non-finite value is a ValueError.
+        data = _validate_data(self.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        # Exact GELU: y = 0.5*x*(1.0 + erf(x/sqrt(2.0))). Elementwise in
+        # ascending index order; each intermediate is checked as it is
+        # produced, and an overflow or non-finite intermediate aborts
+        # before a result tensor exists, so no state can change on
+        # failure.
+        sqrt_two = math.sqrt(2.0)
+
+        def forward_value(x):
+            z = x / sqrt_two
+            if not math.isfinite(z):
+                raise ValueError("gelu intermediate must be finite")
+            e = math.erf(z)
+            if not math.isfinite(e):
+                raise ValueError("gelu intermediate must be finite")
+            a = 1.0 + e
+            if not math.isfinite(a):
+                raise ValueError("gelu intermediate must be finite")
+            y = 0.5 * x * a
+            if not math.isfinite(y):
+                raise ValueError("gelu intermediate must be finite")
+            return y, a
+
+        if isinstance(data, list):
+            out_data = []
+            snapshot_a = []
+            for x in data:
+                y, a = forward_value(x)
+                out_data.append(y)
+                snapshot_a.append(a)
+        else:
+            out_data, snapshot_a = forward_value(data)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # Snapshot the forward input and the erf term so later caller-side
+        # mutation or replacement of the input cannot change a pending
+        # backward pass.
+        snapshot_x = list(data) if isinstance(data, list) else data
+        a_values = snapshot_a
+        sqrt_two_pi = math.sqrt(2.0 * math.pi)
+
+        def backward_value(g, x, a):
+            # d/dx GELU = 0.5*a + x*exp(-0.5*x*x)/sqrt(2*pi); each
+            # intermediate is checked as it is produced, and the generic
+            # engine validates the contribution itself and every merge
+            # into an existing grad.
+            q = x * x
+            if not math.isfinite(q):
+                raise ValueError(
+                    "gelu backward intermediate must be finite"
+                )
+            r = _finite_exp(
+                -0.5 * q, "gelu backward intermediate must be finite"
+            )
+            xr = x * r
+            if not math.isfinite(xr):
+                raise ValueError(
+                    "gelu backward intermediate must be finite"
+                )
+            d = 0.5 * a + xr / sqrt_two_pi
+            if not math.isfinite(d):
+                raise ValueError(
+                    "gelu backward intermediate must be finite"
+                )
+            dx = g * d
+            if not math.isfinite(dx):
+                raise ValueError(
+                    "gelu backward intermediate must be finite"
+                )
+            return dx
+
+        def backward_fn(grad):
+            # Elementwise in ascending index order.
+            if isinstance(grad, list):
+                contribution = []
+                for i in range(len(snapshot_x)):
+                    contribution.append(
+                        backward_value(grad[i], snapshot_x[i], a_values[i])
+                    )
+            else:
+                contribution = backward_value(grad, snapshot_x, a_values)
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def exp(self):
         # Re-validate at call time since the data may have been mutated
         # after construction: a finite float scalar or a non-empty 1D
