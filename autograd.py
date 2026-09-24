@@ -667,6 +667,160 @@ class Tensor:
             out_data, True, (parent_self, parent_other), backward_fn
         )
 
+    def logaddexp(self, other):
+        # other is accepted as a Tensor or a finite float only; bools, ints
+        # and anything else are a TypeError, and a non-finite float is a
+        # ValueError.
+        other = self._coerce(other)
+        a = _validate_data(self.data)
+        b = _validate_data(other.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        if not isinstance(other.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        a_vector = isinstance(a, list)
+        b_vector = isinstance(b, list)
+        if a_vector and b_vector and len(a) != len(b):
+            raise ValueError("vector lengths must match")
+        # Evaluate log(exp(x) + exp(y)) stably one output index at a time in
+        # ascending order: m = max(x, y), e = 1.0 on an exact tie, otherwise
+        # e = exp(min(x, y) - m) (0.0 when that gap is -infinity), and the
+        # result is m + log1p(e). A non-finite intermediate aborts before a
+        # result tensor exists, leaving every input untouched on failure.
+        n_outputs = len(a) if a_vector else (len(b) if b_vector else 1)
+        out_values = []
+        wa_values = []
+        wb_values = []
+        for i in range(n_outputs):
+            x = a[i] if a_vector else a
+            y = b[i] if b_vector else b
+            m = x if x >= y else y
+            if not math.isfinite(m):
+                raise ValueError("logaddexp intermediate must be finite")
+            if x == y:
+                e = 1.0
+            else:
+                d = (x if x < y else y) - m
+                if d == float("-inf"):
+                    e = 0.0
+                elif math.isfinite(d):
+                    try:
+                        e = math.exp(d)
+                    except OverflowError:
+                        raise ValueError(
+                            "logaddexp intermediate must be finite"
+                        )
+                    if not math.isfinite(e):
+                        raise ValueError(
+                            "logaddexp intermediate must be finite"
+                        )
+                else:
+                    raise ValueError("logaddexp intermediate must be finite")
+            try:
+                log_term = math.log1p(e)
+            except (OverflowError, ValueError):
+                raise ValueError("logaddexp intermediate must be finite")
+            if not math.isfinite(log_term):
+                raise ValueError("logaddexp intermediate must be finite")
+            value = m + log_term
+            if not math.isfinite(value):
+                raise ValueError("logaddexp result must be finite")
+            out_values.append(value)
+            # Softmax weights of the two summands: the larger side gets
+            # 1/(1+e), the smaller side e/(1+e), and an exact tie splits
+            # 0.5/0.5.
+            if x == y:
+                wa = 0.5
+                wb = 0.5
+            else:
+                denominator = 1.0 + e
+                if not math.isfinite(denominator) or denominator == 0.0:
+                    raise ValueError(
+                        "logaddexp intermediate must be finite"
+                    )
+                large = 1.0 / denominator
+                small = e / denominator
+                if not math.isfinite(large) or not math.isfinite(small):
+                    raise ValueError(
+                        "logaddexp intermediate must be finite"
+                    )
+                if x > y:
+                    wa, wb = large, small
+                else:
+                    wa, wb = small, large
+            wa_values.append(wa)
+            wb_values.append(wb)
+        out_data = out_values if (a_vector or b_vector) else out_values[0]
+        if not (self.requires_grad or other.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_other = self, other
+        # Snapshot the per-index weights so later caller-side mutation or
+        # replacement of either input cannot change what a pending backward
+        # pass uses.
+
+        def backward_fn(grad):
+            grad_values = grad if isinstance(grad, list) else [grad]
+            da_values = [0.0] * n_outputs
+            db_values = [0.0] * n_outputs
+            for i in range(n_outputs):
+                g = grad_values[i]
+                da = g * wa_values[i]
+                if not math.isfinite(da):
+                    raise ValueError(
+                        "logaddexp backward intermediate must be finite"
+                    )
+                db = g * wb_values[i]
+                if not math.isfinite(db):
+                    raise ValueError(
+                        "logaddexp backward intermediate must be finite"
+                    )
+                da_values[i] = da
+                db_values[i] = db
+            roles = []
+            if parent_self.requires_grad:
+                if a_vector:
+                    roles.append((parent_self, da_values))
+                else:
+                    # A broadcast scalar parent reduces by accumulating
+                    # from 0.0 in ascending output-index order.
+                    total = 0.0
+                    for value in da_values:
+                        total += value
+                        if not math.isfinite(total):
+                            raise ValueError(
+                                "logaddexp backward intermediate must be finite"
+                            )
+                    roles.append((parent_self, total))
+            if parent_other.requires_grad:
+                if b_vector:
+                    roles.append((parent_other, db_values))
+                else:
+                    total = 0.0
+                    for value in db_values:
+                        total += value
+                        if not math.isfinite(total):
+                            raise ValueError(
+                                "logaddexp backward intermediate must be finite"
+                            )
+                    roles.append((parent_other, total))
+            # The same object may play both sides; merge such roles into one
+            # contribution per tensor, submitting only parents that require
+            # grad.
+            merged = {}
+            for parent, value in roles:
+                entry = merged.get(id(parent))
+                if entry is None:
+                    merged[id(parent)] = [parent, value]
+                else:
+                    combined = _merge_grad(entry[1], value)
+                    _ensure_finite_grad(combined)
+                    entry[1] = combined
+            return [(entry[0], entry[1]) for entry in merged.values()]
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_other), backward_fn
+        )
+
     def where(self, condition, other):
         # condition is a bool or a non-empty list of bools only; a bad
         # container or element type is a TypeError and an empty list is a
