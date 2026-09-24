@@ -1697,26 +1697,43 @@ class Tensor:
         a_data = _require_nonempty_float_vector(self, "bmm")
         b_data = _require_nonempty_float_vector(other, "bmm")
         B, R, I, C = batch, rows, inner, cols
-        # self stores B matrices of rows x inner and other B matrices of
-        # inner x cols, all in row-major order with batches stacked.
-        if len(a_data) != B * R * I:
-            raise ValueError("bmm left length must equal batch * rows * inner")
-        if len(b_data) != B * I * C:
+        # self stores either one rows x inner matrix shared by every batch
+        # or B stacked rows x inner matrices; other likewise holds either
+        # one inner x cols matrix or B of them, all row-major.
+        if len(a_data) not in (R * I, B * R * I):
             raise ValueError(
-                "bmm right length must equal batch * inner * cols"
+                "bmm left length must equal rows * inner or "
+                "batch * rows * inner"
             )
+        if len(b_data) not in (I * C, B * I * C):
+            raise ValueError(
+                "bmm right length must equal inner * cols or "
+                "batch * inner * cols"
+            )
+        # Batch offset of each operand: 0 for a shared (single-batch)
+        # matrix, q otherwise.
+        a_batched = len(a_data) == B * R * I
+        b_batched = len(b_data) == B * I * C
+
+        def a_batch_base(q):
+            return q * R * I if a_batched else 0
+
+        def b_batch_base(q):
+            return q * I * C if b_batched else 0
+
         # Snapshot both operands so later caller-side mutation of either
         # input list cannot change what a pending backward pass uses.
         snapshot_a = list(a_data)
         snapshot_b = list(b_data)
-        # out[q*R*C+r*C+c] = sum_k a[q*R*I+r*I+k] * b[q*I*C+k*C+c],
-        # accumulated from 0.0 in ascending (q, r, c, k) order; a non-finite
-        # product or partial sum aborts before a result tensor exists, so no
-        # state changes.
+        # out[q*R*C+r*C+c] = sum_k a[aq*R*I+r*I+k] * b[bq*I*C+k*C+c]
+        # with aq == 0 for a shared left matrix else q (and likewise for
+        # the right), accumulated from 0.0 in ascending (q, r, c, k)
+        # order; a non-finite product or partial sum aborts before a
+        # result tensor exists, so no state changes.
         out_data = []
         for q in range(B):
-            a_base = q * R * I
-            b_base = q * I * C
+            a_base = a_batch_base(q)
+            b_base = b_batch_base(q)
             for r in range(R):
                 for c in range(C):
                     acc = 0.0
@@ -1740,16 +1757,18 @@ class Tensor:
         parent_self, parent_other = self, other
 
         def backward_fn(grad):
-            # da[q*R*I+r*I+k] += g[q*R*C+r*C+c] * b[q*I*C+k*C+c] and
-            # db[q*I*C+k*C+c] += g[q*R*C+r*C+c] * a[q*R*I+r*I+k],
-            # accumulated from 0.0 in ascending (q, r, c, k) order. A
-            # non-finite product or partial sum aborts the whole pass before
-            # any grad is written.
-            da = [0.0] * (B * R * I)
-            db = [0.0] * (B * I * C)
+            # Accumulate per-batch contributions into B-sized buffers; a
+            # shared (single-batch) parent reduces across q back to its
+            # original shape. da[q*R*I+r*I+k] += g[q*R*C+r*C+c] *
+            # b[bq*I*C+k*C+c] and db[q*I*C+k*C+c] += g[q*R*C+r*C+c] *
+            # a[aq*R*I+r*I+k], accumulated from 0.0 in ascending
+            # (q, r, c, k) order. A non-finite product or partial sum
+            # aborts the whole pass before any grad is written.
+            da_full = [0.0] * (B * R * I)
+            db_full = [0.0] * (B * I * C)
             for q in range(B):
-                a_base = q * R * I
-                b_base = q * I * C
+                a_base = a_batch_base(q)
+                b_base = b_batch_base(q)
                 g_base = q * R * C
                 for r in range(R):
                     for c in range(C):
@@ -1760,10 +1779,12 @@ class Tensor:
                                 raise ValueError(
                                     "bmm backward intermediate must be finite"
                                 )
-                            da[a_base + r * I + k] = (
-                                da[a_base + r * I + k] + term_a
+                            da_full[a_base + r * I + k] = (
+                                da_full[a_base + r * I + k] + term_a
                             )
-                            if not math.isfinite(da[a_base + r * I + k]):
+                            if not math.isfinite(
+                                da_full[a_base + r * I + k]
+                            ):
                                 raise ValueError(
                                     "bmm backward intermediate must be finite"
                                 )
@@ -1772,13 +1793,34 @@ class Tensor:
                                 raise ValueError(
                                     "bmm backward intermediate must be finite"
                                 )
-                            db[b_base + k * C + c] = (
-                                db[b_base + k * C + c] + term_b
+                            db_full[b_base + k * C + c] = (
+                                db_full[b_base + k * C + c] + term_b
                             )
-                            if not math.isfinite(db[b_base + k * C + c]):
+                            if not math.isfinite(
+                                db_full[b_base + k * C + c]
+                            ):
                                 raise ValueError(
                                     "bmm backward intermediate must be finite"
                                 )
+
+            def reduce_to_parent(full, per_batch):
+                if per_batch:
+                    return full
+                reduced = [0.0] * (len(full) // B)
+                for q in range(B):
+                    base = q * len(reduced)
+                    for index in range(len(reduced)):
+                        reduced[index] = (
+                            reduced[index] + full[base + index]
+                        )
+                        if not math.isfinite(reduced[index]):
+                            raise ValueError(
+                                "bmm backward intermediate must be finite"
+                            )
+                return reduced
+
+            da = reduce_to_parent(da_full, a_batched)
+            db = reduce_to_parent(db_full, b_batched)
             # The same object may play both roles; merge such roles into
             # one contribution per tensor, and submit only parents that
             # require grad.
