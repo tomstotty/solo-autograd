@@ -6575,6 +6575,272 @@ class Tensor:
             out_data, True, (parent_self, parent_source), backward_fn
         )
 
+    def attention(self, key, value, q, k, d, mask=None):
+        if not isinstance(key, Tensor):
+            raise TypeError("key must be a Tensor")
+        if not isinstance(value, Tensor):
+            raise TypeError("value must be a Tensor")
+        # The three dimensions must be non-bool positive ints.
+        for name, dim in (("q", q), ("k", k), ("d", d)):
+            if isinstance(dim, bool) or not isinstance(dim, int):
+                raise TypeError(name + " must be a positive int")
+            if dim <= 0:
+                raise ValueError(name + " must be a positive int")
+        # All three operands must hold non-empty 1D finite float lists;
+        # data may have been mutated after construction, so re-validate at
+        # call time. self is the q x d queries, key the k x d keys and
+        # value the k x d values, all row-major.
+        q_data = _require_nonempty_float_vector(self, "attention")
+        k_data = _require_nonempty_float_vector(key, "attention")
+        v_data = _require_nonempty_float_vector(value, "attention")
+        if len(q_data) != q * d:
+            raise ValueError("query length must equal q * d")
+        if len(k_data) != k * d:
+            raise ValueError("key length must equal k * d")
+        if len(v_data) != k * d:
+            raise ValueError("value length must equal k * d")
+        # mask is either None (every position allowed) or a length q*k
+        # flat list of bools, one per query/key pair in row-major order;
+        # every query row must allow at least one position.
+        if mask is None:
+            mask_list = [True] * (q * k)
+        else:
+            if not isinstance(mask, list):
+                raise TypeError("mask must be a list of bools")
+            if len(mask) != q * k:
+                raise ValueError("mask length must equal q * k")
+            for flag in mask:
+                if not isinstance(flag, bool):
+                    raise TypeError("mask elements must be bools")
+            mask_list = list(mask)
+            for i in range(q):
+                base = i * k
+                if not any(mask_list[base:base + k]):
+                    raise ValueError("each mask row must contain a true value")
+        # Snapshot the inputs at call time so later caller-side mutation
+        # or replacement of any data list or the mask can change neither
+        # the forward result nor a pending backward pass.
+        snapshot_q = list(q_data)
+        snapshot_k = list(k_data)
+        snapshot_v = list(v_data)
+        snapshot_mask = mask_list
+        scale = math.sqrt(float(d))
+        if not math.isfinite(scale):
+            raise ValueError("attention intermediate must be finite")
+        # Scores: s[i,j] = (sum_r Q[i,r]*K[j,r]) / sqrt(d), accumulated
+        # from 0.0 in ascending (i, j, r) order. A non-finite product,
+        # partial sum or scaled score aborts before a result tensor
+        # exists, so no state can change on failure.
+        scores = [0.0] * (q * k)
+        for i in range(q):
+            for j in range(k):
+                acc = 0.0
+                for r in range(d):
+                    product = snapshot_q[i * d + r] * snapshot_k[j * d + r]
+                    if not math.isfinite(product):
+                        raise ValueError("attention intermediate must be finite")
+                    acc += product
+                    if not math.isfinite(acc):
+                        raise ValueError("attention intermediate must be finite")
+                score = acc / scale
+                if not math.isfinite(score):
+                    raise ValueError("attention intermediate must be finite")
+                scores[i * k + j] = score
+        # Per-row stable softmax over the allowed positions only, in
+        # ascending key order: m = row max of the allowed scores,
+        # z_j = exp(s_j - m), s = sum(z), p_j = z_j / s; masked
+        # positions stay 0.0. exp is only ever evaluated on values in
+        # (-inf, 0]; exp(s_j) directly is never computed.
+        probs = [0.0] * (q * k)
+        for i in range(q):
+            base = i * k
+            allowed = [j for j in range(k) if snapshot_mask[base + j]]
+            m = max(scores[base + j] for j in allowed)
+            z = [0.0] * k
+            row_sum = 0.0
+            for j in allowed:
+                diff = scores[base + j] - m
+                if not math.isfinite(diff):
+                    raise ValueError("attention intermediate must be finite")
+                z_j = math.exp(diff)
+                if not math.isfinite(z_j):
+                    raise ValueError("attention intermediate must be finite")
+                z[j] = z_j
+                row_sum += z_j
+                if not math.isfinite(row_sum):
+                    raise ValueError("attention intermediate must be finite")
+            for j in allowed:
+                p_j = z[j] / row_sum
+                if not math.isfinite(p_j):
+                    raise ValueError("attention intermediate must be finite")
+                probs[base + j] = p_j
+        # Output: y[i,r] = sum_j p[i,j] * V[j,r], accumulated from 0.0
+        # in ascending (i, r, j) order; masked positions contribute 0.
+        out_data = [0.0] * (q * d)
+        for i in range(q):
+            for r in range(d):
+                acc = 0.0
+                for j in range(k):
+                    if not snapshot_mask[i * k + j]:
+                        continue
+                    product = probs[i * k + j] * snapshot_v[j * d + r]
+                    if not math.isfinite(product):
+                        raise ValueError("attention intermediate must be finite")
+                    acc += product
+                    if not math.isfinite(acc):
+                        raise ValueError("attention intermediate must be finite")
+                out_data[i * d + r] = acc
+        if not (
+            self.requires_grad or key.requires_grad or value.requires_grad
+        ):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_key, parent_value = self, key, value
+        saved_mask = snapshot_mask
+        saved_p = list(probs)
+
+        def backward_fn(grad):
+            # H = G V^T, D[i,j] = p[i,j]*(H[i,j] - sum_j p[i,j]*H[i,j])
+            # over allowed positions, dQ = D K / sqrt(d),
+            # dK = D^T Q / sqrt(d), dV = P^T G; masked positions
+            # contribute 0.0. Every product and partial sum is checked
+            # as it is produced, and the generic engine validates each
+            # contribution and every merge into an existing grad.
+            h_mat = [0.0] * (q * k)
+            d_mat = [0.0] * (q * k)
+            dq = [0.0] * (q * d)
+            dk = [0.0] * (k * d)
+            dv = [0.0] * (k * d)
+            for i in range(q):
+                for j in range(k):
+                    acc = 0.0
+                    for r in range(d):
+                        product = grad[i * d + r] * snapshot_v[j * d + r]
+                        if not math.isfinite(product):
+                            raise ValueError(
+                                "attention backward intermediate must be finite"
+                            )
+                        acc += product
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "attention backward intermediate must be finite"
+                            )
+                    h_mat[i * k + j] = acc
+            for i in range(q):
+                base = i * k
+                allowed = [j for j in range(k) if saved_mask[base + j]]
+                row_sum = 0.0
+                for j in allowed:
+                    product = saved_p[base + j] * h_mat[base + j]
+                    if not math.isfinite(product):
+                        raise ValueError(
+                            "attention backward intermediate must be finite"
+                        )
+                    row_sum += product
+                    if not math.isfinite(row_sum):
+                        raise ValueError(
+                            "attention backward intermediate must be finite"
+                        )
+                for j in allowed:
+                    difference = h_mat[base + j] - row_sum
+                    if not math.isfinite(difference):
+                        raise ValueError(
+                            "attention backward intermediate must be finite"
+                        )
+                    d_ij = saved_p[base + j] * difference
+                    if not math.isfinite(d_ij):
+                        raise ValueError(
+                            "attention backward intermediate must be finite"
+                        )
+                    d_mat[base + j] = d_ij
+            for i in range(q):
+                for r in range(d):
+                    acc = 0.0
+                    for j in range(k):
+                        if not saved_mask[i * k + j]:
+                            continue
+                        product = d_mat[i * k + j] * snapshot_k[j * d + r]
+                        if not math.isfinite(product):
+                            raise ValueError(
+                                "attention backward intermediate must be finite"
+                            )
+                        acc += product
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "attention backward intermediate must be finite"
+                            )
+                    contribution = acc / scale
+                    if not math.isfinite(contribution):
+                        raise ValueError(
+                            "attention backward intermediate must be finite"
+                        )
+                    dq[i * d + r] = contribution
+            for j in range(k):
+                for r in range(d):
+                    acc = 0.0
+                    for i in range(q):
+                        if not saved_mask[i * k + j]:
+                            continue
+                        product = d_mat[i * k + j] * snapshot_q[i * d + r]
+                        if not math.isfinite(product):
+                            raise ValueError(
+                                "attention backward intermediate must be finite"
+                            )
+                        acc += product
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "attention backward intermediate must be finite"
+                            )
+                    contribution = acc / scale
+                    if not math.isfinite(contribution):
+                        raise ValueError(
+                            "attention backward intermediate must be finite"
+                        )
+                    dk[j * d + r] = contribution
+            for j in range(k):
+                for r in range(d):
+                    acc = 0.0
+                    for i in range(q):
+                        if not saved_mask[i * k + j]:
+                            continue
+                        product = saved_p[i * k + j] * grad[i * d + r]
+                        if not math.isfinite(product):
+                            raise ValueError(
+                                "attention backward intermediate must be finite"
+                            )
+                        acc += product
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "attention backward intermediate must be finite"
+                            )
+                    dv[j * d + r] = acc
+            # One object may play several roles (e.g. key and value are
+            # the same tensor); merge such roles into one contribution
+            # per tensor, and submit only parents that require grad.
+            merged = {}
+            roles = (
+                (parent_self, dq),
+                (parent_key, dk),
+                (parent_value, dv),
+            )
+            for parent, value in roles:
+                if not parent.requires_grad:
+                    continue
+                entry = merged.get(id(parent))
+                if entry is None:
+                    merged[id(parent)] = [parent, value]
+                else:
+                    combined = _merge_grad(entry[1], value)
+                    _ensure_finite_grad(combined)
+                    entry[1] = combined
+            return [(entry[0], entry[1]) for entry in merged.values()]
+
+        return Tensor._make(
+            out_data,
+            True,
+            (parent_self, parent_key, parent_value),
+            backward_fn,
+        )
+
     def zero_grad(self):
         self.grad = None
         return None
