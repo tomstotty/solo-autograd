@@ -805,6 +805,124 @@ class Tensor:
             out_data, True, (parent_self, parent_other), backward_fn
         )
 
+    def max(self):
+        # Differentiable global maximum reduction (unlike maximum(), which
+        # stays elementwise). Re-validate at call time since the data may
+        # have been mutated after construction: a finite float scalar or a
+        # non-empty 1D float list. bools, ints, nested lists and other
+        # types are a TypeError, as are non-float list elements and a
+        # non-bool requires_grad; an empty list or any non-finite value is
+        # a ValueError.
+        data = _validate_data(self.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        if isinstance(data, list):
+            # Compare in ascending index order; strict > keeps the first
+            # occurrence, which only matters for -0.0 vs 0.0 (exactly
+            # equal anyway). Inputs are already finite and comparison
+            # cannot produce a non-finite value, but the explicit check
+            # still aborts before a result tensor exists on failure.
+            extreme = data[0]
+            for value in data[1:]:
+                if value > extreme:
+                    extreme = value
+            out_data = extreme
+        else:
+            # A scalar's maximum is the scalar itself.
+            out_data = data
+        _ensure_finite_data(out_data)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # _validate_data already returns a fresh list for vector input,
+        # so `data` is a snapshot: later caller-side mutation or
+        # replacement of self.data changes neither which positions tie
+        # the extreme nor a pending backward pass.
+        snapshot = data
+
+        def backward_fn(grad):
+            # Scalar input: the contribution is g itself. Vector input:
+            # every position exactly equal to the snapshotted extreme,
+            # located in ascending index order, splits g evenly; the
+            # count c is at least one since the extreme came from the
+            # snapshot itself. The division, each contribution and the
+            # engine's merge into an existing grad must stay finite; a
+            # failure aborts the whole pass before any grad is written.
+            if not isinstance(snapshot, list):
+                return [(parent, grad)]
+            winners = [i for i, value in enumerate(snapshot) if value == out_data]
+            count = len(winners)
+            share = grad / count
+            if not math.isfinite(share):
+                raise ValueError(
+                    "max backward intermediate must be finite"
+                )
+            contribution = [0.0] * len(snapshot)
+            for i in winners:
+                contribution[i] = share
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
+    def min(self):
+        # Differentiable global minimum reduction (unlike minimum(), which
+        # stays elementwise). Re-validate at call time since the data may
+        # have been mutated after construction: a finite float scalar or a
+        # non-empty 1D float list. bools, ints, nested lists and other
+        # types are a TypeError, as are non-float list elements and a
+        # non-bool requires_grad; an empty list or any non-finite value is
+        # a ValueError.
+        data = _validate_data(self.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        if isinstance(data, list):
+            # Compare in ascending index order; strict < keeps the first
+            # occurrence, which only matters for -0.0 vs 0.0 (exactly
+            # equal anyway). Inputs are already finite and comparison
+            # cannot produce a non-finite value, but the explicit check
+            # still aborts before a result tensor exists on failure.
+            extreme = data[0]
+            for value in data[1:]:
+                if value < extreme:
+                    extreme = value
+            out_data = extreme
+        else:
+            # A scalar's minimum is the scalar itself.
+            out_data = data
+        _ensure_finite_data(out_data)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # _validate_data already returns a fresh list for vector input,
+        # so `data` is a snapshot: later caller-side mutation or
+        # replacement of self.data changes neither which positions tie
+        # the extreme nor a pending backward pass.
+        snapshot = data
+
+        def backward_fn(grad):
+            # Scalar input: the contribution is g itself. Vector input:
+            # every position exactly equal to the snapshotted extreme,
+            # located in ascending index order, splits g evenly; the
+            # count c is at least one since the extreme came from the
+            # snapshot itself. The division, each contribution and the
+            # engine's merge into an existing grad must stay finite; a
+            # failure aborts the whole pass before any grad is written.
+            if not isinstance(snapshot, list):
+                return [(parent, grad)]
+            winners = [i for i, value in enumerate(snapshot) if value == out_data]
+            count = len(winners)
+            share = grad / count
+            if not math.isfinite(share):
+                raise ValueError(
+                    "min backward intermediate must be finite"
+                )
+            contribution = [0.0] * len(snapshot)
+            for i in winners:
+                contribution[i] = share
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def logaddexp(self, other):
         # other is accepted as a Tensor or a finite float only; bools, ints
         # and anything else are a TypeError, and a non-finite float is a
