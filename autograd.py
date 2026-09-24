@@ -3391,6 +3391,101 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def logcumsumexp(self):
+        # Re-validate at call time since the data may have been mutated
+        # after construction: a non-empty 1D float list. Non-list input
+        # (including scalar floats, bools, ints, tuples, nested values)
+        # and empty lists are a ValueError; non-float elements and a
+        # non-bool requires_grad flag are a TypeError; non-finite values
+        # are a ValueError.
+        data = _require_nonempty_float_vector(self, "logcumsumexp")
+        # Snapshot the input at call time so later caller-side mutation or
+        # replacement of data can change neither the forward result nor a
+        # pending backward pass.
+        x = list(data)
+        n = len(x)
+        # Stable one-dimensional prefix log-sum-exp recurrence; exp is only
+        # ever evaluated on values in (-inf, 0] and exp(x) directly is
+        # never accumulated:
+        #   y[0] = x[0]
+        #   y[i] = m + log1p(exp(d)), m = max(y[i-1], x[i]),
+        #          d = min(y[i-1], x[i]) - m
+        # A non-finite intermediate aborts before a result tensor exists,
+        # so no state can change on failure.
+        y = [x[0]]
+        for i in range(1, n):
+            m = max(y[i - 1], x[i])
+            d = min(y[i - 1], x[i]) - m
+            if d == float("-inf"):
+                # A difference collapsed to -inf: its exponential is 0.
+                e = 0.0
+            else:
+                if not math.isfinite(d):
+                    raise ValueError(
+                        "logcumsumexp intermediate must be finite"
+                    )
+                e = math.exp(d)
+                if not math.isfinite(e):
+                    raise ValueError(
+                        "logcumsumexp intermediate must be finite"
+                    )
+            log_term = math.log1p(e)
+            if not math.isfinite(log_term):
+                raise ValueError("logcumsumexp intermediate must be finite")
+            value = m + log_term
+            if not math.isfinite(value):
+                raise ValueError("logcumsumexp intermediate must be finite")
+            y.append(value)
+        if not self.requires_grad:
+            return Tensor._make(y, False, (), None)
+        parent = self
+        # Save private copies of x and y so later mutation of the input or
+        # output data lists cannot change a pending backward pass.
+        saved_x = list(x)
+        saved_y = list(y)
+
+        def backward_fn(grad):
+            # dy[i]/dx[j] = exp(x[j] - y[i]) for j <= i (and 0 for j > i),
+            # so dx[j] accumulates grad[i] * exp(x[j] - y[i]) from 0.0 in
+            # ascending j, then ascending i from j to n-1. Every exponent
+            # is non-positive; a difference of -inf contributes 0.0. Any
+            # other non-finite difference, exponent, product, partial sum
+            # or final contribution aborts the whole pass before anything
+            # is returned, leaving every graph grad untouched.
+            dx = [0.0] * n
+            for j in range(n):
+                total = 0.0
+                for i in range(j, n):
+                    diff = saved_x[j] - saved_y[i]
+                    if diff == float("-inf"):
+                        e = 0.0
+                    else:
+                        if not math.isfinite(diff):
+                            raise ValueError(
+                                "logcumsumexp backward intermediate "
+                                "must be finite"
+                            )
+                        e = math.exp(diff)
+                        if not math.isfinite(e):
+                            raise ValueError(
+                                "logcumsumexp backward intermediate "
+                                "must be finite"
+                            )
+                    contribution_i = grad[i] * e
+                    if not math.isfinite(contribution_i):
+                        raise ValueError(
+                            "logcumsumexp backward intermediate must be finite"
+                        )
+                    total += contribution_i
+                    if not math.isfinite(total):
+                        raise ValueError(
+                            "logcumsumexp backward intermediate must be finite"
+                        )
+                dx[j] = total
+            return [(parent, dx)]
+
+        return Tensor._make(y, True, (parent,), backward_fn)
+
     def logsumexp(self):
         data = _require_nonempty_float_vector(self, "logsumexp")
         # Snapshot the input so later caller-side mutation cannot change
