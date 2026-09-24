@@ -4637,10 +4637,13 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
-    def max_pool2d(self, height, width, kernel_size, stride=None):
+    def max_pool2d(
+        self, height, width, kernel_size, stride=None, padding=0, dilation=1
+    ):
         data = _require_nonempty_float_vector(self, "max_pool2d")
-        # height, width, kernel_size and a non-None stride must be
+        # height, width, kernel_size, a non-None stride and dilation must be
         # non-bool positive ints; stride=None falls back to kernel_size.
+        # padding must be a non-bool non-negative int.
         for name, value in (
             ("height", height),
             ("width", width),
@@ -4656,19 +4659,31 @@ class Tensor:
             raise TypeError("stride must be a positive int")
         elif stride <= 0:
             raise ValueError("stride must be a positive int")
-        H, W, K, S = height, width, kernel_size, stride
+        if isinstance(padding, bool) or not isinstance(padding, int):
+            raise TypeError("padding must be a non-negative int")
+        if padding < 0:
+            raise ValueError("padding must be a non-negative int")
+        if isinstance(dilation, bool) or not isinstance(dilation, int):
+            raise TypeError("dilation must be a positive int")
+        if dilation <= 0:
+            raise ValueError("dilation must be a positive int")
+        H, W, K, S, P, D = height, width, kernel_size, stride, padding, dilation
         # self stores a single-channel H x W image in row-major order.
         if len(data) != H * W:
             raise ValueError(
                 "max_pool2d input length must equal height * width"
             )
-        out_h = (H - K) // S + 1
-        out_w = (W - K) // S + 1
+        # Effective window span: taps in each axis sit dilation positions
+        # apart, so a window covers E = D*(K-1)+1 positions.
+        E = D * (K - 1) + 1
+        out_h = (H + 2 * P - E) // S + 1
+        out_w = (W + 2 * P - E) // S + 1
         if out_h <= 0 or out_w <= 0:
             raise ValueError("max_pool2d output dimensions must be positive")
-        # Scan positions in ascending (or, oc, kr, kc) order; the window
-        # tap sits at row or*S+kr, column oc*S+kc. On ties the earliest
-        # tap in scan order wins the gradient.
+        # Scan taps in ascending (or, oc, kr, kc) order; the tap sits at row
+        # or*S+kr*D-P and column oc*S+kc*D-P. Out-of-range positions (from
+        # padding or dilation) are skipped; a window with no in-range tap is
+        # an error. On ties the earliest tap in scan order wins the gradient.
         out_data = []
         argmax_indices = []
         for orow in range(out_h):
@@ -4676,12 +4691,16 @@ class Tensor:
                 best = None
                 best_j = None
                 for kr in range(K):
-                    row = orow * S + kr
+                    r = orow * S + kr * D - P
                     for kc in range(K):
-                        j = row * W + (ocol * S + kc)
-                        if best is None or data[j] > best:
-                            best = data[j]
-                            best_j = j
+                        c = ocol * S + kc * D - P
+                        if 0 <= r < H and 0 <= c < W:
+                            j = r * W + c
+                            if best is None or data[j] > best:
+                                best = data[j]
+                                best_j = j
+                if best_j is None:
+                    raise ValueError("max_pool2d window has no valid positions")
                 out_data.append(best)
                 argmax_indices.append(best_j)
         if not self.requires_grad:
