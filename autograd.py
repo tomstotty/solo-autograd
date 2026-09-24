@@ -1697,26 +1697,38 @@ class Tensor:
         a_data = _require_nonempty_float_vector(self, "bmm")
         b_data = _require_nonempty_float_vector(other, "bmm")
         B, R, I, C = batch, rows, inner, cols
-        # self stores B matrices of rows x inner and other B matrices of
-        # inner x cols, all in row-major order with batches stacked.
-        if len(a_data) != B * R * I:
-            raise ValueError("bmm left length must equal batch * rows * inner")
-        if len(b_data) != B * I * C:
-            raise ValueError(
-                "bmm right length must equal batch * inner * cols"
-            )
+        # Batch-dimension broadcasting: an operand whose data holds just one
+        # matrix (R*I or I*C) is reused for every batch; a full operand holds
+        # B stacked matrices. A length that matches neither shape is invalid.
+        a_count = len(a_data)
+        b_count = len(b_data)
+        if a_count == R * I:
+            a_batched = False
+        elif a_count == B * R * I:
+            a_batched = True
+        else:
+            raise ValueError("bmm left length must equal rows * inner"
+                             " or batch * rows * inner")
+        if b_count == I * C:
+            b_batched = False
+        elif b_count == B * I * C:
+            b_batched = True
+        else:
+            raise ValueError("bmm right length must equal inner * cols"
+                             " or batch * inner * cols")
         # Snapshot both operands so later caller-side mutation of either
         # input list cannot change what a pending backward pass uses.
         snapshot_a = list(a_data)
         snapshot_b = list(b_data)
-        # out[q*R*C+r*C+c] = sum_k a[q*R*I+r*I+k] * b[q*I*C+k*C+c],
+
+        # out[q*R*C+r*C+c] = sum_k a[aq*R*I+r*I+k] * b[aq=q else 0]
         # accumulated from 0.0 in ascending (q, r, c, k) order; a non-finite
         # product or partial sum aborts before a result tensor exists, so no
         # state changes.
         out_data = []
         for q in range(B):
-            a_base = q * R * I
-            b_base = q * I * C
+            a_base = q * R * I if a_batched else 0
+            b_base = q * I * C if b_batched else 0
             for r in range(R):
                 for c in range(C):
                     acc = 0.0
@@ -1740,42 +1752,41 @@ class Tensor:
         parent_self, parent_other = self, other
 
         def backward_fn(grad):
-            # da[q*R*I+r*I+k] += g[q*R*C+r*C+c] * b[q*I*C+k*C+c] and
-            # db[q*I*C+k*C+c] += g[q*R*C+r*C+c] * a[q*R*I+r*I+k],
+            # da[aq*R*I+r*I+k] += g[q*R*C+r*C+c] * b[aq=q else 0] and
+            # db[aq=q else 0]+k*C+c] += g[q*R*C+r*C+c] * a[...],
             # accumulated from 0.0 in ascending (q, r, c, k) order. A
             # non-finite product or partial sum aborts the whole pass before
-            # any grad is written.
-            da = [0.0] * (B * R * I)
-            db = [0.0] * (B * I * C)
+            # any grad is written. Single-matrix operands reduce across all
+            # batches back into their original R*I / I*C shape.
+            da = [0.0] * (B * R * I if a_batched else R * I)
+            db = [0.0] * (B * I * C if b_batched else I * C)
             for q in range(B):
-                a_base = q * R * I
-                b_base = q * I * C
+                a_base = q * R * I if a_batched else 0
+                b_base = q * I * C if b_batched else 0
                 g_base = q * R * C
                 for r in range(R):
                     for c in range(C):
                         g_rc = grad[g_base + r * C + c]
                         for k in range(I):
-                            term_a = g_rc * snapshot_b[b_base + k * C + c]
+                            ia = a_base + r * I + k
+                            ib = b_base + k * C + c
+                            term_a = g_rc * snapshot_b[ib]
                             if not math.isfinite(term_a):
                                 raise ValueError(
                                     "bmm backward intermediate must be finite"
                                 )
-                            da[a_base + r * I + k] = (
-                                da[a_base + r * I + k] + term_a
-                            )
-                            if not math.isfinite(da[a_base + r * I + k]):
+                            da[ia] = da[ia] + term_a
+                            if not math.isfinite(da[ia]):
                                 raise ValueError(
                                     "bmm backward intermediate must be finite"
                                 )
-                            term_b = g_rc * snapshot_a[a_base + r * I + k]
+                            term_b = g_rc * snapshot_a[ia]
                             if not math.isfinite(term_b):
                                 raise ValueError(
                                     "bmm backward intermediate must be finite"
                                 )
-                            db[b_base + k * C + c] = (
-                                db[b_base + k * C + c] + term_b
-                            )
-                            if not math.isfinite(db[b_base + k * C + c]):
+                            db[ib] = db[ib] + term_b
+                            if not math.isfinite(db[ib]):
                                 raise ValueError(
                                     "bmm backward intermediate must be finite"
                                 )
