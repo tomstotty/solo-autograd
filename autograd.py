@@ -6841,6 +6841,308 @@ class Tensor:
             backward_fn,
         )
 
+    def lstm(self, w, u, b, h0, c0, steps, input_size, hidden_size):
+        if not isinstance(w, Tensor):
+            raise TypeError("w must be a Tensor")
+        if not isinstance(u, Tensor):
+            raise TypeError("u must be a Tensor")
+        if not isinstance(b, Tensor):
+            raise TypeError("b must be a Tensor")
+        if not isinstance(h0, Tensor):
+            raise TypeError("h0 must be a Tensor")
+        if not isinstance(c0, Tensor):
+            raise TypeError("c0 must be a Tensor")
+        # All six operands must hold non-empty 1D finite float lists; data
+        # may have been mutated after construction, so re-validate at call
+        # time.
+        x_data = _require_nonempty_float_vector(self, "lstm")
+        w_data = _require_nonempty_float_vector(w, "lstm")
+        u_data = _require_nonempty_float_vector(u, "lstm")
+        b_data = _require_nonempty_float_vector(b, "lstm")
+        h0_data = _require_nonempty_float_vector(h0, "lstm")
+        c0_data = _require_nonempty_float_vector(c0, "lstm")
+        for name, value in (
+            ("steps", steps),
+            ("input_size", input_size),
+            ("hidden_size", hidden_size),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(name + " must be a positive int")
+            if value <= 0:
+                raise ValueError(name + " must be a positive int")
+        Tn = steps
+        I = input_size
+        H = hidden_size
+        G = 4 * H
+        # self is the Tn x I input sequence in row-major order; w stores
+        # the 4H x I input weights, u the 4H x H hidden weights and b the
+        # length-4H bias, all row-major with gate rows ordered i, f, g, o.
+        if len(x_data) != Tn * I:
+            raise ValueError(
+                "lstm input length must equal steps * input_size"
+            )
+        if len(w_data) != G * I:
+            raise ValueError(
+                "lstm w length must equal 4 * hidden_size * input_size"
+            )
+        if len(u_data) != G * H:
+            raise ValueError(
+                "lstm u length must equal 4 * hidden_size * hidden_size"
+            )
+        if len(b_data) != G:
+            raise ValueError("lstm b length must equal 4 * hidden_size")
+        if len(h0_data) != H:
+            raise ValueError("lstm h0 length must equal hidden_size")
+        if len(c0_data) != H:
+            raise ValueError("lstm c0 length must equal hidden_size")
+        # Snapshot all six operands so later caller-side mutation or
+        # replacement of any input can change neither the forward result
+        # nor a pending backward pass.
+        snapshot_x = list(x_data)
+        snapshot_w = list(w_data)
+        snapshot_u = list(u_data)
+        snapshot_b = list(b_data)
+        snapshot_h0 = list(h0_data)
+        snapshot_c0 = list(c0_data)
+        needs_grad = (
+            self.requires_grad
+            or w.requires_grad
+            or u.requires_grad
+            or b.requires_grad
+            or h0.requires_grad
+            or c0.requires_grad
+        )
+        # For each step t and gate row j (both ascending), the affine
+        # pre-activation a starts from b[j] and accumulates the input
+        # contributions w[j*I+k]*x[t*I+k] then the hidden contributions
+        # u[j*H+k]*h_prev[k], each in ascending index order. Gates are
+        # i/f/o = sigmoid(a), g = tanh(a); c = f*c_prev + i*g and
+        # h = o*tanh(c). A non-finite product or partial sum aborts
+        # before a result tensor exists, so no state changes.
+        out_data = []
+        saved = []
+        h_prev = snapshot_h0
+        c_prev = snapshot_c0
+        for t in range(Tn):
+            a = [0.0] * G
+            for j in range(G):
+                acc = snapshot_b[j]
+                base = j * I
+                xbase = t * I
+                for k in range(I):
+                    product = snapshot_w[base + k] * snapshot_x[xbase + k]
+                    if not math.isfinite(product):
+                        raise ValueError(
+                            "lstm intermediate must be finite"
+                        )
+                    acc += product
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "lstm intermediate must be finite"
+                        )
+                hbase = j * H
+                for k in range(H):
+                    product = snapshot_u[hbase + k] * h_prev[k]
+                    if not math.isfinite(product):
+                        raise ValueError(
+                            "lstm intermediate must be finite"
+                        )
+                    acc += product
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "lstm intermediate must be finite"
+                        )
+                a[j] = acc
+            gate_i = [0.0] * H
+            gate_f = [0.0] * H
+            gate_g = [0.0] * H
+            gate_o = [0.0] * H
+            c_new = [0.0] * H
+            tanh_c = [0.0] * H
+            h_new = [0.0] * H
+            for k in range(H):
+                i_k = _stable_sigmoid_value(a[k])
+                f_k = _stable_sigmoid_value(a[H + k])
+                g_k = math.tanh(a[2 * H + k])
+                if not math.isfinite(g_k):
+                    raise ValueError("lstm intermediate must be finite")
+                o_k = _stable_sigmoid_value(a[3 * H + k])
+                forget = f_k * c_prev[k]
+                if not math.isfinite(forget):
+                    raise ValueError("lstm intermediate must be finite")
+                write = i_k * g_k
+                if not math.isfinite(write):
+                    raise ValueError("lstm intermediate must be finite")
+                c_k = forget + write
+                if not math.isfinite(c_k):
+                    raise ValueError("lstm intermediate must be finite")
+                t_k = math.tanh(c_k)
+                if not math.isfinite(t_k):
+                    raise ValueError("lstm intermediate must be finite")
+                h_k = o_k * t_k
+                if not math.isfinite(h_k):
+                    raise ValueError("lstm intermediate must be finite")
+                gate_i[k] = i_k
+                gate_f[k] = f_k
+                gate_g[k] = g_k
+                gate_o[k] = o_k
+                c_new[k] = c_k
+                tanh_c[k] = t_k
+                h_new[k] = h_k
+            out_data.extend(h_new)
+            if needs_grad:
+                saved.append(
+                    (
+                        gate_i,
+                        gate_f,
+                        gate_g,
+                        gate_o,
+                        tanh_c,
+                        h_prev,
+                        c_prev,
+                    )
+                )
+            h_prev = h_new
+            c_prev = c_new
+        if not needs_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_w, parent_u = self, w, u
+        parent_b, parent_h0, parent_c0 = b, h0, c0
+
+        def backward_fn(grad):
+            # Chain-rule the recurrence in reverse step order. Every sum
+            # is accumulated from 0.0 in ascending index order; a
+            # non-finite product or partial sum aborts the whole pass
+            # before any grad is written.
+            def product(x, y):
+                value = x * y
+                if not math.isfinite(value):
+                    raise ValueError(
+                        "lstm backward intermediate must be finite"
+                    )
+                return value
+
+            def accumulate(acc, term):
+                value = acc + term
+                if not math.isfinite(value):
+                    raise ValueError(
+                        "lstm backward intermediate must be finite"
+                    )
+                return value
+
+            dx = [0.0] * (Tn * I)
+            dw = [0.0] * (G * I)
+            du = [0.0] * (G * H)
+            db = [0.0] * G
+            dh_next = [0.0] * H
+            dc_next = [0.0] * H
+            for t in range(Tn - 1, -1, -1):
+                (
+                    gate_i,
+                    gate_f,
+                    gate_g,
+                    gate_o,
+                    tanh_c,
+                    h_prev,
+                    c_prev,
+                ) = saved[t]
+                da = [0.0] * G
+                dc_prev = [0.0] * H
+                for k in range(H):
+                    # Total grad on h_t[k]: the upstream output grad plus
+                    # the recurrent contribution from step t + 1.
+                    dh = 0.0
+                    dh = accumulate(dh, grad[t * H + k])
+                    dh = accumulate(dh, dh_next[k])
+                    i_k = gate_i[k]
+                    f_k = gate_f[k]
+                    g_k = gate_g[k]
+                    o_k = gate_o[k]
+                    t_k = tanh_c[k]
+                    # h = o * tanh(c)
+                    do = product(dh, t_k)
+                    dc = 0.0
+                    dc = accumulate(dc, dc_next[k])
+                    sq = product(t_k, t_k)
+                    term = product(dh, o_k)
+                    term = product(term, 1.0 - sq)
+                    dc = accumulate(dc, term)
+                    # c = f*c_prev + i*g
+                    df = product(dc, c_prev[k])
+                    dc_prev[k] = product(dc, f_k)
+                    di = product(dc, g_k)
+                    dg = product(dc, i_k)
+                    # Gate pre-activations: sigmoid' = y*(1 - y),
+                    # tanh' = 1 - y*y.
+                    da[k] = product(product(di, i_k), 1.0 - i_k)
+                    da[H + k] = product(product(df, f_k), 1.0 - f_k)
+                    sq_g = product(g_k, g_k)
+                    da[2 * H + k] = product(dg, 1.0 - sq_g)
+                    da[3 * H + k] = product(product(do, o_k), 1.0 - o_k)
+                # Parameter and input grads, gate rows ascending.
+                dh_prev = [0.0] * H
+                xbase = t * I
+                for j in range(G):
+                    da_j = da[j]
+                    db[j] = accumulate(db[j], da_j)
+                    base = j * I
+                    for k in range(I):
+                        dw[base + k] = accumulate(
+                            dw[base + k],
+                            product(da_j, snapshot_x[xbase + k]),
+                        )
+                        dx[xbase + k] = accumulate(
+                            dx[xbase + k],
+                            product(da_j, snapshot_w[base + k]),
+                        )
+                    hbase = j * H
+                    for k in range(H):
+                        du[hbase + k] = accumulate(
+                            du[hbase + k],
+                            product(da_j, h_prev[k]),
+                        )
+                        dh_prev[k] = accumulate(
+                            dh_prev[k],
+                            product(da_j, snapshot_u[hbase + k]),
+                        )
+                dh_next = dh_prev
+                dc_next = dc_prev
+            # After the t = 0 pass the recurrent grads are the h0/c0 grads.
+            dh0 = dh_next
+            dc0 = dc_next
+            # One object may play several roles (e.g. w is also u); merge
+            # such roles into one contribution per tensor, and submit only
+            # parents that require grad. Role shapes agree whenever the
+            # objects coincide, since each length was validated per role.
+            merged = {}
+            roles = (
+                (parent_self, dx),
+                (parent_w, dw),
+                (parent_u, du),
+                (parent_b, db),
+                (parent_h0, dh0),
+                (parent_c0, dc0),
+            )
+            for parent, value in roles:
+                if not parent.requires_grad:
+                    continue
+                entry = merged.get(id(parent))
+                if entry is None:
+                    merged[id(parent)] = [parent, value]
+                else:
+                    combined = _merge_grad(entry[1], value)
+                    _ensure_finite_grad(combined)
+                    entry[1] = combined
+            return [(entry[0], entry[1]) for entry in merged.values()]
+
+        return Tensor._make(
+            out_data,
+            True,
+            (parent_self, parent_w, parent_u, parent_b, parent_h0,
+             parent_c0),
+            backward_fn,
+        )
+
     def zero_grad(self):
         self.grad = None
         return None
