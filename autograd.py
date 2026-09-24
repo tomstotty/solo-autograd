@@ -5399,7 +5399,7 @@ class Tensor:
         )
 
     def conv_transpose2d_batch(self, kernel, batch, channels, filters, size,
-                               kernel_size):
+                               kernel_size, stride=1, padding=0, dilation=1):
         if not isinstance(kernel, Tensor):
             raise TypeError("kernel must be a Tensor")
         # Both operands must hold non-empty 1D finite float lists; data may
@@ -5410,20 +5410,30 @@ class Tensor:
         w_data = _require_nonempty_float_vector(
             kernel, "conv_transpose2d_batch"
         )
-        # batch, channels, filters, size and kernel_size must be non-bool
-        # positive ints.
+        # batch, channels, filters, size, kernel_size, stride and dilation
+        # must be non-bool positive ints, and padding a non-bool non-negative
+        # int.
         for name, value in (
             ("batch", batch),
             ("channels", channels),
             ("filters", filters),
             ("size", size),
             ("kernel_size", kernel_size),
+            ("stride", stride),
+            ("dilation", dilation),
         ):
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError(name + " must be a positive int")
             if value <= 0:
                 raise ValueError(name + " must be a positive int")
-        B, C, O, N, K = batch, channels, filters, size, kernel_size
+        if isinstance(padding, bool) or not isinstance(padding, int):
+            raise TypeError("padding must be a non-negative int")
+        if padding < 0:
+            raise ValueError("padding must be a non-negative int")
+        B, C, O, N, K, S, P, D = (
+            batch, channels, filters, size, kernel_size, stride, padding,
+            dilation,
+        )
         # self stores B images of C channels of N x N pixels and kernel C
         # filters of O channels of K x K weights, all in row-major order.
         if len(x_data) != B * C * N * N:
@@ -5437,8 +5447,15 @@ class Tensor:
                 "channels * filters * kernel_size * kernel_size"
             )
         # Each input element scatters a scaled K x K copy of its filter
-        # onto the output, so the output side is L = N + K - 1.
-        L = N + K - 1
+        # onto the output; stride steps the scatter anchors apart, padding
+        # shifts them inwards and dilation spaces the kernel taps, so the
+        # output side is L = (N-1)*S - 2*P + D*(K-1) + 1. With the defaults
+        # S = 1, P = 0 and D = 1 this is simply N + K - 1.
+        L = (N - 1) * S - 2 * P + D * (K - 1) + 1
+        if L <= 0:
+            raise ValueError(
+                "conv_transpose2d_batch output dimensions must be positive"
+            )
         total_out = B * O * L * L
         # Snapshot both operands at call time so later caller-side mutation
         # or replacement of either input can change neither the forward
@@ -5447,11 +5464,12 @@ class Tensor:
         snapshot_w = list(w_data)
         # Batched multi-channel 2D transposed cross-correlation: the kernel
         # is never flipped. In ascending (b, c, r, q, o, kr, kc) order,
-        # i = ((b*C+c)*N+r)*N+q, j = ((c*O+o)*K+kr)*K+kc and
-        # z = ((b*O+o)*L+r+kr)*L+q+kc, and out[z] += x[i]*w[j], accumulated
-        # from 0.0; every scattered position lies inside the L x L output,
-        # so nothing is skipped. A non-finite product or partial sum
-        # aborts before a result tensor exists, so no state can change.
+        # i = ((b*C+c)*N+r)*N+q, j = ((c*O+o)*K+kr)*K+kc,
+        # y = r*S-P+kr*D, x = q*S-P+kc*D and z = ((b*O+o)*L+y)*L+x, and
+        # out[z] += x[i]*w[j], accumulated from 0.0 while skipping
+        # out-of-range output positions (from stride, padding or the
+        # dilation gaps). A non-finite product or partial sum aborts before
+        # a result tensor exists, so no state can change.
         out_data = [0.0] * total_out
         for b in range(B):
             for c in range(C):
@@ -5460,9 +5478,15 @@ class Tensor:
                         i = ((b * C + c) * N + r) * N + q
                         for o in range(O):
                             for kr in range(K):
+                                y = r * S - P + kr * D
+                                if not 0 <= y < L:
+                                    continue
                                 for kc in range(K):
+                                    x = q * S - P + kc * D
+                                    if not 0 <= x < L:
+                                        continue
                                     j = ((c * O + o) * K + kr) * K + kc
-                                    z = ((b * O + o) * L + r + kr) * L + q + kc
+                                    z = ((b * O + o) * L + y) * L + x
                                     product = snapshot_x[i] * snapshot_w[j]
                                     if not math.isfinite(product):
                                         raise ValueError(
@@ -5485,8 +5509,9 @@ class Tensor:
         def backward_fn(grad):
             # dx[i] += g[z]*w[j] and dw[j] += g[z]*x[i], accumulated from
             # 0.0 in the same ascending (b, c, r, q, o, kr, kc) order and
-            # i/j/z indexing as the forward pass; dw has no batch index, so
-            # its contributions reduce across all B images. A non-finite
+            # i/j/z/y/x indexing as the forward pass, skipping the same
+            # out-of-range positions; dw has no batch index, so its
+            # contributions reduce across all B images. A non-finite
             # product or partial sum aborts the whole pass before any grad
             # is written.
             dx = [0.0] * (B * C * N * N)
@@ -5498,12 +5523,17 @@ class Tensor:
                             i = ((b * C + c) * N + r) * N + q
                             for o in range(O):
                                 for kr in range(K):
+                                    y = r * S - P + kr * D
+                                    if not 0 <= y < L:
+                                        continue
                                     for kc in range(K):
-                                        j = ((c * O + o) * K + kr) * K + kc
-                                        z = (
-                                            ((b * O + o) * L + r + kr) * L
-                                            + q + kc
-                                        )
+                                        x = q * S - P + kc * D
+                                        if not 0 <= x < L:
+                                            continue
+                                        j = (
+                                            (c * O + o) * K + kr
+                                        ) * K + kc
+                                        z = ((b * O + o) * L + y) * L + x
                                         g = grad[z]
                                         contrib_x = g * snapshot_w[j]
                                         if not math.isfinite(contrib_x):
