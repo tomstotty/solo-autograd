@@ -6845,6 +6845,87 @@ class Tensor:
             grad_validator=lambda g: _validate_vector_grad(g, OH * OW),
         )
 
+    def adaptive_max_pool2d(self, height, width, out_height, out_width):
+        data = _require_nonempty_float_vector(
+            self, "adaptive_max_pool2d"
+        )
+        # height, width, out_height and out_width must be non-bool
+        # positive ints.
+        for name, value in (
+            ("height", height),
+            ("width", width),
+            ("out_height", out_height),
+            ("out_width", out_width),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(name + " must be a positive int")
+            if value <= 0:
+                raise ValueError(name + " must be a positive int")
+        H, W, OH, OW = height, width, out_height, out_width
+        # self stores a single-channel H x W image in row-major order.
+        if len(data) != H * W:
+            raise ValueError(
+                "adaptive_max_pool2d input length must equal height * width"
+            )
+        # Output cell (or, oc) takes the maximum over the rectangle
+        # [rs, re) x [cs, ce) whose bounds follow the adaptive pooling
+        # convention: rs = (or*H)//OH, re = ((or+1)*H+OH-1)//OH, and the
+        # analogous column bounds. Cells are scanned in ascending
+        # (or, oc, r, c) order; on ties the earliest position in scan
+        # order wins the gradient.
+        out_data = []
+        argmax_indices = []
+        for orow in range(OH):
+            rs = (orow * H) // OH
+            re = ((orow + 1) * H + OH - 1) // OH
+            for ocol in range(OW):
+                cs = (ocol * W) // OW
+                ce = ((ocol + 1) * W + OW - 1) // OW
+                best = None
+                best_j = None
+                for r in range(rs, re):
+                    for c in range(cs, ce):
+                        j = r * W + c
+                        if best is None or data[j] > best:
+                            best = data[j]
+                            best_j = j
+                out_data.append(best)
+                argmax_indices.append(best_j)
+        if not self.requires_grad:
+            return Tensor._make(
+                out_data, False, (), None,
+                grad_validator=lambda g: _validate_vector_grad(g, OH * OW),
+            )
+        # Snapshot the input length and winning indices with the graph;
+        # mutating the parent's data after the forward pass cannot change
+        # what a pending backward pass uses.
+        parent = self
+        n = H * W
+
+        def backward_fn(grad):
+            # dx[j] += grad[o] for the winning cell of each output,
+            # accumulated from 0.0 in ascending output order; overlapping
+            # regions accumulate. A non-finite partial sum aborts the
+            # whole pass before any grad is written.
+            dx = [0.0] * n
+            for o in range(OH * OW):
+                j = argmax_indices[o]
+                dx[j] = dx[j] + grad[o]
+                if not math.isfinite(dx[j]):
+                    raise ValueError(
+                        "adaptive_max_pool2d backward intermediate must be"
+                        " finite"
+                    )
+            return [(parent, dx)]
+
+        return Tensor._make(
+            out_data,
+            True,
+            (parent,),
+            backward_fn,
+            grad_validator=lambda g: _validate_vector_grad(g, OH * OW),
+        )
+
     def grid_sample2d(self, grid, height, width, out_height, out_width):
         if not isinstance(grid, Tensor):
             raise TypeError("grid must be a Tensor")
