@@ -6790,6 +6790,106 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def unfold2d(self, channels, height, width, kernel_size, stride=1,
+                 padding=0, dilation=1):
+        data = _require_nonempty_float_vector(self, "unfold2d")
+        # channels, height, width, kernel_size, stride and dilation must be
+        # non-bool positive ints; padding must be a non-bool non-negative int.
+        for name, value in (
+            ("channels", channels),
+            ("height", height),
+            ("width", width),
+            ("kernel_size", kernel_size),
+            ("stride", stride),
+            ("dilation", dilation),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(name + " must be a positive int")
+            if value <= 0:
+                raise ValueError(name + " must be a positive int")
+        if isinstance(padding, bool) or not isinstance(padding, int):
+            raise TypeError("padding must be a non-negative int")
+        if padding < 0:
+            raise ValueError("padding must be a non-negative int")
+        C, H, W, K, S, P, D = (
+            channels, height, width, kernel_size, stride, padding, dilation
+        )
+        # self stores a C x H x W image in (channel, row, column) row-major
+        # order.
+        if len(data) != C * H * W:
+            raise ValueError(
+                "unfold2d input length must equal channels * height * width"
+            )
+        # Effective window span: taps in each axis sit dilation positions
+        # apart, so a window covers E = D*(K-1)+1 positions.
+        E = D * (K - 1) + 1
+        out_h = (H + 2 * P - E) // S + 1
+        out_w = (W + 2 * P - E) // S + 1
+        if out_h <= 0 or out_w <= 0:
+            raise ValueError("unfold2d output dimensions must be positive")
+        out_length = out_h * out_w * C * K * K
+        # im2col gather: in ascending (or, oc, c, kr, kc) order each entry
+        # is data[(c*H+r)*W+q] with r = or*S+kr*D-P and
+        # q = oc*S+kc*D-P; out-of-range positions (from padding or the
+        # dilation gaps) become 0.0. Values are only copied from the
+        # already-finite input, so no intermediate arithmetic is needed.
+        out_data = []
+        for orow in range(out_h):
+            for ocol in range(out_w):
+                for c in range(C):
+                    for kr in range(K):
+                        r = orow * S + kr * D - P
+                        for kc in range(K):
+                            q = ocol * S + kc * D - P
+                            if 0 <= r < H and 0 <= q < W:
+                                out_data.append(data[(c * H + r) * W + q])
+                            else:
+                                out_data.append(0.0)
+        validator = lambda g: _validate_vector_grad(g, out_length)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None,
+                                grad_validator=validator)
+        # Snapshot the image shape and window parameters with the graph;
+        # mutating the parent's data after the forward pass cannot change
+        # what a pending backward pass uses.
+        parent = self
+        n = C * H * W
+        snapshot_C, snapshot_H, snapshot_W = C, H, W
+        snapshot_K, snapshot_S, snapshot_P, snapshot_D = K, S, P, D
+
+        def backward_fn(grad):
+            # dx[(c*H+r)*W+q] += grad[o] for every in-range tap, where o
+            # walks ascending (or, oc, c, kr, kc) order; accumulated from
+            # 0.0 so overlapping windows sum together. A non-finite partial
+            # sum aborts the whole pass before any grad is written.
+            dx = [0.0] * n
+            o = 0
+            for orow in range(out_h):
+                for ocol in range(out_w):
+                    for c in range(snapshot_C):
+                        for kr in range(snapshot_K):
+                            r = orow * snapshot_S + kr * snapshot_D - snapshot_P
+                            for kc in range(snapshot_K):
+                                q = (
+                                    ocol * snapshot_S
+                                    + kc * snapshot_D
+                                    - snapshot_P
+                                )
+                                if 0 <= r < snapshot_H and 0 <= q < snapshot_W:
+                                    j = (c * snapshot_H + r) * snapshot_W + q
+                                    dx[j] = dx[j] + grad[o]
+                                    if not math.isfinite(dx[j]):
+                                        raise ValueError(
+                                            "unfold2d backward intermediate"
+                                            " must be finite"
+                                        )
+                                o += 1
+            return [(parent, dx)]
+
+        return Tensor._make(
+            out_data, True, (parent,), backward_fn, grad_validator=validator
+        )
+
     def adaptive_avg_pool2d(self, height, width, out_height, out_width):
         data = _require_nonempty_float_vector(
             self, "adaptive_avg_pool2d"
