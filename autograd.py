@@ -6913,6 +6913,139 @@ class Tensor:
             grad_validator=lambda g: _validate_vector_grad(g, n_out),
         )
 
+    def fold2d(
+        self, channels, height, width, kernel_size, stride=1,
+        padding=0, dilation=1,
+    ):
+        data = _require_nonempty_float_vector(self, "fold2d")
+        # channels, height, width, kernel_size, stride and dilation must be
+        # non-bool positive ints; padding must be a non-bool non-negative int.
+        for name, value in (
+            ("channels", channels),
+            ("height", height),
+            ("width", width),
+            ("kernel_size", kernel_size),
+            ("stride", stride),
+            ("dilation", dilation),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(name + " must be a positive int")
+            if value <= 0:
+                raise ValueError(name + " must be a positive int")
+        if isinstance(padding, bool) or not isinstance(padding, int):
+            raise TypeError("padding must be a non-negative int")
+        if padding < 0:
+            raise ValueError("padding must be a non-negative int")
+        C, H, W, K, S, P, D = (
+            channels, height, width, kernel_size,
+            stride, padding, dilation,
+        )
+        # self is the column-flattened unfold output: OH*OW windows, each
+        # holding C*K*K taps in ascending (c, kr, kc) order.
+        E = D * (K - 1) + 1
+        out_h = (H + 2 * P - E) // S + 1
+        out_w = (W + 2 * P - E) // S + 1
+        if out_h <= 0 or out_w <= 0:
+            raise ValueError("fold2d output dimensions must be positive")
+        n_in = out_h * out_w * C * K * K
+        if len(data) != n_in:
+            raise ValueError(
+                "fold2d input length must equal"
+                " out_height * out_width * channels * kernel_size^2"
+            )
+        # Scatter each tap at (or*S+kr*D-P, oc*S+kc*D-P) into the C*H*W
+        # image, walking the input in ascending (or, oc, c, kr, kc) order;
+        # taps landing outside the image are dropped. Overlapping windows
+        # accumulate into the same output cell, and a non-finite partial
+        # sum aborts before a result tensor exists, so no state changes.
+        out_data = [0.0] * (C * H * W)
+        kk = K * K
+        for orow in range(out_h):
+            for ocol in range(out_w):
+                window_base = (orow * out_w + ocol) * C * kk
+                for c in range(C):
+                    channel_base = c * H * W
+                    g_base = window_base + c * kk
+                    for kr in range(K):
+                        r = orow * S + kr * D - P
+                        for kc in range(K):
+                            if not (0 <= r < H):
+                                continue
+                            q = ocol * S + kc * D - P
+                            if not (0 <= q < W):
+                                continue
+                            j = channel_base + r * W + q
+                            out_data[j] += data[g_base + kr * K + kc]
+                            if not math.isfinite(out_data[j]):
+                                raise ValueError(
+                                    "fold2d partial sum must be finite"
+                                )
+        n_out = C * H * W
+        if not self.requires_grad:
+            return Tensor._make(
+                out_data, False, (), None,
+                grad_validator=lambda g: _validate_vector_grad(g, n_out),
+            )
+        # Snapshot the image shape and window parameters with the graph;
+        # mutating the parent's data after the forward pass cannot change
+        # what a pending backward pass uses.
+        parent = self
+        snapshot_C, snapshot_H, snapshot_W = C, H, W
+        snapshot_K, snapshot_S, snapshot_P, snapshot_D = K, S, P, D
+        snapshot_OH, snapshot_OW = out_h, out_w
+
+        def backward_fn(grad):
+            # dx[((or*OW+oc)*C+c)*K*K+kr*K+kc] =
+            # grad[(c*H+r)*W+q] for every in-range tap (out-of-range taps
+            # read 0.0), accumulated in the same ascending
+            # (or, oc, c, kr, kc) order as the forward pass. A non-finite
+            # partial sum aborts the whole pass before any grad is written.
+            dx = [0.0] * n_in
+            kk_b = snapshot_K * snapshot_K
+            for orow in range(snapshot_OH):
+                for ocol in range(snapshot_OW):
+                    window_base = (
+                        (orow * snapshot_OW + ocol) * snapshot_C * kk_b
+                    )
+                    for c in range(snapshot_C):
+                        channel_base = c * snapshot_H * snapshot_W
+                        g_base = window_base + c * kk_b
+                        for kr in range(snapshot_K):
+                            r = (
+                                orow * snapshot_S
+                                + kr * snapshot_D
+                                - snapshot_P
+                            )
+                            for kc in range(snapshot_K):
+                                q = (
+                                    ocol * snapshot_S
+                                    + kc * snapshot_D
+                                    - snapshot_P
+                                )
+                                if (
+                                    0 <= r < snapshot_H
+                                    and 0 <= q < snapshot_W
+                                ):
+                                    idx = g_base + kr * snapshot_K + kc
+                                    dx[idx] = (
+                                        dx[idx]
+                                        + grad[channel_base + r * snapshot_W + q]
+                                    )
+                                    if not math.isfinite(dx[idx]):
+                                        raise ValueError(
+                                            "fold2d backward intermediate"
+                                            " must be finite"
+                                        )
+            return [(parent, dx)]
+
+        return Tensor._make(
+            out_data,
+            True,
+            (parent,),
+            backward_fn,
+            grad_validator=lambda g: _validate_vector_grad(g, n_out),
+        )
+
     def adaptive_avg_pool2d(self, height, width, out_height, out_width):
         data = _require_nonempty_float_vector(
             self, "adaptive_avg_pool2d"
