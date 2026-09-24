@@ -12342,14 +12342,15 @@ def _load_checkpoint_adamax(parameters, optimizer, text, names):
 def dump_training_state(parameters, optimizer, global_step, rng_state):
     """Serialize named parameters, a supported optimizer and loop state.
 
-    RMSprop, Adamax, Adam and AdamW are supported; any other optimizer
-    raises TypeError, and so do non-bool loop values of the wrong type.
-    The parameters mapping and the optimizer state follow the
+    RMSprop, Adamax, Adam, AdamW and AMSGrad are supported; any other
+    optimizer raises TypeError, and so do non-bool loop values of the
+    wrong type. The parameters mapping and the optimizer state follow the
     dump_checkpoint contract. For Adamax and Adam, lr, beta1, beta2 and
-    eps are validated exactly as the constructor validates them, and for
-    AdamW weight_decay is validated the same way: a wrong type raises
-    TypeError and an illegal value raises ValueError. global_step must be
-    a non-bool non-negative int and rng_state a non-bool int in
+    eps are validated exactly as the constructor validates them, for
+    AdamW weight_decay is validated the same way, and for AMSGrad lr,
+    beta1, beta2 and eps are validated the same way too: a wrong type
+    raises TypeError and an illegal value raises ValueError. global_step
+    must be a non-bool non-negative int and rng_state a non-bool int in
     0..4294967295; an out-of-range value raises ValueError.
 
     The output contains no whitespace and no trailing newline; top-level
@@ -12359,10 +12360,11 @@ def dump_training_state(parameters, optimizer, global_step, rng_state):
     dump_checkpoint, keeping its inner bytes unchanged. RMSprop emits
     version 1 with a version-8 checkpoint; Adamax emits version 2 with a
     version-4 checkpoint; both close with a single brace. Adam emits
-    version 3 with a version-2 checkpoint and AdamW emits version 4 with
-    a version-3 checkpoint; each appends a fifth key digest: the
-    lowercase 64-character hexadecimal SHA-256 of the UTF-8 bytes of the
-    otherwise identical text containing only the first four keys.
+    version 3 with a version-2 checkpoint, AdamW emits version 4 with a
+    version-3 checkpoint and AMSGrad emits version 5 with a version-1
+    checkpoint; each appends a fifth key digest: the lowercase
+    64-character hexadecimal SHA-256 of the UTF-8 bytes of the otherwise
+    identical text containing only the first four keys.
     """
     if isinstance(optimizer, RMSprop):
         version = 1
@@ -12383,6 +12385,12 @@ def dump_training_state(parameters, optimizer, global_step, rng_state):
             optimizer.eps,
             optimizer.weight_decay,
         )
+    elif isinstance(optimizer, AMSGrad):
+        version = 5
+        checkpoint = dump_checkpoint(parameters, optimizer)
+        AMSGrad._check_hyperparameters(
+            optimizer.lr, optimizer.beta1, optimizer.beta2, optimizer.eps
+        )
     elif isinstance(optimizer, Adam):
         version = 3
         checkpoint = dump_checkpoint(parameters, optimizer)
@@ -12391,7 +12399,8 @@ def dump_training_state(parameters, optimizer, global_step, rng_state):
         )
     else:
         raise TypeError(
-            "optimizer must be an RMSprop, Adamax, Adam or AdamW instance"
+            "optimizer must be an RMSprop, Adamax, Adam, AdamW or AMSGrad"
+            " instance"
         )
     if isinstance(global_step, bool) or not isinstance(global_step, int):
         raise TypeError("global_step must be a non-bool non-negative int")
@@ -12411,7 +12420,7 @@ def dump_training_state(parameters, optimizer, global_step, rng_state):
         + ',"checkpoint":'
         + checkpoint
     )
-    if version not in (3, 4):
+    if version not in (3, 4, 5):
         return prefix + "}"
     # The digest covers the exact bytes of the four-key document; the
     # returned text replaces its closing brace with the digest member.
@@ -12448,7 +12457,7 @@ class _TrainingStateParser:
     def parse(self):
         self._expect('{"version":')
         version = self._parse_integer()
-        if version not in (1, 2, 3, 4):
+        if version not in (1, 2, 3, 4, 5):
             raise ValueError("unsupported training state version")
         self._expect(',"global_step":')
         global_step = self._parse_integer()
@@ -12459,11 +12468,11 @@ class _TrainingStateParser:
         self._expect(',"checkpoint":')
         # The checkpoint object is followed either by the training state's
         # own single closing brace (versions 1 and 2) or by the version-3
-        # /version-4 digest member ,"digest":"H"}. Its exact format
-        # (version 8 for v1, version 4 for v2, version 2 for v3, version 3
-        # for v4) is validated by the checkpoint parser before any state is
-        # applied.
-        if version not in (3, 4):
+        # /version-4/version-5 digest member ,"digest":"H"}. Its exact
+        # format (version 8 for v1, version 4 for v2, version 2 for v3,
+        # version 3 for v4, version 1 for v5) is validated by the
+        # checkpoint parser before any state is applied.
+        if version not in (3, 4, 5):
             if not self._text.endswith("}"):
                 self._fail()
             checkpoint_text = self._text[self._pos:-1]
@@ -12564,38 +12573,150 @@ def _restore_named_adam_family(
     return None
 
 
+def _restore_named_amsgrad(parameters, optimizer, text, names):
+    """Restore a version-1 AMSGrad state bound by name.
+
+    This is the validate -> rearrange -> commit route used by the
+    version-1 AMSGrad checkpoint embedded in a version-5 training state.
+    ``names`` may be in any order but must name exactly the target
+    parameters (duplicates rejected); the data, requires_grad, m, v and
+    v_max entries are bound by name and rearranged into
+    optimizer.parameters order.
+
+    The live optimizer state is validated with ``_check_amsgrad_state``
+    and the embedded text with ``_AMSGradParser``; counts, name-set
+    equality and the scalar/one-dimensional shape of every data, m, v
+    and v_max entry are all checked, v and v_max must parse as
+    non-negative with v_max elementwise >= v, and t must be a non-bool
+    non-negative integer (all guaranteed by the strict parser/extra
+    checks) before anything is touched. The commit then happens exactly
+    once: each Tensor's data and requires_grad are replaced in place,
+    every grad is cleared, and m, v, v_max and t are replaced. Tensor
+    identities, the optimizer.parameters list and the hyperparameters
+    are preserved.
+    """
+    _check_amsgrad_state(optimizer)
+    parsed = _AMSGradParser(text).parse()
+    state_parameters, moments, velocities, max_velocities, t = parsed
+    count = len(optimizer.parameters)
+    if len(state_parameters) != count:
+        raise ValueError("state must contain exactly one entry per parameter")
+    if (
+        len(moments) != count
+        or len(velocities) != count
+        or len(max_velocities) != count
+    ):
+        raise ValueError(
+            "state m, v and v_max must match the parameters in length"
+        )
+    target_names = list(parameters.keys())
+    if set(names) != set(target_names) or len(names) != len(target_names):
+        raise ValueError(
+            "checkpoint names must name exactly the target parameters"
+        )
+    by_name = {
+        name: (spec, moment, velocity, maximum)
+        for name, spec, moment, velocity, maximum in zip(
+            names, state_parameters, moments, velocities, max_velocities
+        )
+    }
+    updates = []
+    ordered_moments = []
+    ordered_velocities = []
+    ordered_max_velocities = []
+    for name, parameter in zip(parameters.keys(), optimizer.parameters):
+        data, requires_grad = by_name[name][0]
+        current = parameter.data
+        if isinstance(current, list):
+            if not isinstance(data, list) or len(data) != len(current):
+                raise ValueError(
+                    "state data shape must match parameter shape"
+                )
+        elif isinstance(data, list):
+            raise ValueError("state data shape must match parameter shape")
+        updates.append((parameter, data, requires_grad))
+        ordered_moments.append(by_name[name][1])
+        ordered_velocities.append(by_name[name][2])
+        ordered_max_velocities.append(by_name[name][3])
+    for slot_name, buffers in (
+        ("m", ordered_moments),
+        ("v", ordered_velocities),
+        ("v_max", ordered_max_velocities),
+    ):
+        for buffer, parameter in zip(buffers, optimizer.parameters):
+            current = parameter.data
+            if isinstance(current, list):
+                if not isinstance(buffer, list) or len(buffer) != len(current):
+                    raise ValueError(
+                        "state " + slot_name
+                        + " shape must match parameter shape"
+                    )
+            elif isinstance(buffer, list):
+                raise ValueError(
+                    "state " + slot_name
+                    + " shape must match parameter shape"
+                )
+    for velocity, maximum in zip(ordered_velocities, ordered_max_velocities):
+        if isinstance(velocity, list):
+            v_values = velocity
+            h_values = maximum
+        else:
+            v_values = [velocity]
+            h_values = [maximum]
+        for value, top in zip(v_values, h_values):
+            if value < 0.0:
+                raise ValueError("state v must be non-negative")
+            if top < 0.0:
+                raise ValueError("state v_max must be non-negative")
+            if top < value:
+                raise ValueError("state v_max must be elementwise >= v")
+    for parameter, data, requires_grad in updates:
+        parameter.data = data
+        parameter.requires_grad = requires_grad
+        parameter.grad = None
+    optimizer.m = ordered_moments
+    optimizer.v = ordered_velocities
+    optimizer.v_max = ordered_max_velocities
+    optimizer.t = t
+    return None
+
+
 def load_training_state(parameters, optimizer, text):
     """Restore named parameters, a supported optimizer and loop state.
 
-    RMSprop, Adamax, Adam and AdamW are supported; any other optimizer
-    raises TypeError, and a non-string text raises TypeError. The
-    parameters mapping follows the load_checkpoint contract. Only the
-    exact forms produced by dump_training_state are accepted: version 1
-    must wrap a version-8 RMSprop checkpoint, version 2 a version-4
-    Adamax checkpoint, version 3 a version-2 Adam checkpoint and
-    version 4 a version-3 AdamW checkpoint, and the checkpoint type must
-    match the target optimizer. Any outer parse, key set/order,
-    version/target, integer lexical/range or inner checkpoint error
-    raises ValueError.
+    RMSprop, Adamax, Adam, AdamW and AMSGrad are supported; any other
+    optimizer raises TypeError, and a non-string text raises TypeError.
+    The parameters mapping follows the load_checkpoint contract. Only
+    the exact forms produced by dump_training_state are accepted:
+    version 1 must wrap a version-8 RMSprop checkpoint, version 2 a
+    version-4 Adamax checkpoint, version 3 a version-2 Adam checkpoint,
+    version 4 a version-3 AdamW checkpoint and version 5 a version-1
+    AMSGrad checkpoint, and the checkpoint type must match the target
+    optimizer. Any outer parse, key set/order, version/target, integer
+    lexical/range or inner checkpoint error raises ValueError.
 
-    Versions 3 and 4 additionally require their digest member to verify
-    against the SHA-256 of the four-key document and bind the embedded
-    checkpoint by name: its names may be in any order but must name
-    exactly the target parameters. Any digest, inner version/type or
-    name/shape violation raises ValueError.
+    Versions 3, 4 and 5 additionally require their digest member to
+    verify against the SHA-256 of the four-key document and bind the
+    embedded checkpoint by name: its names may be in any order but must
+    name exactly the target parameters. Any digest, inner version/type
+    or name/shape violation raises ValueError.
 
     The content is fully validated before anything is committed. On
     success the embedded checkpoint restores the optimizer atomically
     (RMSprop: data, requires_grad, square_avg and hyperparameters;
     Adamax: data, requires_grad, m, u and t; Adam: data, requires_grad,
-    m, v and t; AdamW: data, requires_grad, m, v and t, keeping object
-    identities and hyperparameters), clears every grad and the tuple
+    m, v and t; AdamW: data, requires_grad, m, v and t; AMSGrad: data,
+    requires_grad, m, v, v_max and t, keeping object identities and
+    hyperparameters), clears every grad and the tuple
     (global_step, rng_state) of two ints is returned. On any failure the
     parameters, grads, slots and hyperparameters are left unchanged.
     """
-    if not isinstance(optimizer, (RMSprop, Adamax, Adam, AdamW)):
+    if not isinstance(
+        optimizer, (RMSprop, Adamax, Adam, AdamW, AMSGrad)
+    ):
         raise TypeError(
-            "optimizer must be an RMSprop, Adamax, Adam or AdamW instance"
+            "optimizer must be an RMSprop, Adamax, Adam, AdamW or AMSGrad"
+            " instance"
         )
     if not isinstance(text, str):
         raise TypeError("text must be a string")
@@ -12645,7 +12766,7 @@ def load_training_state(parameters, optimizer, text):
             _AdamParser,
         )
         return (global_step, rng_state)
-    else:
+    elif version == 4:
         # The checkpoint parser reaches kind "adamw" only through its
         # version-3 branch, so inner version 3 and type "adamw" are
         # already enforced byte for byte.
@@ -12661,6 +12782,16 @@ def load_training_state(parameters, optimizer, text):
             _check_adamw_state,
             _AdamWParser,
         )
+        return (global_step, rng_state)
+    else:
+        # The checkpoint parser reaches kind "amsgrad" only through its
+        # version-1 branch, so inner version 1 and the amsgrad object
+        # are already enforced byte for byte.
+        if kind != "amsgrad" or not isinstance(optimizer, AMSGrad):
+            raise ValueError(
+                "version 5 training state must wrap an AMSGrad checkpoint"
+            )
+        _restore_named_amsgrad(parameters, optimizer, state_text, names)
         return (global_step, rng_state)
     load_checkpoint(parameters, optimizer, checkpoint_text)
     return (global_step, rng_state)
