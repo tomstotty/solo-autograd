@@ -3506,6 +3506,113 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def log_softmax_batch(self, rows, cols):
+        data = _require_nonempty_float_vector(self, "log_softmax_batch")
+        for name, value in (("rows", rows), ("cols", cols)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(name + " must be a positive int")
+            if value <= 0:
+                raise ValueError(name + " must be a positive int")
+        total = len(data)
+        if total != rows * cols:
+            raise ValueError("data length must equal rows * cols")
+        # Snapshot the input at call time so later caller-side mutation or
+        # replacement of data can change neither the forward result nor a
+        # pending backward pass.
+        x = list(data)
+        # Per-row stable log-softmax in row-major, ascending column order:
+        # m = max of the row, s accumulated from 0.0 as s += exp(x_i - m),
+        # then l_i = x_i - m - log(s). exp is only ever evaluated on
+        # values in (-inf, 0]; exp(x_i) directly is never computed. A
+        # non-finite intermediate aborts before a result tensor exists, so
+        # no state can change on failure.
+        out_data = [0.0] * total
+        for q in range(rows):
+            base = q * cols
+            m = x[base]
+            for j in range(1, cols):
+                if x[base + j] > m:
+                    m = x[base + j]
+            diffs = []
+            s = 0.0
+            for j in range(cols):
+                diff = x[base + j] - m
+                if not math.isfinite(diff):
+                    raise ValueError(
+                        "log_softmax_batch intermediate must be finite"
+                    )
+                diffs.append(diff)
+                z_i = math.exp(diff)
+                if not math.isfinite(z_i):
+                    raise ValueError(
+                        "log_softmax_batch intermediate must be finite"
+                    )
+                s += z_i
+                if not math.isfinite(s):
+                    raise ValueError(
+                        "log_softmax_batch intermediate must be finite"
+                    )
+            log_s = math.log(s)
+            if not math.isfinite(log_s):
+                raise ValueError(
+                    "log_softmax_batch intermediate must be finite"
+                )
+            for j in range(cols):
+                l_i = diffs[j] - log_s
+                if not math.isfinite(l_i):
+                    raise ValueError(
+                        "log_softmax_batch intermediate must be finite"
+                    )
+                out_data[base + j] = l_i
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # Save a private copy of l with the graph so later mutation of the
+        # input or output data lists cannot change a pending backward pass.
+        saved_l = list(out_data)
+
+        def backward_fn(grad):
+            # Per row, in ascending column order: G accumulated from 0.0
+            # as G += g_i, then dx_i = g_i - exp(l_i) * G. Each
+            # intermediate is checked as it is produced, and the generic
+            # engine validates the contribution itself and every merge
+            # into an existing grad.
+            dx = [0.0] * total
+            for q in range(rows):
+                base = q * cols
+                G = 0.0
+                for j in range(cols):
+                    G += grad[base + j]
+                    if not math.isfinite(G):
+                        raise ValueError(
+                            "log_softmax_batch backward intermediate"
+                            " must be finite"
+                        )
+                for j in range(cols):
+                    k = base + j
+                    e = math.exp(saved_l[k])
+                    if not math.isfinite(e):
+                        raise ValueError(
+                            "log_softmax_batch backward intermediate"
+                            " must be finite"
+                        )
+                    product = e * G
+                    if not math.isfinite(product):
+                        raise ValueError(
+                            "log_softmax_batch backward intermediate"
+                            " must be finite"
+                        )
+                    contribution = grad[k] - product
+                    if not math.isfinite(contribution):
+                        raise ValueError(
+                            "log_softmax_batch backward intermediate"
+                            " must be finite"
+                        )
+                    dx[k] = contribution
+            return [(parent, dx)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def logcumsumexp(self):
         # Re-validate at call time since the data may have been mutated
         # after construction: a non-empty 1D float list. Non-list input
