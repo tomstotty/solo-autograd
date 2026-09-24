@@ -3108,6 +3108,132 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def masked_softmax(self, mask, rows, cols):
+        data = _require_nonempty_float_vector(self, "masked_softmax")
+        for name, value in (("rows", rows), ("cols", cols)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(name + " must be a positive int")
+            if value <= 0:
+                raise ValueError(name + " must be a positive int")
+        total = len(data)
+        if total != rows * cols:
+            raise ValueError("data length must equal rows * cols")
+        if not isinstance(mask, list):
+            raise TypeError("mask must be a list of bools")
+        if len(mask) != total:
+            raise ValueError("mask length must equal data length")
+        for value in mask:
+            if not isinstance(value, bool):
+                raise TypeError("mask elements must be bools")
+        for q in range(rows):
+            base = q * cols
+            if not any(mask[base:base + cols]):
+                raise ValueError("each row must contain at least one true")
+        # Snapshot the inputs at call time so later caller-side mutation
+        # or replacement of data or mask can change neither the forward
+        # result nor a pending backward pass.
+        x = list(data)
+        snapshot_mask = list(mask)
+        # Per-row stable softmax over the true positions only, in row-major
+        # and ascending column order: m = max of the row's true positions,
+        # z_i = exp(x_i - m), s = sum(z), y_i = z_i / s; false positions
+        # stay 0.0. exp is only ever evaluated on values in (-inf, 0];
+        # exp(x_i) directly is never computed. A non-finite intermediate
+        # aborts before a result tensor exists, so no state can change on
+        # failure.
+        out_data = [0.0] * total
+        for q in range(rows):
+            base = q * cols
+            m = None
+            for j in range(cols):
+                if snapshot_mask[base + j]:
+                    value = x[base + j]
+                    if m is None or value > m:
+                        m = value
+            z = []
+            s = 0.0
+            for j in range(cols):
+                k = base + j
+                if not snapshot_mask[k]:
+                    continue
+                diff = x[k] - m
+                if not math.isfinite(diff):
+                    raise ValueError(
+                        "masked_softmax intermediate must be finite"
+                    )
+                z_i = math.exp(diff)
+                if not math.isfinite(z_i):
+                    raise ValueError(
+                        "masked_softmax intermediate must be finite"
+                    )
+                z.append((k, z_i))
+                s += z_i
+                if not math.isfinite(s):
+                    raise ValueError(
+                        "masked_softmax intermediate must be finite"
+                    )
+            for k, z_i in z:
+                y_i = z_i / s
+                if not math.isfinite(y_i):
+                    raise ValueError(
+                        "masked_softmax intermediate must be finite"
+                    )
+                out_data[k] = y_i
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # Save mask and y with the graph so a pending backward pass is
+        # independent of any subsequent input or output mutation.
+        saved_mask = snapshot_mask
+        saved_y = list(out_data)
+
+        def backward_fn(grad):
+            # Per row, over the true positions in ascending column order:
+            # d = sum(g_i * y_i), then dx_i = y_i * (g_i - d); false
+            # positions contribute 0.0. Each intermediate is checked as
+            # it is produced, and the generic engine validates the
+            # contribution itself and every merge into an existing grad.
+            dx = [0.0] * total
+            for q in range(rows):
+                base = q * cols
+                d = 0.0
+                for j in range(cols):
+                    k = base + j
+                    if not saved_mask[k]:
+                        continue
+                    product = grad[k] * saved_y[k]
+                    if not math.isfinite(product):
+                        raise ValueError(
+                            "masked_softmax backward intermediate"
+                            " must be finite"
+                        )
+                    d += product
+                    if not math.isfinite(d):
+                        raise ValueError(
+                            "masked_softmax backward intermediate"
+                            " must be finite"
+                        )
+                for j in range(cols):
+                    k = base + j
+                    if not saved_mask[k]:
+                        continue
+                    difference = grad[k] - d
+                    if not math.isfinite(difference):
+                        raise ValueError(
+                            "masked_softmax backward intermediate"
+                            " must be finite"
+                        )
+                    contribution = saved_y[k] * difference
+                    if not math.isfinite(contribution):
+                        raise ValueError(
+                            "masked_softmax backward intermediate"
+                            " must be finite"
+                        )
+                    dx[k] = contribution
+            return [(parent, dx)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def log_softmax(self):
         data = _require_nonempty_float_vector(self, "log_softmax")
         out_data = _log_softmax_values(data)
