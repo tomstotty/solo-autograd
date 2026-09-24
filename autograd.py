@@ -6841,6 +6841,304 @@ class Tensor:
             backward_fn,
         )
 
+    def lstm(self, w, u, b, h0, c0, steps, input_size, hidden_size):
+        # All six operands must be Tensors.
+        for name, operand in (
+            ("w", w),
+            ("u", u),
+            ("b", b),
+            ("h0", h0),
+            ("c0", c0),
+        ):
+            if not isinstance(operand, Tensor):
+                raise TypeError(name + " must be a Tensor")
+        # The three dimensions must be non-bool positive ints.
+        for name, dim in (
+            ("steps", steps),
+            ("input_size", input_size),
+            ("hidden_size", hidden_size),
+        ):
+            if isinstance(dim, bool) or not isinstance(dim, int):
+                raise TypeError(name + " must be a positive int")
+            if dim <= 0:
+                raise ValueError(name + " must be a positive int")
+        tn = steps
+        isize = input_size
+        hsize = hidden_size
+        # All operands (self included) must hold non-empty 1D finite
+        # float lists; data may have been mutated after construction, so
+        # re-validate at call time. self is the tn*isize input sequence,
+        # w the 4h*isize input weights, u the 4h*hsize hidden weights, b
+        # the 4h bias, and h0/c0 the hsize initial states, all row-major
+        # with gate order i, f, g, o.
+        x_data = _require_nonempty_float_vector(self, "lstm")
+        w_data = _require_nonempty_float_vector(w, "lstm")
+        u_data = _require_nonempty_float_vector(u, "lstm")
+        b_data = _require_nonempty_float_vector(b, "lstm")
+        h0_data = _require_nonempty_float_vector(h0, "lstm")
+        c0_data = _require_nonempty_float_vector(c0, "lstm")
+        if len(x_data) != tn * isize:
+            raise ValueError("input length must equal steps * input_size")
+        if len(w_data) != 4 * hsize * isize:
+            raise ValueError("w length must equal 4 * hidden_size * input_size")
+        if len(u_data) != 4 * hsize * hsize:
+            raise ValueError("u length must equal 4 * hidden_size * hidden_size")
+        if len(b_data) != 4 * hsize:
+            raise ValueError("b length must equal 4 * hidden_size")
+        if len(h0_data) != hsize:
+            raise ValueError("h0 length must equal hidden_size")
+        if len(c0_data) != hsize:
+            raise ValueError("c0 length must equal hidden_size")
+        # Snapshot the inputs at call time so later caller-side mutation
+        # or replacement of any data list can change neither the forward
+        # result nor a pending backward pass.
+        snapshot_x = list(x_data)
+        snapshot_w = list(w_data)
+        snapshot_u = list(u_data)
+        snapshot_b = list(b_data)
+        snapshot_h0 = list(h0_data)
+        snapshot_c0 = list(c0_data)
+
+        def finite(value, label):
+            if not math.isfinite(value):
+                raise ValueError(label + " must be finite")
+            return value
+
+        # Forward scan in ascending t. For each step the four gate rows
+        # are visited in ascending flat index r = q*h + m (gate order
+        # i, f, g, o); each affine a starts from the bias and then
+        # accumulates input contributions followed by hidden contributions
+        # in ascending index order. i/f/o = sigmoid(a), g = tanh(a),
+        # c = f*c_prev + i*g, h = o*tanh(c). A non-finite product, sum or
+        # activation aborts before a result tensor exists, so no state can
+        # change on failure. The gate activations and states are cached for
+        # the reverse-time backward pass.
+        hs = []
+        cs = []
+        i_sig = []
+        f_sig = []
+        g_tanh = []
+        o_sig = []
+        cbar_cache = []
+        h_prev = snapshot_h0
+        c_prev = snapshot_c0
+        for t in range(tn):
+            a_gates = [0.0] * (4 * hsize)
+            for r in range(4 * hsize):
+                acc = finite(snapshot_b[r], "lstm intermediate")
+                for n in range(isize):
+                    product = snapshot_w[r * isize + n] * snapshot_x[
+                        t * isize + n
+                    ]
+                    acc = finite(
+                        acc + finite(product, "lstm intermediate"),
+                        "lstm intermediate",
+                    )
+                for n in range(hsize):
+                    product = snapshot_u[r * hsize + n] * h_prev[n]
+                    acc = finite(
+                        acc + finite(product, "lstm intermediate"),
+                        "lstm intermediate",
+                    )
+                a_gates[r] = acc
+            i_v = [0.0] * hsize
+            f_v = [0.0] * hsize
+            g_v = [0.0] * hsize
+            o_v = [0.0] * hsize
+            for m in range(hsize):
+                i_v[m] = finite(
+                    _stable_sigmoid_value(a_gates[0 * hsize + m]),
+                    "lstm intermediate",
+                )
+                f_v[m] = finite(
+                    _stable_sigmoid_value(a_gates[1 * hsize + m]),
+                    "lstm intermediate",
+                )
+                g_v[m] = finite(
+                    math.tanh(a_gates[2 * hsize + m]), "lstm intermediate"
+                )
+                o_v[m] = finite(
+                    _stable_sigmoid_value(a_gates[3 * hsize + m]),
+                    "lstm intermediate",
+                )
+            c_row = [0.0] * hsize
+            cb_row = [0.0] * hsize
+            h_row = [0.0] * hsize
+            for m in range(hsize):
+                term_f = finite(f_v[m] * c_prev[m], "lstm intermediate")
+                term_i = finite(i_v[m] * g_v[m], "lstm intermediate")
+                c_value = finite(term_f + term_i, "lstm intermediate")
+                c_row[m] = c_value
+                cb_value = finite(math.tanh(c_value), "lstm intermediate")
+                cb_row[m] = cb_value
+                h_row[m] = finite(
+                    o_v[m] * cb_value, "lstm intermediate"
+                )
+            i_sig.append(i_v)
+            f_sig.append(f_v)
+            g_tanh.append(g_v)
+            o_sig.append(o_v)
+            cbar_cache.append(cb_row)
+            cs.append(c_row)
+            hs.append(h_row)
+            h_prev = h_row
+            c_prev = c_row
+        # Output is the tn*hsize sequence of hidden states, row-major.
+        out_data = []
+        for t in range(tn):
+            for m in range(hsize):
+                out_data.append(hs[t][m])
+        if not any(
+            parent.requires_grad
+            for parent in (self, w, u, b, h0, c0)
+        ):
+            return Tensor._make(out_data, False, (), None)
+        parent_x = self
+        parent_w = w
+        parent_u = u
+        parent_b = b
+        parent_h0 = h0
+        parent_c0 = c0
+
+        def backward_fn(grad):
+            # Reverse-time chain rule through the recurrence above. Each
+            # gradient buffer is accumulated from 0.0 in ascending index
+            # order; every product, partial sum and role merge is checked
+            # for finiteness as it is produced, and the generic engine
+            # additionally validates each submitted contribution.
+            dw = [0.0] * (4 * hsize * isize)
+            du = [0.0] * (4 * hsize * hsize)
+            db = [0.0] * (4 * hsize)
+            dx = [0.0] * (tn * isize)
+            dh0 = [0.0] * hsize
+            dc0 = [0.0] * hsize
+            # Gradients of h[t] and c[t] contributed by step t+1.
+            dh_next = [0.0] * hsize
+            dc_next = [0.0] * hsize
+            label = "lstm backward intermediate"
+
+            def addf(buffer, index, value):
+                result = buffer[index] + finite(value, label)
+                buffer[index] = finite(result, label)
+
+            for t in range(tn - 1, -1, -1):
+                x_row = snapshot_x[t * isize:(t + 1) * isize]
+                h_previous = snapshot_h0 if t == 0 else hs[t - 1]
+                c_previous = snapshot_c0 if t == 0 else cs[t - 1]
+                i_v = i_sig[t]
+                f_v = f_sig[t]
+                g_v = g_tanh[t]
+                o_v = o_sig[t]
+                cb_row = cbar_cache[t]
+                da = [0.0] * (4 * hsize)
+                dc_row = [0.0] * hsize
+                for m in range(hsize):
+                    # Total grad of h[t]: upstream output plus the carry
+                    # from step t+1; c[t] also receives the carry from
+                    # c[t+1]. h[t] = o*tanh(c[t]).
+                    dh_total = finite(
+                        grad[t * hsize + m] + dh_next[m], label
+                    )
+                    do_v = finite(dh_total * cb_row[m], label)
+                    d_cb = finite(dh_total * o_v[m], label)
+                    cb_sq = finite(cb_row[m] * cb_row[m], label)
+                    dc_h = finite(
+                        d_cb * finite(1.0 - cb_sq, label), label
+                    )
+                    dc = finite(dc_next[m] + dc_h, label)
+                    dc_row[m] = dc
+                    # c[t] = f*c_prev + i*g.
+                    di_v = finite(dc * g_v[m], label)
+                    dg_v = finite(dc * i_v[m], label)
+                    df_v = finite(dc * c_previous[m], label)
+                    # da for a sigmoid gate with activation s is
+                    # (upstream * s) * (1 - s), left-associative to match
+                    # the framework's sigmoid backward; the g gate uses
+                    # tanh: dg * (1 - g*g).
+                    di_s = finite(di_v * i_v[m], label)
+                    da[0 * hsize + m] = finite(
+                        di_s * finite(1.0 - i_v[m], label), label
+                    )
+                    df_s = finite(df_v * f_v[m], label)
+                    da[1 * hsize + m] = finite(
+                        df_s * finite(1.0 - f_v[m], label), label
+                    )
+                    g_sq = finite(g_v[m] * g_v[m], label)
+                    da[2 * hsize + m] = finite(
+                        dg_v * finite(1.0 - g_sq, label), label
+                    )
+                    do_s = finite(do_v * o_v[m], label)
+                    da[3 * hsize + m] = finite(
+                        do_s * finite(1.0 - o_v[m], label), label
+                    )
+                # Parameter grads: visit gate rows ascending, and within a
+                # row input indices before hidden indices, each from 0.0.
+                for r in range(4 * hsize):
+                    a = da[r]
+                    addf(db, r, a)
+                    for n in range(isize):
+                        addf(dw, r * isize + n, a * x_row[n])
+                    for n in range(hsize):
+                        addf(du, r * hsize + n, a * h_previous[n])
+                # Input grad for this step: ascending n, gate rows r.
+                for n in range(isize):
+                    acc = 0.0
+                    for r in range(4 * hsize):
+                        product = da[r] * snapshot_w[r * isize + n]
+                        acc = finite(
+                            acc + finite(product, label), label
+                        )
+                    dx[t * isize + n] = finite(acc, label)
+                # Grad carried to h[t-1] through U: ascending n, rows r.
+                dh_previous = [0.0] * hsize
+                for n in range(hsize):
+                    acc = 0.0
+                    for r in range(4 * hsize):
+                        product = da[r] * snapshot_u[r * hsize + n]
+                        acc = finite(
+                            acc + finite(product, label), label
+                        )
+                    dh_previous[n] = finite(acc, label)
+                # Cell state carries through the forget gate.
+                if t == 0:
+                    for m in range(hsize):
+                        dc0[m] = finite(dc_row[m] * f_v[m], label)
+                    dh0 = dh_previous
+                else:
+                    for m in range(hsize):
+                        dc_next[m] = finite(dc_row[m] * f_v[m], label)
+                    dh_next = dh_previous
+            # One object may play several roles; merge such roles into one
+            # contribution per tensor, and submit only parents that
+            # require grad.
+            merged = {}
+            roles = (
+                (parent_x, dx),
+                (parent_w, dw),
+                (parent_u, du),
+                (parent_b, db),
+                (parent_h0, dh0),
+                (parent_c0, dc0),
+            )
+            for parent, value in roles:
+                if not parent.requires_grad:
+                    continue
+                entry = merged.get(id(parent))
+                if entry is None:
+                    merged[id(parent)] = [parent, value]
+                else:
+                    combined = _merge_grad(entry[1], value)
+                    _ensure_finite_grad(combined)
+                    entry[1] = combined
+            return [(entry[0], entry[1]) for entry in merged.values()]
+
+        return Tensor._make(
+            out_data,
+            True,
+            (parent_x, parent_w, parent_u, parent_b, parent_h0, parent_c0),
+            backward_fn,
+        )
+
     def zero_grad(self):
         self.grad = None
         return None
