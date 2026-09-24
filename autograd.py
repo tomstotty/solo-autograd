@@ -6810,6 +6810,275 @@ class Tensor:
             backward_fn,
         )
 
+    def batch_norm2d(self, weight, bias, batch, channels, height, width,
+                     eps=1e-5):
+        if not isinstance(weight, Tensor):
+            raise TypeError("weight must be a Tensor")
+        if not isinstance(bias, Tensor):
+            raise TypeError("bias must be a Tensor")
+        # The four dimensions must be non-bool positive ints.
+        for name, value in (
+            ("batch", batch),
+            ("channels", channels),
+            ("height", height),
+            ("width", width),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(name + " must be a positive int")
+            if value <= 0:
+                raise ValueError(name + " must be a positive int")
+        # All three operands must hold non-empty 1D finite float lists;
+        # the data may have been mutated after construction, so
+        # re-validate at call time.
+        x_data = _require_nonempty_float_vector(self, "batch_norm2d")
+        w_data = _require_nonempty_float_vector(weight, "batch_norm2d")
+        b_data = _require_nonempty_float_vector(bias, "batch_norm2d")
+        B, C, H, W = batch, channels, height, width
+        if len(x_data) != B * C * H * W:
+            raise ValueError(
+                "batch_norm2d input length must equal"
+                " batch * channels * height * width"
+            )
+        if len(w_data) != C:
+            raise ValueError(
+                "batch_norm2d weight length must equal channels"
+            )
+        if len(b_data) != C:
+            raise ValueError(
+                "batch_norm2d bias length must equal channels"
+            )
+        if isinstance(eps, bool) or not isinstance(eps, float):
+            raise TypeError("eps must be a positive finite float")
+        if not math.isfinite(eps) or eps <= 0.0:
+            raise ValueError("eps must be a positive finite float")
+        # Snapshot all three operands so later caller-side mutation or
+        # replacement can change neither the forward result nor a pending
+        # backward pass.
+        x = list(x_data)
+        w = list(w_data)
+        b = list(b_data)
+        M = B * H * W
+        spatial = H * W
+        # The input is flattened row-major as (n, c, r, s), so channel c of
+        # batch n occupies the contiguous block of H*W values starting at
+        # (n*C+c)*H*W. Per channel, accumulate from 0.0 in ascending
+        # (n, r, s) order: mu = sum(x)/M, c_i = x_i - mu,
+        # v = sum(c_i*c_i)/M, h_i = c_i/sqrt(v+eps),
+        # y_i = w[c]*h_i + b[c]. A non-finite intermediate aborts before a
+        # result tensor exists, so no state can change on failure.
+        out_data = [0.0] * (B * C * H * W)
+        normalized = [0.0] * (B * C * H * W)
+        scales = []
+        for c in range(C):
+            total = 0.0
+            for n in range(B):
+                base = (n * C + c) * spatial
+                for i in range(spatial):
+                    total += x[base + i]
+                    if not math.isfinite(total):
+                        raise ValueError(
+                            "batch_norm2d intermediate must be finite"
+                        )
+            mu = total / M
+            if not math.isfinite(mu):
+                raise ValueError(
+                    "batch_norm2d intermediate must be finite"
+                )
+            var_sum = 0.0
+            for n in range(B):
+                base = (n * C + c) * spatial
+                for i in range(spatial):
+                    c_i = x[base + i] - mu
+                    if not math.isfinite(c_i):
+                        raise ValueError(
+                            "batch_norm2d intermediate must be finite"
+                        )
+                    square = c_i * c_i
+                    if not math.isfinite(square):
+                        raise ValueError(
+                            "batch_norm2d intermediate must be finite"
+                        )
+                    var_sum += square
+                    if not math.isfinite(var_sum):
+                        raise ValueError(
+                            "batch_norm2d intermediate must be finite"
+                        )
+            var = var_sum / M
+            if not math.isfinite(var):
+                raise ValueError(
+                    "batch_norm2d intermediate must be finite"
+                )
+            denom = var + eps
+            if not math.isfinite(denom):
+                raise ValueError(
+                    "batch_norm2d intermediate must be finite"
+                )
+            sd = math.sqrt(denom)
+            if not math.isfinite(sd):
+                raise ValueError(
+                    "batch_norm2d intermediate must be finite"
+                )
+            w_c = w[c]
+            b_c = b[c]
+            for n in range(B):
+                base = (n * C + c) * spatial
+                for i in range(spatial):
+                    idx = base + i
+                    h_i = (x[idx] - mu) / sd
+                    if not math.isfinite(h_i):
+                        raise ValueError(
+                            "batch_norm2d intermediate must be finite"
+                        )
+                    normalized[idx] = h_i
+                    product = w_c * h_i
+                    if not math.isfinite(product):
+                        raise ValueError(
+                            "batch_norm2d intermediate must be finite"
+                        )
+                    y_i = product + b_c
+                    if not math.isfinite(y_i):
+                        raise ValueError(
+                            "batch_norm2d intermediate must be finite"
+                        )
+                    out_data[idx] = y_i
+            scales.append(sd)
+        grad_validator = lambda g: _validate_vector_grad(g, B * C * H * W)
+        if not (
+            self.requires_grad
+            or weight.requires_grad
+            or bias.requires_grad
+        ):
+            return Tensor._make(
+                out_data, False, (), None, grad_validator=grad_validator
+            )
+        parent_self, parent_weight, parent_bias = self, weight, bias
+        # Save w, the per-channel sqrt(v+eps) scales and the normalized
+        # values with the graph so a pending backward pass is independent
+        # of any subsequent data mutation.
+        saved_w = w
+        saved_scales = scales
+        saved_h = normalized
+
+        def backward_fn(grad):
+            # Per channel, accumulate G = sum(g) and Q = sum(g_i*h_i) from
+            # 0.0 in ascending (n, r, s) order, then
+            # dx_i = (w[c]/sqrt(v+eps)) * (M*g_i - G - h_i*Q) / M,
+            # dw[c] = Q, db[c] = G. Only the sides that require grad are
+            # computed and submitted; a non-finite intermediate aborts the
+            # whole pass before any grad is written.
+            dx = (
+                [0.0] * (B * C * H * W)
+                if parent_self.requires_grad
+                else None
+            )
+            dw = [0.0] * C if parent_weight.requires_grad else None
+            db = [0.0] * C if parent_bias.requires_grad else None
+            for c in range(C):
+                G = 0.0
+                Q = 0.0
+                for n in range(B):
+                    base = (n * C + c) * spatial
+                    for i in range(spatial):
+                        idx = base + i
+                        G += grad[idx]
+                        if not math.isfinite(G):
+                            raise ValueError(
+                                "batch_norm2d backward intermediate must be"
+                                " finite"
+                            )
+                        product = grad[idx] * saved_h[idx]
+                        if not math.isfinite(product):
+                            raise ValueError(
+                                "batch_norm2d backward intermediate must be"
+                                " finite"
+                            )
+                        Q += product
+                        if not math.isfinite(Q):
+                            raise ValueError(
+                                "batch_norm2d backward intermediate must be"
+                                " finite"
+                            )
+                if dw is not None:
+                    dw[c] = Q
+                if db is not None:
+                    db[c] = G
+                if dx is not None:
+                    scale = saved_w[c] / saved_scales[c]
+                    if not math.isfinite(scale):
+                        raise ValueError(
+                            "batch_norm2d backward intermediate must be"
+                            " finite"
+                        )
+                    for n in range(B):
+                        base = (n * C + c) * spatial
+                        for i in range(spatial):
+                            idx = base + i
+                            scaled = M * grad[idx]
+                            if not math.isfinite(scaled):
+                                raise ValueError(
+                                    "batch_norm2d backward intermediate"
+                                    " must be finite"
+                                )
+                            shifted = scaled - G
+                            if not math.isfinite(shifted):
+                                raise ValueError(
+                                    "batch_norm2d backward intermediate"
+                                    " must be finite"
+                                )
+                            correction = saved_h[idx] * Q
+                            if not math.isfinite(correction):
+                                raise ValueError(
+                                    "batch_norm2d backward intermediate"
+                                    " must be finite"
+                                )
+                            bracket = shifted - correction
+                            if not math.isfinite(bracket):
+                                raise ValueError(
+                                    "batch_norm2d backward intermediate"
+                                    " must be finite"
+                                )
+                            product = scale * bracket
+                            if not math.isfinite(product):
+                                raise ValueError(
+                                    "batch_norm2d backward intermediate"
+                                    " must be finite"
+                                )
+                            dx_i = product / M
+                            if not math.isfinite(dx_i):
+                                raise ValueError(
+                                    "batch_norm2d backward intermediate"
+                                    " must be finite"
+                                )
+                            dx[idx] = dx_i
+            # The same object may play several roles; merge such roles into
+            # one contribution per tensor, and submit only parents that
+            # require grad.
+            merged = {}
+            roles = (
+                (parent_self, dx),
+                (parent_weight, dw),
+                (parent_bias, db),
+            )
+            for parent, value in roles:
+                if not parent.requires_grad:
+                    continue
+                entry = merged.get(id(parent))
+                if entry is None:
+                    merged[id(parent)] = [parent, value]
+                else:
+                    combined = _merge_grad(entry[1], value)
+                    _ensure_finite_grad(combined)
+                    entry[1] = combined
+            return [(entry[0], entry[1]) for entry in merged.values()]
+
+        return Tensor._make(
+            out_data,
+            True,
+            (parent_self, parent_weight, parent_bias),
+            backward_fn,
+            grad_validator=grad_validator,
+        )
+
     def gather(self, indices):
         data = _require_nonempty_float_vector(self, "gather")
         if not isinstance(indices, list):
