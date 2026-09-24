@@ -3232,6 +3232,108 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def max(self):
+        # Re-validate at call time since the data may have been mutated
+        # after construction: a finite float scalar or a non-empty 1D
+        # float list. bools, ints, nested lists and other types are a
+        # TypeError; an empty list or any non-finite value is a
+        # ValueError.
+        data = _validate_data(self.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        if isinstance(data, list):
+            # Compare in ascending index order, keeping the first value
+            # strictly greater than every predecessor. Inputs are
+            # already finite, so the result is finite.
+            out_data = data[0]
+            for value in data[1:]:
+                if value > out_data:
+                    out_data = value
+        else:
+            # A scalar's maximum is the scalar itself.
+            out_data = data
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # _validate_data already returns a fresh list for vector input,
+        # so `data` is a snapshot: later caller-side mutation or
+        # replacement of the input cannot change a pending backward pass.
+        snapshot = data
+
+        def backward_fn(grad):
+            # Scalar input: the contribution is g itself. Vector input:
+            # every position strictly equal to the snapshot maximum
+            # (collected in ascending index order) shares the upstream
+            # grad equally, g / c with c the number of tied positions;
+            # all other positions receive 0.0.
+            if not isinstance(snapshot, list):
+                return [(parent, grad)]
+            positions = [
+                i for i, value in enumerate(snapshot) if value == out_data
+            ]
+            share = grad / len(positions)
+            if not math.isfinite(share):
+                raise ValueError(
+                    "max backward intermediate must be finite"
+                )
+            contribution = [0.0] * len(snapshot)
+            for i in positions:
+                contribution[i] = share
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
+    def min(self):
+        # Re-validate at call time since the data may have been mutated
+        # after construction: a finite float scalar or a non-empty 1D
+        # float list. bools, ints, nested lists and other types are a
+        # TypeError; an empty list or any non-finite value is a
+        # ValueError.
+        data = _validate_data(self.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        if isinstance(data, list):
+            # Compare in ascending index order, keeping the first value
+            # strictly smaller than every predecessor. Inputs are
+            # already finite, so the result is finite.
+            out_data = data[0]
+            for value in data[1:]:
+                if value < out_data:
+                    out_data = value
+        else:
+            # A scalar's minimum is the scalar itself.
+            out_data = data
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # _validate_data already returns a fresh list for vector input,
+        # so `data` is a snapshot: later caller-side mutation or
+        # replacement of the input cannot change a pending backward pass.
+        snapshot = data
+
+        def backward_fn(grad):
+            # Scalar input: the contribution is g itself. Vector input:
+            # every position strictly equal to the snapshot minimum
+            # (collected in ascending index order) shares the upstream
+            # grad equally, g / c with c the number of tied positions;
+            # all other positions receive 0.0.
+            if not isinstance(snapshot, list):
+                return [(parent, grad)]
+            positions = [
+                i for i, value in enumerate(snapshot) if value == out_data
+            ]
+            share = grad / len(positions)
+            if not math.isfinite(share):
+                raise ValueError(
+                    "min backward intermediate must be finite"
+                )
+            contribution = [0.0] * len(snapshot)
+            for i in positions:
+                contribution[i] = share
+            return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
     def cumprod(self):
         # One-dimensional prefix product. Re-validate at call time since
         # the data may have been mutated after construction: data must be
