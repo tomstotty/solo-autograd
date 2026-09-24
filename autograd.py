@@ -3316,6 +3316,98 @@ class Tensor:
             grad_validator=lambda g: _validate_vector_grad(g, n),
         )
 
+    def cumsum(self, exclusive=False, reverse=False):
+        # One-dimensional cumulative sum in four differentiable modes
+        # (inclusive/exclusive x forward/reverse). Re-validate at call
+        # time since the data may have been mutated after construction:
+        # data must be a non-empty 1D list of finite floats (anything
+        # that is not a list, including a scalar, and an empty list are
+        # ValueError; a non-float element is TypeError), requires_grad
+        # and both flags must be bools (TypeError), and non-finite
+        # elements are ValueError.
+        data = self.data
+        if not isinstance(data, list) or len(data) == 0:
+            raise ValueError("cumsum requires a non-empty 1D float list")
+        for value in data:
+            if isinstance(value, bool) or not isinstance(value, float):
+                raise TypeError("cumsum data elements must be floats")
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        for value in data:
+            if not math.isfinite(value):
+                raise ValueError("cumsum data elements must be finite")
+        if not isinstance(exclusive, bool) or not isinstance(
+            reverse, bool
+        ):
+            raise TypeError("cumsum exclusive and reverse must be bools")
+        # Snapshot the input, its length and the two flags so later
+        # caller-side mutation or replacement of self.data changes
+        # neither the forward result nor a pending backward pass.
+        snapshot = list(data)
+        n = len(snapshot)
+        snap_exclusive = exclusive
+        snap_reverse = reverse
+        # Accumulate from 0.0: ascending i when reverse is False,
+        # descending i when True. Exclusive mode writes the running sum
+        # before adding x[i], inclusive mode adds first. A non-finite
+        # partial sum aborts before a result tensor exists, so the input
+        # and all graph state stay untouched.
+        out_data = [0.0] * n
+        acc = 0.0
+        indices = range(n - 1, -1, -1) if snap_reverse else range(n)
+        for i in indices:
+            if snap_exclusive:
+                out_data[i] = acc
+                acc += snapshot[i]
+            else:
+                acc += snapshot[i]
+                out_data[i] = acc
+            if not math.isfinite(acc) or not math.isfinite(out_data[i]):
+                raise ValueError("cumsum intermediate must be finite")
+        if not self.requires_grad:
+            return Tensor._make(
+                out_data, False, (), None,
+                grad_validator=lambda g: _validate_vector_grad(g, n),
+            )
+        parent = self
+
+        def backward_fn(grad):
+            # The Jacobian entries are 0 or 1, so dx[j] is the sum of
+            # grad[i] over:
+            #   reverse False, inclusive: i >= j;  exclusive: i > j
+            #   reverse True,  inclusive: i <= j;  exclusive: i < j
+            # Each dx[j] is accumulated from 0.0 in strictly ascending i
+            # order. A non-finite contribution or partial sum aborts the
+            # whole pass before any grad is written; the engine handles
+            # merging into an existing grad the same way.
+            dx = [0.0] * n
+            for j in range(n):
+                if snap_reverse:
+                    i_range = range(0, j) if snap_exclusive else range(0, j + 1)
+                else:
+                    i_range = (
+                        range(j + 1, n) if snap_exclusive else range(j, n)
+                    )
+                total = 0.0
+                for i in i_range:
+                    term = grad[i]
+                    if not math.isfinite(term):
+                        raise ValueError(
+                            "cumsum backward intermediate must be finite"
+                        )
+                    total += term
+                    if not math.isfinite(total):
+                        raise ValueError(
+                            "cumsum backward intermediate must be finite"
+                        )
+                dx[j] = total
+            return [(parent, dx)]
+
+        return Tensor._make(
+            out_data, True, (parent,), backward_fn,
+            grad_validator=lambda g: _validate_vector_grad(g, n),
+        )
+
     def mean(self):
         # Re-validate at call time since the data may have been mutated
         # after construction: a finite float scalar or a non-empty 1D
