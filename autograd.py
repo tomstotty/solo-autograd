@@ -153,6 +153,26 @@ def _validate_grad(grad, like):
     raise TypeError("grad must be a float or a list of floats")
 
 
+def _validate_vector_grad(grad, length):
+    """Validate an outgoing gradient for a vector-only op.
+
+    Mirrors Tensor.backward's own rules for a non-scalar result, with
+    one deliberate difference: any *scalar* (bool, int or float) is a
+    shape mismatch (ValueError), even bools and ints, which the generic
+    path otherwise rejects as a TypeError. None and every other
+    non-list type remain a TypeError.
+    """
+    if grad is None:
+        raise TypeError("grad must not be None")
+    if isinstance(grad, list):
+        if len(grad) != length:
+            raise ValueError("grad shape must match tensor shape")
+        return [_as_finite_float(x) for x in grad]
+    if isinstance(grad, bool) or isinstance(grad, (int, float)):
+        raise ValueError("grad shape must match tensor shape")
+    raise TypeError("grad must be a float or a list of floats")
+
+
 def _require_nonempty_float_vector(tensor, op):
     """Validate the shared log_softmax/cross_entropy preconditions."""
     data = tensor.data
@@ -243,9 +263,11 @@ class Tensor:
         self._parents = ()
         self._backward_fn = None
         self._backward_record = None
+        self._grad_validator = None
 
     @classmethod
-    def _make(cls, data, requires_grad, parents, backward_fn):
+    def _make(cls, data, requires_grad, parents, backward_fn,
+              grad_validator=None):
         obj = cls.__new__(cls)
         obj.data = data
         obj.requires_grad = requires_grad
@@ -253,6 +275,7 @@ class Tensor:
         obj._parents = parents
         obj._backward_fn = backward_fn
         obj._backward_record = None
+        obj._grad_validator = grad_validator
         return obj
 
     def _coerce(self, other):
@@ -1811,7 +1834,8 @@ class Tensor:
             return [(entry[0], entry[1]) for entry in merged.values()]
 
         return Tensor._make(
-            out_data, True, (parent_self, parent_other), backward_fn
+            out_data, True, (parent_self, parent_other), backward_fn,
+            _validate_vector_grad,
         )
 
     def linear(self, weight, bias):
@@ -3202,6 +3226,75 @@ class Tensor:
                     )
                 contribution.append(value)
             return [(parent, contribution)]
+
+        return Tensor._make(out_data, True, (parent,), backward_fn)
+
+    def cumprod(self):
+        # One-dimensional prefix product. The data must be a non-empty
+        # 1D list of finite floats (a scalar, unlike with prod, is a
+        # ValueError); elements that are not floats and a non-bool
+        # requires_grad are a TypeError. Data may have been mutated after
+        # construction, so re-validate at call time.
+        data = _require_nonempty_float_vector(self, "cumprod")
+        # Snapshot the input so later caller-side mutation cannot change
+        # either the forward result or a pending backward pass.
+        x = list(data)
+        n = len(x)
+        # y[i] = x[0] * ... * x[i], accumulated from 1.0 in ascending
+        # index order; a non-finite partial product aborts before a result
+        # tensor exists, so the input and every other state stays
+        # untouched on failure.
+        out_data = []
+        acc = 1.0
+        for i in range(n):
+            acc *= x[i]
+            if not math.isfinite(acc):
+                raise ValueError("cumprod intermediate must be finite")
+            out_data.append(acc)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+
+        def backward_fn(grad):
+            # dx[j] = sum_{i=j}^{n-1} grad[i] * prod(x[0:i+1] except x[j]).
+            # For each j in ascending order, the cofactor starts as the
+            # strictly ascending product x[0] * ... * x[j-1] (the empty
+            # product is 1.0), then gains x[i] as i advances; it is never
+            # derived as y[i] / x[j], so zero elements differentiate
+            # naturally. Every cofactor product, term and partial sum is
+            # checked as it is produced, and the generic engine validates
+            # the contribution itself and every merge into an existing
+            # grad. Raising here aborts the whole pass before any grad is
+            # written.
+            dx = [0.0] * n
+            for j in range(n):
+                cofactor = 1.0
+                for k in range(j):
+                    cofactor *= x[k]
+                    if not math.isfinite(cofactor):
+                        raise ValueError(
+                            "cumprod backward intermediate must be finite"
+                        )
+                partial = 0.0
+                for i in range(j, n):
+                    if i > j:
+                        cofactor *= x[i]
+                        if not math.isfinite(cofactor):
+                            raise ValueError(
+                                "cumprod backward intermediate must be finite"
+                            )
+                    term = grad[i] * cofactor
+                    if not math.isfinite(term):
+                        raise ValueError(
+                            "cumprod backward intermediate must be finite"
+                        )
+                    partial += term
+                    if not math.isfinite(partial):
+                        raise ValueError(
+                            "cumprod backward intermediate must be finite"
+                        )
+                dx[j] = partial
+            return [(parent, dx)]
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
@@ -7465,6 +7558,12 @@ class Tensor:
                     "grad must be provided for a non-scalar tensor"
                 )
             grad = 1.0
+        elif self._grad_validator is not None:
+            # Ops whose result is always a vector install an op-specific
+            # validator; this also remaps error types the generic rules
+            # would assign differently (e.g. a bool/int scalar for a
+            # vector result is a shape mismatch, hence ValueError).
+            grad = self._grad_validator(grad, len(self.data))
         elif grad is None:
             raise TypeError("grad must not be None")
         else:
