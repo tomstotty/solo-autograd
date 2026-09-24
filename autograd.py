@@ -42,6 +42,22 @@ def _validate_data(data):
     )
 
 
+def _validate_condition(condition):
+    """Return a condition normalized to a bool or a non-empty bool list."""
+    if isinstance(condition, bool):
+        return condition
+    if isinstance(condition, list):
+        if len(condition) == 0:
+            raise ValueError("condition list must be non-empty")
+        for value in condition:
+            if not isinstance(value, bool):
+                raise TypeError("condition elements must be bools")
+        return list(condition)
+    raise TypeError(
+        "condition must be a bool or a non-empty list of bools"
+    )
+
+
 def _ensure_finite_data(data):
     """ValueError if a forward result contains a non-finite value."""
     values = data if isinstance(data, list) else [data]
@@ -647,6 +663,128 @@ class Tensor:
                         if not math.isfinite(total):
                             raise ValueError(
                                 "maximum backward intermediate must be finite"
+                            )
+                    roles.append((parent_other, total))
+            # The same object may play both sides; merge such roles into one
+            # contribution per tensor, submitting only parents that require
+            # grad.
+            merged = {}
+            for parent, value in roles:
+                entry = merged.get(id(parent))
+                if entry is None:
+                    merged[id(parent)] = [parent, value]
+                else:
+                    combined = _merge_grad(entry[1], value)
+                    _ensure_finite_grad(combined)
+                    entry[1] = combined
+            return [(entry[0], entry[1]) for entry in merged.values()]
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_other), backward_fn
+        )
+
+    def where(self, condition, other):
+        # condition is accepted as a bool or a non-empty list of bools only;
+        # any other container/element type is a TypeError and an empty list
+        # is a ValueError. other is a Tensor or a finite float only; bools,
+        # ints and anything else are a TypeError and a non-finite float is a
+        # ValueError.
+        cond = _validate_condition(condition)
+        other = self._coerce(other)
+        a = _validate_data(self.data)
+        b = _validate_data(other.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        if not isinstance(other.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        a_vector = isinstance(a, list)
+        b_vector = isinstance(b, list)
+        c_vector = isinstance(cond, list)
+        # A list on the condition or either data side makes the output a
+        # vector; every list must share one length. Scalars and a scalar
+        # condition broadcast.
+        output_vector = a_vector or b_vector or c_vector
+        if output_vector:
+            lengths = []
+            if a_vector:
+                lengths.append(len(a))
+            if b_vector:
+                lengths.append(len(b))
+            if c_vector:
+                lengths.append(len(cond))
+            n_outputs = lengths[0]
+            for length in lengths:
+                if length != n_outputs:
+                    raise ValueError("vector lengths must match")
+        else:
+            n_outputs = 1
+        # Select self at indices where the condition is true and other
+        # elsewhere, in ascending output-index order. Inputs are already
+        # finite, so every selection is finite; the explicit finite check
+        # still aborts before a result tensor exists, leaving all inputs
+        # untouched on failure.
+        out_values = []
+        for i in range(n_outputs):
+            take_self = cond[i] if c_vector else cond
+            if take_self:
+                out_values.append(a[i] if a_vector else a)
+            else:
+                out_values.append(b[i] if b_vector else b)
+        out_data = out_values if output_vector else out_values[0]
+        _ensure_finite_data(out_data)
+        if not (self.requires_grad or other.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_other = self, other
+        # Snapshot the condition and both operand shapes (and vector values,
+        # via the already-copied normalized inputs) so later caller-side
+        # mutation or replacement of the condition or either data list
+        # cannot change what a pending backward pass credits.
+        snapshot_cond = list(cond) if c_vector else cond
+
+        def backward_fn(grad):
+            grad_values = grad if isinstance(grad, list) else [grad]
+            da_values = [0.0] * n_outputs
+            db_values = [0.0] * n_outputs
+            # Hand the whole outgoing element to the selected side and 0.0
+            # to the other, in ascending output-index order.
+            for i in range(n_outputs):
+                g = grad_values[i]
+                if not math.isfinite(g):
+                    raise ValueError(
+                        "where backward intermediate must be finite"
+                    )
+                take_self = (
+                    snapshot_cond[i] if c_vector else snapshot_cond
+                )
+                if take_self:
+                    da_values[i] = g
+                else:
+                    db_values[i] = g
+            roles = []
+            if parent_self.requires_grad:
+                if a_vector:
+                    roles.append((parent_self, da_values))
+                else:
+                    # A broadcast scalar parent reduces by accumulating
+                    # from 0.0 in ascending output-index order.
+                    total = 0.0
+                    for value in da_values:
+                        total += value
+                        if not math.isfinite(total):
+                            raise ValueError(
+                                "where backward intermediate must be finite"
+                            )
+                    roles.append((parent_self, total))
+            if parent_other.requires_grad:
+                if b_vector:
+                    roles.append((parent_other, db_values))
+                else:
+                    total = 0.0
+                    for value in db_values:
+                        total += value
+                        if not math.isfinite(total):
+                            raise ValueError(
+                                "where backward intermediate must be finite"
                             )
                     roles.append((parent_other, total))
             # The same object may play both sides; merge such roles into one
