@@ -7143,6 +7143,304 @@ class Tensor:
             backward_fn,
         )
 
+    def gru(self, w, u, b, h0, steps, input_size, hidden_size):
+        if not isinstance(w, Tensor):
+            raise TypeError("w must be a Tensor")
+        if not isinstance(u, Tensor):
+            raise TypeError("u must be a Tensor")
+        if not isinstance(b, Tensor):
+            raise TypeError("b must be a Tensor")
+        if not isinstance(h0, Tensor):
+            raise TypeError("h0 must be a Tensor")
+        # All five operands must hold non-empty 1D finite float lists; data
+        # may have been mutated after construction, so re-validate at call
+        # time.
+        x_data = _require_nonempty_float_vector(self, "gru")
+        w_data = _require_nonempty_float_vector(w, "gru")
+        u_data = _require_nonempty_float_vector(u, "gru")
+        b_data = _require_nonempty_float_vector(b, "gru")
+        h0_data = _require_nonempty_float_vector(h0, "gru")
+        for name, value in (
+            ("steps", steps),
+            ("input_size", input_size),
+            ("hidden_size", hidden_size),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(name + " must be a positive int")
+            if value <= 0:
+                raise ValueError(name + " must be a positive int")
+        Tn = steps
+        I = input_size
+        H = hidden_size
+        G = 3 * H
+        # self is the Tn x I input sequence in row-major order; w stores
+        # the 3H x I input weights, u the 3H x H hidden weights and b the
+        # length-3H bias, all row-major with gate rows ordered z, r, n.
+        if len(x_data) != Tn * I:
+            raise ValueError(
+                "gru input length must equal steps * input_size"
+            )
+        if len(w_data) != G * I:
+            raise ValueError(
+                "gru w length must equal 3 * hidden_size * input_size"
+            )
+        if len(u_data) != G * H:
+            raise ValueError(
+                "gru u length must equal 3 * hidden_size * hidden_size"
+            )
+        if len(b_data) != G:
+            raise ValueError("gru b length must equal 3 * hidden_size")
+        if len(h0_data) != H:
+            raise ValueError("gru h0 length must equal hidden_size")
+        # Snapshot all five operands so later caller-side mutation or
+        # replacement of any input can change neither the forward result
+        # nor a pending backward pass.
+        snapshot_x = list(x_data)
+        snapshot_w = list(w_data)
+        snapshot_u = list(u_data)
+        snapshot_b = list(b_data)
+        snapshot_h0 = list(h0_data)
+        needs_grad = (
+            self.requires_grad
+            or w.requires_grad
+            or u.requires_grad
+            or b.requires_grad
+            or h0.requires_grad
+        )
+        # For each step t and gate row j (both ascending), the affine
+        # pre-activation a starts from b[j] and accumulates the input
+        # contributions w[j*I+k]*x[t*I+k] in ascending index order. The
+        # z/r rows then accumulate u[j*H+k]*h_prev[k] and take the stable
+        # sigmoid; the n row accumulates u[j*H+k]*(r[k]*h_prev[k]) and
+        # takes tanh. h = (1 - z)*n + z*h_prev. A non-finite product or
+        # partial sum aborts before a result tensor exists, so no state
+        # changes.
+        out_data = []
+        saved = []
+        h_prev = snapshot_h0
+        for t in range(Tn):
+            a = [0.0] * G
+            xbase = t * I
+            for j in range(G):
+                acc = snapshot_b[j]
+                base = j * I
+                for k in range(I):
+                    product = snapshot_w[base + k] * snapshot_x[xbase + k]
+                    if not math.isfinite(product):
+                        raise ValueError(
+                            "gru intermediate must be finite"
+                        )
+                    acc += product
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "gru intermediate must be finite"
+                        )
+                a[j] = acc
+            # z and r rows: add the hidden contributions and apply the
+            # stable sigmoid. r is needed by the n row below.
+            gate_z = [0.0] * H
+            gate_r = [0.0] * H
+            for j in range(2 * H):
+                acc = a[j]
+                hbase = j * H
+                for k in range(H):
+                    product = snapshot_u[hbase + k] * h_prev[k]
+                    if not math.isfinite(product):
+                        raise ValueError(
+                            "gru intermediate must be finite"
+                        )
+                    acc += product
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "gru intermediate must be finite"
+                        )
+                a[j] = acc
+            for k in range(H):
+                gate_z[k] = _stable_sigmoid_value(a[k])
+                gate_r[k] = _stable_sigmoid_value(a[H + k])
+            # n row: the hidden contribution is gated by r before the
+            # hidden weights are applied.
+            rh = [0.0] * H
+            for k in range(H):
+                product = gate_r[k] * h_prev[k]
+                if not math.isfinite(product):
+                    raise ValueError("gru intermediate must be finite")
+                rh[k] = product
+            gate_n = [0.0] * H
+            for k in range(H):
+                j = 2 * H + k
+                acc = a[j]
+                hbase = j * H
+                for k2 in range(H):
+                    product = snapshot_u[hbase + k2] * rh[k2]
+                    if not math.isfinite(product):
+                        raise ValueError(
+                            "gru intermediate must be finite"
+                        )
+                    acc += product
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "gru intermediate must be finite"
+                        )
+                n_k = math.tanh(acc)
+                if not math.isfinite(n_k):
+                    raise ValueError("gru intermediate must be finite")
+                gate_n[k] = n_k
+            h_new = [0.0] * H
+            for k in range(H):
+                keep = (1.0 - gate_z[k]) * gate_n[k]
+                if not math.isfinite(keep):
+                    raise ValueError("gru intermediate must be finite")
+                carry = gate_z[k] * h_prev[k]
+                if not math.isfinite(carry):
+                    raise ValueError("gru intermediate must be finite")
+                h_k = keep + carry
+                if not math.isfinite(h_k):
+                    raise ValueError("gru intermediate must be finite")
+                h_new[k] = h_k
+            out_data.extend(h_new)
+            if needs_grad:
+                saved.append((gate_z, gate_r, gate_n, rh, h_prev))
+            h_prev = h_new
+        if not needs_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_w, parent_u = self, w, u
+        parent_b, parent_h0 = b, h0
+
+        def backward_fn(grad):
+            # Chain-rule the recurrence in reverse step order. Every sum
+            # is accumulated from 0.0 in ascending index order; a
+            # non-finite product or partial sum aborts the whole pass
+            # before any grad is written.
+            def product(x, y):
+                value = x * y
+                if not math.isfinite(value):
+                    raise ValueError(
+                        "gru backward intermediate must be finite"
+                    )
+                return value
+
+            def accumulate(acc, term):
+                value = acc + term
+                if not math.isfinite(value):
+                    raise ValueError(
+                        "gru backward intermediate must be finite"
+                    )
+                return value
+
+            dx = [0.0] * (Tn * I)
+            dw = [0.0] * (G * I)
+            du = [0.0] * (G * H)
+            db = [0.0] * G
+            dh_next = [0.0] * H
+            for t in range(Tn - 1, -1, -1):
+                gate_z, gate_r, gate_n, rh, h_prev = saved[t]
+                da = [0.0] * G
+                dh_prev = [0.0] * H
+                for k in range(H):
+                    # Total grad on h_t[k]: the upstream output grad plus
+                    # the recurrent contribution from step t + 1.
+                    dh = 0.0
+                    dh = accumulate(dh, grad[t * H + k])
+                    dh = accumulate(dh, dh_next[k])
+                    z_k = gate_z[k]
+                    n_k = gate_n[k]
+                    # h = (1 - z)*n + z*h_prev
+                    dn = product(dh, 1.0 - z_k)
+                    dz = product(dh, h_prev[k] - n_k)
+                    dh_prev[k] = accumulate(
+                        dh_prev[k], product(dh, z_k)
+                    )
+                    # n = tanh(a_n): tanh' = 1 - y*y.
+                    sq = product(n_k, n_k)
+                    da[2 * H + k] = product(dn, 1.0 - sq)
+                    # z = sigmoid(a_z): sigmoid' = y*(1 - y).
+                    da[k] = product(product(dz, z_k), 1.0 - z_k)
+                # The n row's hidden input is rh[k] = r[k]*h_prev[k];
+                # accumulate its grad and the n-row hidden weights.
+                drh = [0.0] * H
+                for k in range(H):
+                    da_n = da[2 * H + k]
+                    hbase = (2 * H + k) * H
+                    for k2 in range(H):
+                        du[hbase + k2] = accumulate(
+                            du[hbase + k2],
+                            product(da_n, rh[k2]),
+                        )
+                        drh[k2] = accumulate(
+                            drh[k2],
+                            product(da_n, snapshot_u[hbase + k2]),
+                        )
+                # rh = r*h_prev gives the r gate output grad, hence the
+                # r row pre-activation grad via the sigmoid derivative.
+                for k in range(H):
+                    r_k = gate_r[k]
+                    dr = product(drh[k], h_prev[k])
+                    dh_prev[k] = accumulate(
+                        dh_prev[k], product(drh[k], r_k)
+                    )
+                    da[H + k] = product(product(dr, r_k), 1.0 - r_k)
+                # Parameter and input grads, gate rows ascending; the
+                # z/r rows also contribute recurrent grads through h_prev.
+                xbase = t * I
+                for j in range(G):
+                    da_j = da[j]
+                    db[j] = accumulate(db[j], da_j)
+                    base = j * I
+                    for k in range(I):
+                        dw[base + k] = accumulate(
+                            dw[base + k],
+                            product(da_j, snapshot_x[xbase + k]),
+                        )
+                        dx[xbase + k] = accumulate(
+                            dx[xbase + k],
+                            product(da_j, snapshot_w[base + k]),
+                        )
+                    if j < 2 * H:
+                        hbase = j * H
+                        for k in range(H):
+                            du[hbase + k] = accumulate(
+                                du[hbase + k],
+                                product(da_j, h_prev[k]),
+                            )
+                            dh_prev[k] = accumulate(
+                                dh_prev[k],
+                                product(da_j, snapshot_u[hbase + k]),
+                            )
+                dh_next = dh_prev
+            # After the t = 0 pass the recurrent grad is the h0 grad.
+            dh0 = dh_next
+            # One object may play several roles (e.g. w is also u); merge
+            # such roles into one contribution per tensor, and submit only
+            # parents that require grad. Role shapes agree whenever the
+            # objects coincide, since each length was validated per role.
+            merged = {}
+            roles = (
+                (parent_self, dx),
+                (parent_w, dw),
+                (parent_u, du),
+                (parent_b, db),
+                (parent_h0, dh0),
+            )
+            for parent, value in roles:
+                if not parent.requires_grad:
+                    continue
+                entry = merged.get(id(parent))
+                if entry is None:
+                    merged[id(parent)] = [parent, value]
+                else:
+                    combined = _merge_grad(entry[1], value)
+                    _ensure_finite_grad(combined)
+                    entry[1] = combined
+            return [(entry[0], entry[1]) for entry in merged.values()]
+
+        return Tensor._make(
+            out_data,
+            True,
+            (parent_self, parent_w, parent_u, parent_b, parent_h0),
+            backward_fn,
+        )
+
     def zero_grad(self):
         self.grad = None
         return None
