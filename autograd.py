@@ -5527,6 +5527,117 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def scatter_add(self, indices, source):
+        """Copy self and accumulate source values at indices, in o order.
+
+        out starts as a fresh copy of self.data; for each o in ascending
+        order, out[indices[o]] += source.data[o] (a scalar source is
+        broadcast to every o). Repeated indices accumulate. TypeError on
+        bad container/element types, ValueError on empty/non-finite/out of
+        range inputs or non-finite results. When either parent requires
+        grad, a two-parent graph is built with private snapshots of the
+        indices and both shapes, so later caller-side mutation cannot
+        change a pending backward pass.
+        """
+        if not isinstance(source, Tensor):
+            raise TypeError("source must be a Tensor")
+        data = self.data
+        if not isinstance(data, list) or len(data) == 0:
+            raise ValueError(
+                "scatter_add requires a non-empty 1D float list"
+            )
+        src = source.data
+        src_vector = isinstance(src, list)
+        if isinstance(src, bool) or (
+            not isinstance(src, float) and not src_vector
+        ):
+            raise TypeError(
+                "source data must be a finite float scalar or a non-empty"
+                " 1D float list"
+            )
+        if src_vector and len(src) == 0:
+            raise ValueError("source data list must be non-empty")
+        for value in data:
+            if isinstance(value, bool) or not isinstance(value, float):
+                raise TypeError("scatter_add data elements must be floats")
+        src_values = src if src_vector else [src]
+        for value in src_values:
+            if isinstance(value, bool) or not isinstance(value, float):
+                raise TypeError("scatter_add source elements must be floats")
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        if not isinstance(source.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        for value in data:
+            if not math.isfinite(value):
+                raise ValueError("scatter_add data elements must be finite")
+        for value in src_values:
+            if not math.isfinite(value):
+                raise ValueError("scatter_add source elements must be finite")
+        if not isinstance(indices, list):
+            raise TypeError("indices must be a list of non-bool ints")
+        for index in indices:
+            if isinstance(index, bool) or not isinstance(index, int):
+                raise TypeError("indices elements must be non-bool ints")
+        if len(indices) == 0:
+            raise ValueError("indices must be non-empty")
+        n = len(data)
+        for index in indices:
+            if index < 0 or index >= n:
+                raise ValueError("scatter_add index out of range")
+        if src_vector and len(src) != len(indices):
+            raise ValueError("source length must match indices length")
+        # Snapshot the indices and the self length so later caller-side
+        # mutation of the indices list or of either data cannot change a
+        # pending backward pass.
+        snapshot = list(indices)
+        out_data = list(data)
+        for o in range(len(snapshot)):
+            value = src[o] if src_vector else src
+            out_data[snapshot[o]] += value
+            if not math.isfinite(out_data[snapshot[o]]):
+                raise ValueError("scatter_add result must be finite")
+        if not (self.requires_grad or source.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_source = self, source
+        length = n
+        source_was_vector = src_vector
+
+        def backward_fn(grad):
+            contributions = []
+            if parent_self.requires_grad:
+                # The base passes through unchanged: a fresh copy of grad.
+                contributions.append((parent_self, list(grad)))
+            if parent_source.requires_grad:
+                if source_was_vector:
+                    ds = []
+                    for o in range(len(snapshot)):
+                        value = grad[snapshot[o]]
+                        if not math.isfinite(value):
+                            raise ValueError(
+                                "scatter_add backward intermediate"
+                                " must be finite"
+                            )
+                        ds.append(value)
+                    contributions.append((parent_source, ds))
+                else:
+                    # A broadcast scalar source reduces by accumulating
+                    # from 0.0 in ascending o order.
+                    total = 0.0
+                    for o in range(len(snapshot)):
+                        total += grad[snapshot[o]]
+                        if not math.isfinite(total):
+                            raise ValueError(
+                                "scatter_add backward intermediate"
+                                " must be finite"
+                            )
+                    contributions.append((parent_source, total))
+            return contributions
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_source), backward_fn
+        )
+
     def zero_grad(self):
         self.grad = None
         return None
