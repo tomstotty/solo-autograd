@@ -7116,6 +7116,150 @@ class Tensor:
             grad_validator=lambda g: _validate_vector_grad(g, OH * OW),
         )
 
+    def bilinear_resize2d(self, height, width, out_height, out_width,
+                          align_corners=False):
+        # height, width, out_height and out_width must be non-bool positive
+        # ints; align_corners must be a bool.
+        for name, value in (
+            ("height", height),
+            ("width", width),
+            ("out_height", out_height),
+            ("out_width", out_width),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(name + " must be a positive int")
+            if value <= 0:
+                raise ValueError(name + " must be a positive int")
+        if not isinstance(align_corners, bool):
+            raise TypeError("align_corners must be a bool")
+        H, W, OH, OW = height, width, out_height, out_width
+        # self stores a single-channel H x W image in row-major order. Data
+        # may have been mutated after construction, so re-validate at call
+        # time.
+        data = _require_nonempty_float_vector(self, "bilinear_resize2d")
+        if len(data) != H * W:
+            raise ValueError(
+                "bilinear_resize2d input length must equal height * width"
+            )
+        # Snapshot the image at call time so later caller-side mutation or
+        # replacement cannot change neither the forward result nor a pending
+        # backward pass.
+        snapshot = list(data)
+
+        def position(index, in_size, out_size):
+            # Source position sampled by output index along one axis. With
+            # aligned corners the endpoints map to the endpoints (a
+            # singleton output pins position 0); otherwise the centers of
+            # the input and output cells are aligned.
+            if align_corners:
+                if out_size == 1:
+                    pos = 0.0
+                else:
+                    pos = index * (in_size - 1) / (out_size - 1)
+            else:
+                pos = (index + 0.5) * in_size / out_size - 0.5
+            if not math.isfinite(pos):
+                raise ValueError(
+                    "bilinear_resize2d intermediate must be finite"
+                )
+            # Clamp to the legal source range [-1, in_size - 1]; positions
+            # before the first cell still sample it with their fractional
+            # weight, positions beyond the last cell collapse onto it.
+            if pos < 0.0:
+                pos = 0.0
+            elif pos > in_size - 1:
+                pos = in_size - 1
+            low = math.floor(pos)
+            high = min(low + 1, in_size - 1)
+            frac = pos - low
+            return low, high, frac
+
+        # Resize in ascending (or, oc) order: output cell (or, oc) samples
+        # source positions r and c; the four taps (r0/r1, c0/c1) are weighted
+        # (1-a)(1-b), (1-a)b, a(1-b), ab for top-left, top-right,
+        # bottom-left, bottom-right. Each output is accumulated from 0.0; a
+        # non-finite product or partial sum aborts before a result tensor
+        # exists, so no state can change on failure.
+        taps = []
+        out_data = []
+        for orow in range(OH):
+            r0, r1, a = position(orow, H, OH)
+            for ocol in range(OW):
+                c0, c1, b = position(ocol, W, OW)
+                taps.append((r0, r1, a, c0, c1, b))
+                wr = (1.0 - a, a)
+                wc = (1.0 - b, b)
+                corners = (
+                    (r0, c0, wr[0] * wc[0]),
+                    (r0, c1, wr[0] * wc[1]),
+                    (r1, c0, wr[1] * wc[0]),
+                    (r1, c1, wr[1] * wc[1]),
+                )
+                acc = 0.0
+                for rr, cc, weight in corners:
+                    product = snapshot[rr * W + cc] * weight
+                    if not math.isfinite(product):
+                        raise ValueError(
+                            "bilinear_resize2d intermediate must be finite"
+                        )
+                    acc += product
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "bilinear_resize2d intermediate must be finite"
+                        )
+                out_data.append(acc)
+        if not self.requires_grad:
+            return Tensor._make(
+                out_data, False, (), None,
+                grad_validator=lambda g: _validate_vector_grad(g, OH * OW),
+            )
+        # Snapshot the image shape and tap layout with the graph; mutating
+        # the parent's data after the forward pass cannot change what a
+        # pending backward pass uses.
+        parent = self
+        n = H * W
+        snapshot_W = W
+        snapshot_taps = taps
+
+        def backward_fn(grad):
+            # dx[rr,cc] += grad[or*OW+oc] * weight for the four taps of
+            # each output cell, accumulated from 0.0 in the same ascending
+            # (or, oc, corner) order as the forward pass; a non-finite
+            # product or partial sum aborts the whole pass before any grad
+            # is written.
+            dx = [0.0] * n
+            for p in range(OH * OW):
+                g = grad[p]
+                r0, r1, a, c0, c1, b = snapshot_taps[p]
+                wr = (1.0 - a, a)
+                wc = (1.0 - b, b)
+                corners = (
+                    (r0, c0, wr[0] * wc[0]),
+                    (r0, c1, wr[0] * wc[1]),
+                    (r1, c0, wr[1] * wc[0]),
+                    (r1, c1, wr[1] * wc[1]),
+                )
+                for rr, cc, weight in corners:
+                    contribution = g * weight
+                    if not math.isfinite(contribution):
+                        raise ValueError(
+                            "bilinear_resize2d backward intermediate must be"
+                            " finite"
+                        )
+                    index = rr * snapshot_W + cc
+                    dx[index] += contribution
+                    if not math.isfinite(dx[index]):
+                        raise ValueError(
+                            "bilinear_resize2d backward intermediate must be"
+                            " finite"
+                        )
+            return [(parent, dx)]
+
+        return Tensor._make(
+            out_data, True, (parent,), backward_fn,
+            grad_validator=lambda g: _validate_vector_grad(g, OH * OW),
+        )
+
     def affine_grid2d(self, rows, cols):
         # rows and cols must be non-bool positive ints.
         for name, value in (("rows", rows), ("cols", cols)):
