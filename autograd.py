@@ -6845,6 +6845,90 @@ class Tensor:
             grad_validator=lambda g: _validate_vector_grad(g, OH * OW),
         )
 
+    def affine_grid2d(self, rows, cols):
+        # self stores the 2x3 affine matrix as a 6-element list
+        # [a00, a01, a02, a10, a11, a12]; data may have been mutated
+        # after construction, so re-validate at call time.
+        data = self.data
+        if not isinstance(data, list) or len(data) != 6:
+            raise ValueError(
+                "affine_grid2d requires a 6-element float list"
+            )
+        for value in data:
+            if isinstance(value, bool) or not isinstance(value, float):
+                raise TypeError("affine_grid2d data elements must be floats")
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        for value in data:
+            if not math.isfinite(value):
+                raise ValueError(
+                    "affine_grid2d data elements must be finite"
+                )
+        # rows and cols must be non-bool positive ints.
+        for name, value in (("rows", rows), ("cols", cols)):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(name + " must be a positive int")
+            if value <= 0:
+                raise ValueError(name + " must be a positive int")
+        a00, a01, a02, a10, a11, a12 = data
+        # Sampling coordinates in ascending (r, c) order, normalized to
+        # [-1, 1]; a degenerate axis collapses to 0.0. The coordinates are
+        # snapshotted here so later caller-side mutation of self.data can
+        # change neither the forward result nor a pending backward pass.
+        coords = []
+        out_data = []
+        for r in range(rows):
+            y = 0.0 if rows == 1 else 2.0 * r / (rows - 1) - 1.0
+            for c in range(cols):
+                x = 0.0 if cols == 1 else 2.0 * c / (cols - 1) - 1.0
+                coords.append((x, y))
+                gx = a00 * x + a01 * y + a02
+                gy = a10 * x + a11 * y + a12
+                if not (math.isfinite(gx) and math.isfinite(gy)):
+                    raise ValueError("affine_grid2d result must be finite")
+                out_data.append(gx)
+                out_data.append(gy)
+        length = 2 * rows * cols
+        if not self.requires_grad:
+            return Tensor._make(
+                out_data, False, (), None,
+                grad_validator=lambda g: _validate_vector_grad(g, length),
+            )
+        parent = self
+
+        def backward_fn(grad):
+            # gx = a00*x + a01*y + a02 and gy = a10*x + a11*y + a12, so
+            # with u = dL/dgx and v = dL/dgy at point p the matrix grad is
+            # [u*x, u*y, u, v*x, v*y, v]; everything is accumulated from
+            # 0.0 in the same ascending (r, c) order as the forward pass.
+            # A non-finite product or partial sum aborts the whole pass
+            # before any grad is written.
+            dtheta = [0.0] * 6
+            for p in range(rows * cols):
+                u = grad[2 * p]
+                v = grad[2 * p + 1]
+                x, y = coords[p]
+                for k, term in enumerate(
+                    (u * x, u * y, u, v * x, v * y, v)
+                ):
+                    if not math.isfinite(term):
+                        raise ValueError(
+                            "affine_grid2d backward intermediate"
+                            " must be finite"
+                        )
+                    dtheta[k] += term
+                    if not math.isfinite(dtheta[k]):
+                        raise ValueError(
+                            "affine_grid2d backward intermediate"
+                            " must be finite"
+                        )
+            return [(parent, dtheta)]
+
+        return Tensor._make(
+            out_data, True, (parent,), backward_fn,
+            grad_validator=lambda g: _validate_vector_grad(g, length),
+        )
+
     def grid_sample2d(self, grid, height, width, out_height, out_width):
         if not isinstance(grid, Tensor):
             raise TypeError("grid must be a Tensor")
