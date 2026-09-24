@@ -791,6 +791,157 @@ class Tensor:
             out_data, True, (parent_self, parent_other), backward_fn
         )
 
+    def clamp(self, lower, upper):
+        # lower and upper are each accepted as a Tensor or a finite float
+        # only; bools, ints and anything else are a TypeError, and a
+        # non-finite float is a ValueError.
+        lower = self._coerce(lower)
+        upper = self._coerce(upper)
+        x = _validate_data(self.data)
+        lo = _validate_data(lower.data)
+        hi = _validate_data(upper.data)
+        if not isinstance(self.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        if not isinstance(lower.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        if not isinstance(upper.requires_grad, bool):
+            raise TypeError("requires_grad must be a bool")
+        x_vector = isinstance(x, list)
+        lo_vector = isinstance(lo, list)
+        hi_vector = isinstance(hi, list)
+        # The output is a vector whenever any datum is a list; every list
+        # must share one length, while scalars broadcast across vectors.
+        lengths = []
+        if x_vector:
+            lengths.append(len(x))
+        if lo_vector:
+            lengths.append(len(lo))
+        if hi_vector:
+            lengths.append(len(hi))
+        if lengths and any(length != lengths[0] for length in lengths):
+            raise ValueError("vector lengths must match")
+        n_outputs = lengths[0] if lengths else 1
+        # Clamp element by element in ascending output-index order; every
+        # position must satisfy lower < upper. branches snapshots the
+        # per-index decision: -1 below the interval (y = lower), 1 above
+        # it (y = upper), 2 exactly at lower, 3 exactly at upper and 0
+        # strictly inside. Inputs are already finite, so a non-finite
+        # selection cannot occur; the explicit finite check still aborts
+        # before a result tensor exists, leaving every input untouched on
+        # failure.
+        out_values = []
+        branches = []
+        for i in range(n_outputs):
+            xv = x[i] if x_vector else x
+            lv = lo[i] if lo_vector else lo
+            uv = hi[i] if hi_vector else hi
+            if not lv < uv:
+                raise ValueError(
+                    "lower must be less than upper at every position"
+                )
+            if xv < lv:
+                out_values.append(lv)
+                branches.append(-1)
+            elif xv > uv:
+                out_values.append(uv)
+                branches.append(1)
+            elif xv == lv:
+                out_values.append(xv)
+                branches.append(2)
+            elif xv == uv:
+                out_values.append(xv)
+                branches.append(3)
+            else:
+                out_values.append(xv)
+                branches.append(0)
+        out_data = out_values if lengths else out_values[0]
+        _ensure_finite_data(out_data)
+        if not (
+            self.requires_grad
+            or lower.requires_grad
+            or upper.requires_grad
+        ):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_lower, parent_upper = self, lower, upper
+        # branches and the three shape flags snapshot everything backward
+        # needs, so later caller-side mutation or replacement of any datum
+        # cannot change which tensors a pending backward pass credits.
+
+        def backward_fn(grad):
+            grad_values = grad if isinstance(grad, list) else [grad]
+            dx_values = [0.0] * n_outputs
+            dlo_values = [0.0] * n_outputs
+            dhi_values = [0.0] * n_outputs
+            # Inside the interval self gets the whole outgoing element;
+            # outside it the active bound gets it. Exactly at a bound self
+            # and that bound each get 0.5*g; every other role gets 0.0.
+            for i in range(n_outputs):
+                g = grad_values[i]
+                branch = branches[i]
+                if branch == -1:
+                    dlo_values[i] = g
+                elif branch == 1:
+                    dhi_values[i] = g
+                elif branch == 2:
+                    half = 0.5 * g
+                    if not math.isfinite(half):
+                        raise ValueError(
+                            "clamp backward intermediate must be finite"
+                        )
+                    dx_values[i] = half
+                    dlo_values[i] = half
+                elif branch == 3:
+                    half = 0.5 * g
+                    if not math.isfinite(half):
+                        raise ValueError(
+                            "clamp backward intermediate must be finite"
+                        )
+                    dx_values[i] = half
+                    dhi_values[i] = half
+                else:
+                    dx_values[i] = g
+            roles = []
+            for parent, values, is_vector in (
+                (parent_self, dx_values, x_vector),
+                (parent_lower, dlo_values, lo_vector),
+                (parent_upper, dhi_values, hi_vector),
+            ):
+                if not parent.requires_grad:
+                    continue
+                if is_vector:
+                    roles.append((parent, values))
+                else:
+                    # A broadcast scalar parent reduces by accumulating
+                    # from 0.0 in ascending output-index order.
+                    total = 0.0
+                    for value in values:
+                        total += value
+                        if not math.isfinite(total):
+                            raise ValueError(
+                                "clamp backward intermediate must be finite"
+                            )
+                    roles.append((parent, total))
+            # The same object may play several roles; merge such roles into
+            # one contribution per tensor, submitting only parents that
+            # require grad.
+            merged = {}
+            for parent, value in roles:
+                entry = merged.get(id(parent))
+                if entry is None:
+                    merged[id(parent)] = [parent, value]
+                else:
+                    combined = _merge_grad(entry[1], value)
+                    _ensure_finite_grad(combined)
+                    entry[1] = combined
+            return [(entry[0], entry[1]) for entry in merged.values()]
+
+        return Tensor._make(
+            out_data,
+            True,
+            (parent_self, parent_lower, parent_upper),
+            backward_fn,
+        )
+
     def pow(self, exponent):
         # The exponent is accepted as a Tensor or a finite float only;
         # bools, ints and anything else are a TypeError, and a non-finite
