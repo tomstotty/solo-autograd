@@ -250,22 +250,14 @@ class GridSample2dBackwardTests(unittest.TestCase):
         expect(ValueError,
                lambda: out.backward([float("inf")]))
 
-    def test_validation_runs_on_graphless_result(self):
+    def test_graphless_result_rejects_any_grad(self):
         out = Tensor([1.0, 2.0, 3.0, 4.0]).grid_sample2d(
             Tensor([0.0, 0.0]), 2, 2, 1, 1)
         self.assertFalse(out.requires_grad)
-        for bad, error in (
-            (None, TypeError),
-            ("x", TypeError),
-            ((1.0,), TypeError),
-            (True, ValueError),
-            (1, ValueError),
-            (1.0, ValueError),
-        ):
-            expect(error, lambda bad=bad: out.backward(bad))
+        # No graph: every grad, valid or not, is a ValueError.
+        for bad in (None, "x", (1.0,), True, 1, 1.0):
+            expect(ValueError, lambda bad=bad: out.backward(bad))
         expect(ValueError, out.backward)
-        # A valid finite list passes validation, then hits the missing
-        # graph error.
         expect(ValueError, lambda: out.backward([1.0]))
 
     def test_invalid_grad_changes_no_grad(self):

@@ -194,15 +194,15 @@ rg2 = xo.instance_norm2d_affine(Tensor(WV, True), Tensor(BV, False),
 assert rg2._parents == (xo, rg2._parents[1], rg2._parents[2])
 assert rg2.requires_grad is True
 
-# --- no graph: backward -> ValueError even with a valid grad ---
+# --- no graph: any grad, valid or not, -> ValueError ---
 out0 = Tensor(DATA, False).instance_norm2d_affine(
     Tensor(WV), Tensor(BV), B, C, H, W)
 expect(ValueError, lambda: out0.backward([1.0] * 16))
 expect(ValueError, lambda: out0.backward())
 expect(ValueError, lambda: out0.backward(True))
 expect(ValueError, lambda: out0.backward(1.0))
-expect(TypeError, lambda: out0.backward(None))
-expect(TypeError, lambda: out0.backward("x"))
+expect(ValueError, lambda: out0.backward(None))
+expect(ValueError, lambda: out0.backward("x"))
 
 # --- backward: grad validation ---
 out = Tensor(DATA, True).instance_norm2d_affine(

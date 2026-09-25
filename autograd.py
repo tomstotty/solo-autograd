@@ -5562,27 +5562,38 @@ class Tensor:
             out_data, True, (parent_self, parent_kernel), backward_fn
         )
 
-    def conv3d(self, kernel, depth, height, width, kernel_size):
+    def conv3d(self, kernel, depth, height, width, kernel_size, stride=1,
+               padding=0, dilation=1):
         if not isinstance(kernel, Tensor):
             raise TypeError("kernel must be a Tensor")
         # Both operands must hold non-empty 1D finite float lists; data may
         # have been mutated after construction, so re-validate at call time.
         x_data = _require_nonempty_float_vector(self, "conv3d")
         k_data = _require_nonempty_float_vector(kernel, "conv3d")
-        # D, H, W and kernel_size must be non-bool positive ints.
+        # D, H, W, kernel_size, stride and dilation must be non-bool
+        # positive ints, and padding a non-bool non-negative int.
         for name, value in (
             ("depth", depth),
             ("height", height),
             ("width", width),
             ("kernel_size", kernel_size),
+            ("stride", stride),
+            ("dilation", dilation),
         ):
             if isinstance(value, bool) or not isinstance(value, int):
                 raise TypeError(name + " must be a positive int")
             if value <= 0:
                 raise ValueError(name + " must be a positive int")
-        D, H, W, K = depth, height, width, kernel_size
+        if isinstance(padding, bool) or not isinstance(padding, int):
+            raise TypeError("padding must be a non-negative int")
+        if padding < 0:
+            raise ValueError("padding must be a non-negative int")
+        D, H, W, K, S, P, L = (
+            depth, height, width, kernel_size, stride, padding, dilation,
+        )
         # self stores a D x H x W volume and kernel a K x K x K filter,
-        # both in row-major order.
+        # both in row-major order. Dilation spaces the kernel taps by L,
+        # so the effective receptive field spans E = L*(K-1)+1 positions.
         if len(x_data) != D * H * W:
             raise ValueError("conv3d input length must equal depth * height * width")
         if len(k_data) != K * K * K:
@@ -5590,9 +5601,10 @@ class Tensor:
                 "conv3d kernel length must equal "
                 "kernel_size * kernel_size * kernel_size"
             )
-        out_d = D - K + 1
-        out_h = H - K + 1
-        out_w = W - K + 1
+        E = L * (K - 1) + 1
+        out_d = (D + 2 * P - E) // S + 1
+        out_h = (H + 2 * P - E) // S + 1
+        out_w = (W + 2 * P - E) // S + 1
         if out_d <= 0 or out_h <= 0 or out_w <= 0:
             raise ValueError("conv3d output dimensions must be positive")
         # Snapshot both operands at call time so later caller-side mutation
@@ -5600,12 +5612,14 @@ class Tensor:
         # result nor a pending backward pass.
         snapshot_x = list(x_data)
         snapshot_k = list(k_data)
-        # 3D valid cross-correlation: the kernel is never flipped. In
+        # Dilated 3D cross-correlation: the kernel is never flipped. In
         # ascending (od, oh, ow, kd, kh, kw) order,
         # y[(od*OH+oh)*OW+ow] += x[j] * k[q] with
         # q = (kd*K+kh)*K+kw and
-        # j = ((od+kd)*H+oh+kh)*W+ow+kw. A non-finite product or partial
-        # sum aborts before a result tensor exists, so no state can change.
+        # j = ((od*S+kd*L-P)*H+oh*S+kh*L-P)*W+ow*S+kw*L-P; out-of-range
+        # input positions (from padding or the dilation gaps) are skipped.
+        # A non-finite product or partial sum aborts before a result
+        # tensor exists, so no state can change.
         out_len = out_d * out_h * out_w
         out_data = [0.0] * out_len
         for od in range(out_d):
@@ -5613,9 +5627,18 @@ class Tensor:
                 for ow in range(out_w):
                     o = (od * out_h + oh) * out_w + ow
                     for kd in range(K):
+                        id_ = od * S + kd * L - P
+                        if not 0 <= id_ < D:
+                            continue
                         for kh in range(K):
+                            ih = oh * S + kh * L - P
+                            if not 0 <= ih < H:
+                                continue
                             for kw in range(K):
-                                j = ((od + kd) * H + oh + kh) * W + ow + kw
+                                iw = ow * S + kw * L - P
+                                if not 0 <= iw < W:
+                                    continue
+                                j = (id_ * H + ih) * W + iw
                                 q = (kd * K + kh) * K + kw
                                 product = snapshot_x[j] * snapshot_k[q]
                                 if not math.isfinite(product):
@@ -5634,8 +5657,9 @@ class Tensor:
         def backward_fn(grad):
             # dx[j] += g[o]*k[q] and dk[q] += g[o]*x[j], accumulated from
             # 0.0 in the same ascending (od, oh, ow, kd, kh, kw) order as
-            # the forward pass. A non-finite product or partial sum aborts
-            # the whole pass before any grad is written.
+            # the forward pass, using the same dilated j indexing and
+            # skipping out-of-range positions. A non-finite product or
+            # partial sum aborts the whole pass before any grad is written.
             dx = [0.0] * (D * H * W)
             dk = [0.0] * (K * K * K)
             for od in range(out_d):
@@ -5643,12 +5667,18 @@ class Tensor:
                     for ow in range(out_w):
                         g = grad[(od * out_h + oh) * out_w + ow]
                         for kd in range(K):
+                            id_ = od * S + kd * L - P
+                            if not 0 <= id_ < D:
+                                continue
                             for kh in range(K):
+                                ih = oh * S + kh * L - P
+                                if not 0 <= ih < H:
+                                    continue
                                 for kw in range(K):
-                                    j = (
-                                        ((od + kd) * H + oh + kh) * W
-                                        + ow + kw
-                                    )
+                                    iw = ow * S + kw * L - P
+                                    if not 0 <= iw < W:
+                                        continue
+                                    j = (id_ * H + ih) * W + iw
                                     q = (kd * K + kh) * K + kw
                                     contrib_x = g * snapshot_k[q]
                                     if not math.isfinite(contrib_x):
@@ -11895,6 +11925,11 @@ class Tensor:
         return None
 
     def backward(self, grad=_MISSING):
+        # A tensor without a parent graph rejects every grad, valid or
+        # not, with ValueError; grad validation only happens once a graph
+        # exists, so an explicit None on a graphed tensor is a TypeError.
+        if not self._parents:
+            raise ValueError("cannot call backward on a tensor without a graph")
         validator = self._grad_validator
         if validator is not None:
             grad = validator(grad)
@@ -11908,9 +11943,6 @@ class Tensor:
             raise TypeError("grad must not be None")
         else:
             grad = _validate_grad(grad, self.data)
-
-        if not self._parents:
-            raise ValueError("cannot call backward on a tensor without a graph")
 
         # Repeated backward on the same result accumulates the upstream
         # grad and recomputes this graph's contributions from the running
