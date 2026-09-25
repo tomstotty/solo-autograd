@@ -5932,6 +5932,227 @@ class Tensor:
             grad_validator=lambda g: _validate_vector_grad(g, out_len),
         )
 
+    def conv3d_batch(self, kernel, batch, channels, filters, depth, height,
+                     width, size, stride=1, padding=0, dilation=1):
+        if not isinstance(kernel, Tensor):
+            raise TypeError("kernel must be a Tensor")
+        # Both operands must hold non-empty 1D finite float lists; data may
+        # have been mutated after construction, so re-validate at call time.
+        x_data = _require_nonempty_float_vector(self, "conv3d_batch")
+        w_data = _require_nonempty_float_vector(kernel, "conv3d_batch")
+        # batch, channels, filters, depth, height, width, size, stride and
+        # dilation must be non-bool positive ints, and padding a non-bool
+        # non-negative int.
+        for name, value in (
+            ("batch", batch),
+            ("channels", channels),
+            ("filters", filters),
+            ("depth", depth),
+            ("height", height),
+            ("width", width),
+            ("size", size),
+            ("stride", stride),
+            ("dilation", dilation),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(name + " must be a positive int")
+            if value <= 0:
+                raise ValueError(name + " must be a positive int")
+        if isinstance(padding, bool) or not isinstance(padding, int):
+            raise TypeError("padding must be a non-negative int")
+        if padding < 0:
+            raise ValueError("padding must be a non-negative int")
+        B, C, O, D, H, W, K, S, P, L = (
+            batch, channels, filters, depth, height, width, size, stride,
+            padding, dilation,
+        )
+        # self stores B batches of C channels of D x H x W volumes and
+        # kernel O filters of C channels of K x K x K weights, all in
+        # row-major order; every batch shares the same kernel.
+        if len(x_data) != B * C * D * H * W:
+            raise ValueError(
+                "conv3d_batch input length must equal "
+                "batch * channels * depth * height * width"
+            )
+        if len(w_data) != O * C * K * K * K:
+            raise ValueError(
+                "conv3d_batch kernel length must equal "
+                "filters * channels * size * size * size"
+            )
+        # Dilation spaces the kernel taps by L, so the effective receptive
+        # field spans E = L*(K-1)+1 positions; with L=1 this is simply K.
+        E = L * (K - 1) + 1
+        out_d = (D + 2 * P - E) // S + 1
+        out_h = (H + 2 * P - E) // S + 1
+        out_w = (W + 2 * P - E) // S + 1
+        if out_d <= 0 or out_h <= 0 or out_w <= 0:
+            raise ValueError("conv3d_batch output dimensions must be positive")
+        # Snapshot both operands at call time so later caller-side mutation
+        # or replacement of either input can change neither the forward
+        # result nor a pending backward pass.
+        snapshot_x = list(x_data)
+        snapshot_w = list(w_data)
+        # Batched multi-channel 3D cross-correlation: the kernel is never
+        # flipped and is shared by every batch. In ascending
+        # (b, o, od, oh, ow) order each output starts at 0.0, then in
+        # ascending (c, kd, kh, kw) order accumulates
+        # y[(((b*O+o)*OD+od)*OH+oh)*OW+ow]
+        #   += x[(((b*C+c)*D+r)*H+q)*W+s]
+        #      * w[(((o*C+c)*K+kd)*K+kh)*K+kw],
+        # with r = od*S+kd*L-P, q = oh*S+kh*L-P and s = ow*S+kw*L-P;
+        # out-of-range input positions from padding or the dilation gaps
+        # are skipped. A non-finite product or partial sum aborts before a
+        # result tensor exists, so no state can change.
+        out_len = B * O * out_d * out_h * out_w
+        out_data = [0.0] * out_len
+        for b in range(B):
+            for o in range(O):
+                for od in range(out_d):
+                    for oh in range(out_h):
+                        for ow in range(out_w):
+                            oi = (
+                                (((b * O + o) * out_d + od) * out_h + oh)
+                                * out_w + ow
+                            )
+                            for c in range(C):
+                                for kd in range(K):
+                                    r = od * S + kd * L - P
+                                    if not 0 <= r < D:
+                                        continue
+                                    for kh in range(K):
+                                        q = oh * S + kh * L - P
+                                        if not 0 <= q < H:
+                                            continue
+                                        for kw in range(K):
+                                            s = ow * S + kw * L - P
+                                            if not 0 <= s < W:
+                                                continue
+                                            xi = (
+                                                (((b * C + c) * D + r) * H + q)
+                                                * W + s
+                                            )
+                                            wi = (
+                                                (((o * C + c) * K + kd) * K
+                                                 + kh) * K + kw
+                                            )
+                                            product = (
+                                                snapshot_x[xi] * snapshot_w[wi]
+                                            )
+                                            if not math.isfinite(product):
+                                                raise ValueError(
+                                                    "conv3d_batch intermediate "
+                                                    "must be finite"
+                                                )
+                                            out_data[oi] = (
+                                                out_data[oi] + product
+                                            )
+                                            if not math.isfinite(out_data[oi]):
+                                                raise ValueError(
+                                                    "conv3d_batch intermediate "
+                                                    "must be finite"
+                                                )
+        if not (self.requires_grad or kernel.requires_grad):
+            return Tensor._make(out_data, False, (), None)
+        parent_self, parent_kernel = self, kernel
+
+        def backward_fn(grad):
+            # dx[xi] += g*w[wi] and dw[wi] += g*x[xi], accumulated from
+            # 0.0 in the same ascending (b, o, od, oh, ow, c, kd, kh, kw)
+            # order as the forward pass, using the same dilated r/q/s
+            # indexing and skipping out-of-range positions; dw has no batch
+            # index, so its contributions reduce across all B batches. A
+            # non-finite product or partial sum aborts the whole pass
+            # before any grad is written.
+            dx = [0.0] * (B * C * D * H * W)
+            dw = [0.0] * (O * C * K * K * K)
+            for b in range(B):
+                for o in range(O):
+                    for od in range(out_d):
+                        for oh in range(out_h):
+                            for ow in range(out_w):
+                                g = grad[
+                                    (
+                                        (((b * O + o) * out_d + od) * out_h
+                                         + oh) * out_w + ow
+                                    )
+                                ]
+                                for c in range(C):
+                                    for kd in range(K):
+                                        r = od * S + kd * L - P
+                                        if not 0 <= r < D:
+                                            continue
+                                        for kh in range(K):
+                                            q = oh * S + kh * L - P
+                                            if not 0 <= q < H:
+                                                continue
+                                            for kw in range(K):
+                                                s = ow * S + kw * L - P
+                                                if not 0 <= s < W:
+                                                    continue
+                                                xi = (
+                                                    (((b * C + c) * D + r) * H
+                                                     + q) * W + s
+                                                )
+                                                wi = (
+                                                    (((o * C + c) * K + kd)
+                                                      * K + kh) * K + kw
+                                                )
+                                                contrib_x = g * snapshot_w[wi]
+                                                if not math.isfinite(contrib_x):
+                                                    raise ValueError(
+                                                        "conv3d_batch backward "
+                                                        "intermediate must be "
+                                                        "finite"
+                                                    )
+                                                dx[xi] = dx[xi] + contrib_x
+                                                if not math.isfinite(dx[xi]):
+                                                    raise ValueError(
+                                                        "conv3d_batch backward "
+                                                        "intermediate must be "
+                                                        "finite"
+                                                    )
+                                                contrib_w = g * snapshot_x[xi]
+                                                if not math.isfinite(contrib_w):
+                                                    raise ValueError(
+                                                        "conv3d_batch backward "
+                                                        "intermediate must be "
+                                                        "finite"
+                                                    )
+                                                dw[wi] = dw[wi] + contrib_w
+                                                if not math.isfinite(dw[wi]):
+                                                    raise ValueError(
+                                                        "conv3d_batch backward "
+                                                        "intermediate must be "
+                                                        "finite"
+                                                    )
+            # The same object may play both roles; merge such roles into
+            # one contribution per tensor, and submit only parents that
+            # require grad.
+            merged = {}
+            roles = (
+                (parent_self, dx),
+                (parent_kernel, dw),
+            )
+            for parent, value in roles:
+                if not parent.requires_grad:
+                    continue
+                entry = merged.get(id(parent))
+                if entry is None:
+                    merged[id(parent)] = [parent, value]
+                else:
+                    combined = _merge_grad(entry[1], value)
+                    _ensure_finite_grad(combined)
+                    entry[1] = combined
+            return [(entry[0], entry[1]) for entry in merged.values()]
+
+        return Tensor._make(
+            out_data,
+            True,
+            (parent_self, parent_kernel),
+            backward_fn,
+            grad_validator=lambda g: _validate_vector_grad(g, out_len),
+        )
+
     def conv_transpose2d(self, kernel, size, kernel_size, stride=1,
                          padding=0, dilation=1):
         if not isinstance(kernel, Tensor):
