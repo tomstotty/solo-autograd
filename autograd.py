@@ -5562,6 +5562,151 @@ class Tensor:
             out_data, True, (parent_self, parent_kernel), backward_fn
         )
 
+    def conv3d(self, kernel, depth, height, width, kernel_size):
+        if not isinstance(kernel, Tensor):
+            raise TypeError("kernel must be a Tensor")
+        # Both operands must hold non-empty 1D finite float lists; data may
+        # have been mutated after construction, so re-validate at call time.
+        x_data = _require_nonempty_float_vector(self, "conv3d")
+        k_data = _require_nonempty_float_vector(kernel, "conv3d")
+        # D, H, W and kernel_size must be non-bool positive ints.
+        for name, value in (
+            ("depth", depth),
+            ("height", height),
+            ("width", width),
+            ("kernel_size", kernel_size),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(name + " must be a positive int")
+            if value <= 0:
+                raise ValueError(name + " must be a positive int")
+        D, H, W, K = depth, height, width, kernel_size
+        # self stores a D x H x W volume and kernel a K x K x K filter,
+        # both in row-major order.
+        if len(x_data) != D * H * W:
+            raise ValueError(
+                "conv3d input length must equal depth * height * width"
+            )
+        if len(k_data) != K * K * K:
+            raise ValueError(
+                "conv3d kernel length must equal "
+                "kernel_size * kernel_size * kernel_size"
+            )
+        OD = D - K + 1
+        OH = H - K + 1
+        OW = W - K + 1
+        if OD <= 0 or OH <= 0 or OW <= 0:
+            raise ValueError("conv3d output dimensions must be positive")
+        # Snapshot both operands at call time so later caller-side mutation
+        # or replacement of either input can change neither the forward
+        # result nor a pending backward pass.
+        snapshot_x = list(x_data)
+        snapshot_k = list(k_data)
+        # 3D valid cross-correlation: the kernel is never flipped. In
+        # ascending (od, oh, ow, kd, kh, kw) order,
+        # y[(od*OH+oh)*OW+ow] +=
+        #     x[((od+kd)*H+oh+kh)*W+ow+kw] * k[(kd*K+kh)*K+kw],
+        # accumulated from 0.0. A non-finite product or partial sum aborts
+        # before a result tensor exists, so no state can change.
+        out_len = OD * OH * OW
+        out_data = [0.0] * out_len
+        for od in range(OD):
+            for oh in range(OH):
+                for ow in range(OW):
+                    o = (od * OH + oh) * OW + ow
+                    for kd in range(K):
+                        for kh in range(K):
+                            row = (od + kd) * H + oh + kh
+                            for kw in range(K):
+                                j = row * W + ow + kw
+                                q = (kd * K + kh) * K + kw
+                                product = snapshot_x[j] * snapshot_k[q]
+                                if not math.isfinite(product):
+                                    raise ValueError(
+                                        "conv3d intermediate must be finite"
+                                    )
+                                out_data[o] = out_data[o] + product
+                                if not math.isfinite(out_data[o]):
+                                    raise ValueError(
+                                        "conv3d intermediate must be finite"
+                                    )
+        grad_validator = lambda g: _validate_vector_grad(g, out_len)
+        if not (self.requires_grad or kernel.requires_grad):
+            return Tensor._make(
+                out_data, False, (), None,
+                grad_validator=grad_validator,
+            )
+        parent_self, parent_kernel = self, kernel
+
+        def backward_fn(grad):
+            # dx[j] += g[o]*k[q] and dk[q] += g[o]*x[j], accumulated from
+            # 0.0 in the same ascending (od, oh, ow, kd, kh, kw) order as
+            # the forward pass. A non-finite product or partial sum aborts
+            # the whole pass before any grad is written.
+            dx = [0.0] * (D * H * W)
+            dk = [0.0] * (K * K * K)
+            for od in range(OD):
+                for oh in range(OH):
+                    for ow in range(OW):
+                        g = grad[(od * OH + oh) * OW + ow]
+                        for kd in range(K):
+                            for kh in range(K):
+                                row = (od + kd) * H + oh + kh
+                                for kw in range(K):
+                                    j = row * W + ow + kw
+                                    q = (kd * K + kh) * K + kw
+                                    contrib_x = g * snapshot_k[q]
+                                    if not math.isfinite(contrib_x):
+                                        raise ValueError(
+                                            "conv3d backward intermediate"
+                                            " must be finite"
+                                        )
+                                    dx[j] = dx[j] + contrib_x
+                                    if not math.isfinite(dx[j]):
+                                        raise ValueError(
+                                            "conv3d backward intermediate"
+                                            " must be finite"
+                                        )
+                                    contrib_k = g * snapshot_x[j]
+                                    if not math.isfinite(contrib_k):
+                                        raise ValueError(
+                                            "conv3d backward intermediate"
+                                            " must be finite"
+                                        )
+                                    dk[q] = dk[q] + contrib_k
+                                    if not math.isfinite(dk[q]):
+                                        raise ValueError(
+                                            "conv3d backward intermediate"
+                                            " must be finite"
+                                        )
+            # The same object may play both roles; merge such roles into
+            # one contribution per tensor, and submit only parents that
+            # require grad.
+            merged = {}
+            roles = (
+                (parent_self, dx),
+                (parent_kernel, dk),
+            )
+            for parent, value in roles:
+                if not parent.requires_grad:
+                    continue
+                entry = merged.get(id(parent))
+                if entry is None:
+                    merged[id(parent)] = [parent, value]
+                else:
+                    combined = _merge_grad(entry[1], value)
+                    _ensure_finite_grad(combined)
+                    entry[1] = combined
+            return [(entry[0], entry[1]) for entry in merged.values()]
+
+        return Tensor._make(
+            out_data,
+            True,
+            (parent_self, parent_kernel),
+            backward_fn,
+            grad_validator=grad_validator,
+        )
+
     def conv_transpose2d(self, kernel, size, kernel_size, stride=1,
                          padding=0, dilation=1):
         if not isinstance(kernel, Tensor):
