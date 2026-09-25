@@ -8875,6 +8875,210 @@ class Tensor:
 
         return Tensor._make(out_data, True, (parent,), backward_fn)
 
+    def instance_norm2d(self, batch, channels, height, width, eps=1e-5):
+        # batch, channels, height, width must be non-bool positive ints;
+        # a wrong type is a TypeError, a non-positive value a ValueError.
+        for name, value in (
+            ("batch", batch),
+            ("channels", channels),
+            ("height", height),
+            ("width", width),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(name + " must be a positive int")
+            if value <= 0:
+                raise ValueError(name + " must be a positive int")
+        data = _require_nonempty_float_vector(self, "instance_norm2d")
+        B, C, H, W = batch, channels, height, width
+        if len(data) != B * C * H * W:
+            raise ValueError(
+                "instance_norm2d input length must equal "
+                "batch * channels * height * width"
+            )
+        if isinstance(eps, bool) or not isinstance(eps, float):
+            raise TypeError("eps must be a positive finite float")
+        if not math.isfinite(eps) or eps <= 0.0:
+            raise ValueError("eps must be a positive finite float")
+        # Snapshot the input so later caller-side mutation or replacement
+        # can change neither the forward result nor a pending backward.
+        x = list(data)
+        m = H * W
+        # Normalize each (n, c) instance independently over its H x W
+        # spatial positions, walking (r, s) in ascending order from 0.0:
+        # mu = sum(x)/M, z_i = x_i - mu, v = sum(z_i*z_i)/M,
+        # R = 1/sqrt(v+eps), h_i = z_i*R. The flat data is laid out
+        # B x C x H x W in row-major order. A non-finite intermediate
+        # aborts before a result tensor exists, so no state can change
+        # on failure.
+        scales = []
+        centered_all = []
+        out_data = []
+        for n in range(B):
+            for c in range(C):
+                base = (n * C + c) * m
+                total = 0.0
+                for k in range(m):
+                    total += x[base + k]
+                    if not math.isfinite(total):
+                        raise ValueError(
+                            "instance_norm2d intermediate must be finite"
+                        )
+                mu = total / m
+                if not math.isfinite(mu):
+                    raise ValueError(
+                        "instance_norm2d intermediate must be finite"
+                    )
+                centered = []
+                for k in range(m):
+                    z_k = x[base + k] - mu
+                    if not math.isfinite(z_k):
+                        raise ValueError(
+                            "instance_norm2d intermediate must be finite"
+                        )
+                    centered.append(z_k)
+                var_sum = 0.0
+                for k in range(m):
+                    square = centered[k] * centered[k]
+                    if not math.isfinite(square):
+                        raise ValueError(
+                            "instance_norm2d intermediate must be finite"
+                        )
+                    var_sum += square
+                    if not math.isfinite(var_sum):
+                        raise ValueError(
+                            "instance_norm2d intermediate must be finite"
+                        )
+                var = var_sum / m
+                if not math.isfinite(var):
+                    raise ValueError(
+                        "instance_norm2d intermediate must be finite"
+                    )
+                denom = var + eps
+                if not math.isfinite(denom):
+                    raise ValueError(
+                        "instance_norm2d intermediate must be finite"
+                    )
+                r = 1.0 / math.sqrt(denom)
+                if not math.isfinite(r):
+                    raise ValueError(
+                        "instance_norm2d intermediate must be finite"
+                    )
+                for k in range(m):
+                    h_k = centered[k] * r
+                    if not math.isfinite(h_k):
+                        raise ValueError(
+                            "instance_norm2d intermediate must be finite"
+                        )
+                    out_data.append(h_k)
+                scales.append(r)
+                centered_all.append(centered)
+        if not self.requires_grad:
+            return Tensor._make(out_data, False, (), None)
+        parent = self
+        # Save the freshly centered values and per-instance scales with
+        # the graph, so a pending backward pass is independent of any
+        # subsequent data mutation.
+        saved_B = B
+        saved_C = C
+        saved_m = m
+        saved_centered = centered_all
+        saved_scales = scales
+
+        def backward_fn(grad):
+            # Per (n, c) instance, accumulate G = sum(g_i) and
+            # Q = sum(g_i*z_i) from 0.0 in ascending spatial order, then
+            # dx_i = (R/M)*(M*g_i - G - z_i*R*R*Q) in the same order.
+            # Only self is submitted; a non-finite intermediate aborts the
+            # whole pass before any grad is written.
+            dx = []
+            for n in range(saved_B):
+                for c in range(saved_C):
+                    idx = n * saved_C + c
+                    r = saved_scales[idx]
+                    centered = saved_centered[idx]
+                    G = 0.0
+                    for k in range(saved_m):
+                        G += grad[idx * saved_m + k]
+                        if not math.isfinite(G):
+                            raise ValueError(
+                                "instance_norm2d backward intermediate "
+                                "must be finite"
+                            )
+                    Q = 0.0
+                    for k in range(saved_m):
+                        product = grad[idx * saved_m + k] * centered[k]
+                        if not math.isfinite(product):
+                            raise ValueError(
+                                "instance_norm2d backward intermediate "
+                                "must be finite"
+                            )
+                        Q += product
+                        if not math.isfinite(Q):
+                            raise ValueError(
+                                "instance_norm2d backward intermediate "
+                                "must be finite"
+                            )
+                    scale = r / saved_m
+                    if not math.isfinite(scale):
+                        raise ValueError(
+                            "instance_norm2d backward intermediate must be finite"
+                        )
+                    for k in range(saved_m):
+                        scaled = saved_m * grad[idx * saved_m + k]
+                        if not math.isfinite(scaled):
+                            raise ValueError(
+                                "instance_norm2d backward intermediate "
+                                "must be finite"
+                            )
+                        shifted = scaled - G
+                        if not math.isfinite(shifted):
+                            raise ValueError(
+                                "instance_norm2d backward intermediate "
+                                "must be finite"
+                            )
+                        correction = centered[k] * r
+                        if not math.isfinite(correction):
+                            raise ValueError(
+                                "instance_norm2d backward intermediate "
+                                "must be finite"
+                            )
+                        correction = correction * r
+                        if not math.isfinite(correction):
+                            raise ValueError(
+                                "instance_norm2d backward intermediate "
+                                "must be finite"
+                            )
+                        correction = correction * Q
+                        if not math.isfinite(correction):
+                            raise ValueError(
+                                "instance_norm2d backward intermediate "
+                                "must be finite"
+                            )
+                        bracket = shifted - correction
+                        if not math.isfinite(bracket):
+                            raise ValueError(
+                                "instance_norm2d backward intermediate "
+                                "must be finite"
+                            )
+                        dx_k = scale * bracket
+                        if not math.isfinite(dx_k):
+                            raise ValueError(
+                                "instance_norm2d backward intermediate "
+                                "must be finite"
+                            )
+                        dx.append(dx_k)
+            return [(parent, dx)]
+
+        return Tensor._make(
+            out_data,
+            True,
+            (parent,),
+            backward_fn,
+            grad_validator=lambda g: _validate_vector_grad(
+                g, B * C * H * W
+            ),
+        )
+
     def batch_norm(self, weight, bias, eps=1e-5):
         if not isinstance(weight, Tensor):
             raise TypeError("weight must be a Tensor")
