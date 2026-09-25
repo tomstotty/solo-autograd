@@ -4858,6 +4858,184 @@ class Tensor:
             grad_validator=lambda g: _validate_vector_grad(g, out_len),
         )
 
+    def conv_transpose1d_batch(self, kernel, batch, channels, filters,
+                               length, size, stride=1, padding=0,
+                               dilation=1):
+        if not isinstance(kernel, Tensor):
+            raise TypeError("kernel must be a Tensor")
+        # Both operands must hold non-empty 1D finite float lists; data may
+        # have been mutated after construction, so re-validate at call time.
+        x_data = _require_nonempty_float_vector(
+            self, "conv_transpose1d_batch"
+        )
+        w_data = _require_nonempty_float_vector(
+            kernel, "conv_transpose1d_batch"
+        )
+        # batch, channels, filters, length, size, stride and dilation must
+        # be non-bool positive ints, and padding a non-bool non-negative
+        # int.
+        for name, value in (
+            ("batch", batch),
+            ("channels", channels),
+            ("filters", filters),
+            ("length", length),
+            ("size", size),
+            ("stride", stride),
+            ("dilation", dilation),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(name + " must be a positive int")
+            if value <= 0:
+                raise ValueError(name + " must be a positive int")
+        if isinstance(padding, bool) or not isinstance(padding, int):
+            raise TypeError("padding must be a non-negative int")
+        if padding < 0:
+            raise ValueError("padding must be a non-negative int")
+        B, C, O, N, K, S, P, D = (
+            batch, channels, filters, length, size, stride, padding,
+            dilation,
+        )
+        # self stores B sequences of C channels of N samples and the kernel
+        # C input channels of O output channels of K weights, all in
+        # row-major order.
+        if len(x_data) != B * C * N:
+            raise ValueError(
+                "conv_transpose1d_batch input length must equal "
+                "batch * channels * length"
+            )
+        if len(w_data) != C * O * K:
+            raise ValueError(
+                "conv_transpose1d_batch kernel length must equal "
+                "channels * filters * size"
+            )
+        # Each input element scatters a scaled K-tap copy of its filter
+        # onto the output; stride steps the scatter anchors apart, padding
+        # shifts them inwards and dilation spaces the kernel taps, so the
+        # output length is L = (N-1)*S - 2*P + D*(K-1) + 1. With the
+        # defaults S = 1, P = 0 and D = 1 this is simply N + K - 1.
+        L = (N - 1) * S - 2 * P + D * (K - 1) + 1
+        if L <= 0:
+            raise ValueError(
+                "conv_transpose1d_batch output length must be positive"
+            )
+        total_out = B * O * L
+        # Snapshot all operands at call time so later caller-side mutation
+        # or replacement of any input can change neither the forward result
+        # nor a pending backward pass.
+        snapshot_x = list(x_data)
+        snapshot_w = list(w_data)
+        # Batched multi-channel 1D transposed cross-correlation: the kernel
+        # is never flipped. The output is B x O x L in row-major order,
+        # starting at 0.0; in ascending (b, c, i, o, r) order,
+        # y[(b*O+o)*L+t] += x[(b*C+c)*N+i] * w[(c*O+o)*K+r],
+        # with t = i*S - P + r*D; out-of-range output positions (from
+        # stride, padding or the dilation gaps) are skipped. A non-finite
+        # product or partial sum aborts before a result tensor exists, so
+        # no state can change.
+        out_data = [0.0] * total_out
+        for b in range(B):
+            for c in range(C):
+                for i in range(N):
+                    xi = (b * C + c) * N + i
+                    for o in range(O):
+                        wi_base = (c * O + o) * K
+                        oi_base = (b * O + o) * L
+                        for r in range(K):
+                            t = i * S - P + r * D
+                            if not 0 <= t < L:
+                                continue
+                            product = (
+                                snapshot_x[xi] * snapshot_w[wi_base + r]
+                            )
+                            if not math.isfinite(product):
+                                raise ValueError(
+                                    "conv_transpose1d_batch intermediate "
+                                    "must be finite"
+                                )
+                            oi = oi_base + t
+                            out_data[oi] = out_data[oi] + product
+                            if not math.isfinite(out_data[oi]):
+                                raise ValueError(
+                                    "conv_transpose1d_batch intermediate "
+                                    "must be finite"
+                                )
+        if not (self.requires_grad or kernel.requires_grad):
+            return Tensor._make(
+                out_data, False, (), None,
+                grad_validator=lambda g: _validate_vector_grad(g, total_out),
+            )
+        parent_self, parent_kernel = self, kernel
+
+        def backward_fn(grad):
+            # dx[xi] += g*w[wi] and dw[wi] += g*x[xi], accumulated from
+            # 0.0 in the same ascending (b, c, i, o, r) order and xi/wi/t
+            # indexing as the forward pass, skipping the same out-of-range
+            # output positions; dw has no batch index, so its contributions
+            # reduce across all B sequences. A non-finite product or
+            # partial sum aborts the whole pass before any grad is written.
+            dx = [0.0] * (B * C * N)
+            dw = [0.0] * (C * O * K)
+            for b in range(B):
+                for c in range(C):
+                    for i in range(N):
+                        xi = (b * C + c) * N + i
+                        for o in range(O):
+                            wi_base = (c * O + o) * K
+                            oi_base = (b * O + o) * L
+                            for r in range(K):
+                                t = i * S - P + r * D
+                                if not 0 <= t < L:
+                                    continue
+                                g = grad[oi_base + t]
+                                wi = wi_base + r
+                                contrib_x = g * snapshot_w[wi]
+                                if not math.isfinite(contrib_x):
+                                    raise ValueError(
+                                        "conv_transpose1d_batch backward "
+                                        "intermediate must be finite"
+                                    )
+                                dx[xi] = dx[xi] + contrib_x
+                                if not math.isfinite(dx[xi]):
+                                    raise ValueError(
+                                        "conv_transpose1d_batch backward "
+                                        "intermediate must be finite"
+                                    )
+                                contrib_w = g * snapshot_x[xi]
+                                if not math.isfinite(contrib_w):
+                                    raise ValueError(
+                                        "conv_transpose1d_batch backward "
+                                        "intermediate must be finite"
+                                    )
+                                dw[wi] = dw[wi] + contrib_w
+                                if not math.isfinite(dw[wi]):
+                                    raise ValueError(
+                                        "conv_transpose1d_batch backward "
+                                        "intermediate must be finite"
+                                    )
+            # The same object may play both roles; merge such roles into
+            # one contribution per tensor, and submit only parents that
+            # require grad.
+            merged = {}
+            for parent, value in (
+                (parent_self, dx),
+                (parent_kernel, dw),
+            ):
+                if not parent.requires_grad:
+                    continue
+                entry = merged.get(id(parent))
+                if entry is None:
+                    merged[id(parent)] = [parent, value]
+                else:
+                    combined = _merge_grad(entry[1], value)
+                    _ensure_finite_grad(combined)
+                    entry[1] = combined
+            return [(entry[0], entry[1]) for entry in merged.values()]
+
+        return Tensor._make(
+            out_data, True, (parent_self, parent_kernel), backward_fn,
+            grad_validator=lambda g: _validate_vector_grad(g, total_out),
+        )
+
     def conv1d_multi(self, kernel, channels, filters, length, size,
                      stride=1, padding=0, dilation=1, bias=None,
                      padding_mode="zeros"):
