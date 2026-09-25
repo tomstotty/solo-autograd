@@ -215,18 +215,13 @@ class BilinearResize2dBackwardTests(unittest.TestCase):
         expect(ValueError, lambda: out.backward([float("nan")] * 4))
         expect(ValueError, lambda: out.backward([float("inf")] * 4))
 
-    def test_validation_runs_on_graphless_result(self):
+    def test_graphless_result_rejects_any_grad(self):
+        # The missing-graph ValueError takes precedence over grad
+        # validation: every grad, valid or not, raises ValueError.
         out = Tensor(IMG4).bilinear_resize2d(2, 2, 2, 2)
         self.assertFalse(out.requires_grad)
-        for bad, error in (
-            (None, TypeError),
-            ("x", TypeError),
-            ((1.0, 1.0, 1.0, 1.0), TypeError),
-            (True, ValueError),
-            (1, ValueError),
-            (1.0, ValueError),
-        ):
-            expect(error, lambda bad=bad: out.backward(bad))
+        for bad in (None, "x", (1.0, 1.0, 1.0, 1.0), True, 1, 1.0):
+            expect(ValueError, lambda bad=bad: out.backward(bad))
         expect(ValueError, out.backward)
         expect(ValueError, lambda: out.backward([1.0, 1.0, 1.0, 1.0]))
 

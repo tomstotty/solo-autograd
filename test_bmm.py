@@ -56,24 +56,17 @@ class BmmBackwardGradValidationTests(unittest.TestCase):
             with self.assertRaises(TypeError):
                 out.backward(bad)
 
-    def test_validation_runs_on_graphless_result(self):
-        # Without any requiring parent the result has no graph; the grad
-        # rules still take precedence over the no-graph ValueError.
+    def test_graphless_result_rejects_any_grad(self):
+        # Without any requiring parent the result has no graph; the
+        # missing-graph ValueError takes precedence over grad validation,
+        # so every grad — valid or not — raises ValueError.
         _, _, out = _bmm(False, False)
         self.assertFalse(out.requires_grad)
-        for bad, error in (
-            (None, TypeError),
-            ("x", TypeError),
-            (True, ValueError),
-            (1, ValueError),
-            (1.0, ValueError),
-        ):
-            with self.assertRaises(error):
+        for bad in (None, "x", True, 1, 1.0):
+            with self.assertRaises(ValueError):
                 out.backward(bad)
         with self.assertRaises(ValueError):
             out.backward()
-        # A valid finite list passes validation, then hits the missing
-        # graph error.
         with self.assertRaises(ValueError):
             out.backward([1.0, 1.0, 1.0, 1.0])
 

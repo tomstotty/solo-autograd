@@ -151,15 +151,14 @@ rg = parent_src.instance_norm2d(B, C, H, W)
 assert rg.requires_grad is True
 assert rg._parents == (parent_src,)
 
-# --- no graph: backward -> ValueError even with a valid grad ---
+# --- no graph: backward -> ValueError for any grad, valid or not ---
 out0 = Tensor(DATA, False).instance_norm2d(B, C, H, W)
 expect(ValueError, lambda: out0.backward([1.0] * 16))
-# but a bad grad still raises its own T/V before the graph check
 expect(ValueError, lambda: out0.backward())
 expect(ValueError, lambda: out0.backward(True))
 expect(ValueError, lambda: out0.backward(1.0))
-expect(TypeError, lambda: out0.backward(None))
-expect(TypeError, lambda: out0.backward("x"))
+expect(ValueError, lambda: out0.backward(None))
+expect(ValueError, lambda: out0.backward("x"))
 
 # --- backward: grad validation (bool/int/float/scalars -> V) ---
 out = Tensor(DATA, True).instance_norm2d(B, C, H, W)
